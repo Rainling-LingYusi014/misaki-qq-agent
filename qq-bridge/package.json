@@ -27,6 +27,7 @@
   "dependencies": {
     "@deepseek-ai/schemastery": "^3.18.1",
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "@modelcontextprotocol/server-filesystem": "^2.0.1",
     "exceljs": "^4.4.0",
     "pptxgenjs": "^4.0.1",
     "zod": "^4.4.3"
