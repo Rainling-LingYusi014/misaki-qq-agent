@@ -3831,6 +3831,57 @@ function ytDayCountBump(dir) {
   if (j.day !== today) j = { day: today, n: 0 };
   return { day: today, n: j.n, bump: () => { j.n += 1; try { fs.writeFileSync(f, JSON.stringify(j)); } catch {} } };
 }
+if (cfg.social?.tools?.biliSearch !== false) {
+  /* 2026-10-26 M1：B 站站内搜索（登录态 Wbi 签名 + 桥侧打分排序，只读零副作用）。
+   * cookie 在 state/bilibili-auth.json（主人 Edge 登录后导出；24h 短票到期需重新登录/续期）。
+   * 打分 = log10(播放) + 新鲜度*0.8 + 互动率，保质量下限；语义挑选与推荐话术归模型。 */
+  const BILI_AUTH = path.join(ROOT, 'state', 'bilibili-auth.json');
+  const BILI_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
+  const BILI_TAB = [46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52];
+  const biliEnc = (s) => encodeURIComponent(String(s)).replace(/[!'"()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'));
+  async function biliSearch(query, n) {
+    let auth = {};
+    try { auth = JSON.parse(fs.readFileSync(BILI_AUTH, 'utf8')); } catch {}
+    const cookie = Object.entries(auth).filter(([k]) => !['savedAt', 'mode', 'fingerprint'].includes(k)).map(([k, v]) => k + '=' + v).join('; ');
+    const nav = await (await fetch('https://api.bilibili.com/x/web-interface/nav', { headers: { 'user-agent': BILI_UA, ...(cookie ? { cookie } : {}) } })).json();
+    if (!nav.data?.wbi_img) return { error: `B站导航接口异常（code=${nav.code}）` };
+    if (nav.data?.isLogin === false) return { error: 'B站登录已过期：请管理员重新登录（state/bilibili-auth.json 失效）' };
+    const imgKey = nav.data.wbi_img.img_url.split('/').pop().split('.')[0];
+    const subKey = nav.data.wbi_img.sub_url.split('/').pop().split('.')[0];
+    const mixinKey = BILI_TAB.map((i) => (imgKey + subKey)[i]).join('').slice(0, 32);
+    const params = { keyword: String(query).slice(0, 120), search_type: 'video', order: 'totalrank', page: 1, wts: Math.floor(Date.now() / 1000) };
+    const qs = Object.keys(params).sort().map((k) => encodeURIComponent(k) + '=' + biliEnc(params[k])).join('&');
+    const w_rid = crypto.createHash('md5').update(qs + mixinKey).digest('hex');
+    const res = await fetch('https://api.bilibili.com/x/web-interface/search/type?' + qs + '&w_rid=' + w_rid + '&wts=' + params.wts, { headers: { 'user-agent': BILI_UA, referer: 'https://www.bilibili.com/', ...(cookie ? { cookie } : {}) } });
+    const j = await res.json();
+    if (j.code !== 0) return { error: `B站搜索失败（code=${j.code} ${j.message ?? ''}）` };
+    const now = Date.now() / 1000;
+    const rows = (j.data?.result ?? []).map((r) => {
+      const play = Number(r.play) || 0;
+      const ageDays = Math.max(0, Math.round((now - (Number(r.pubdate) || now)) / 86400));
+      const review = Number(r.review) || 0;
+      return { title: String(r.title).replace(/<[^>]+>/g, ''), bvid: r.bvid, url: `https://www.bilibili.com/video/${r.bvid}`, play, up: String(r.author ?? ''), ageDays, duration: String(r.duration ?? ''), score: +(Math.log10(Math.max(10, play)) + Math.max(0, 3 - ageDays / 180) * 0.8 + Math.min(1.5, play > 0 ? (review / play) * 100 : 0)).toFixed(2) };
+    }).sort((a, b) => b.score - a.score).slice(0, n);
+    return { total: j.data?.numResults ?? rows.length, rows };
+  }
+  registerTool(
+    'bili_search',
+    'Search Bilibili (bilibili.com, CN video site) with the logged-in account and return ranked candidates: title / url / bvid / play count / uploader / ageDays / score (quality ranking already computed: popularity x freshness x engagement). Use when asked to find a video / guide / tutorial ON Bilibili, or to recommend Bilibili content to deliver. Pick usually the TOP score row unless the user stated a preference (newest / specific uploader / series). Deliver with qq_send_message in YOUR OWN words: the url plus ONE sentence why it fits - never paste the raw JSON at the user. If rows are empty or nothing truly matches (e.g. the named thing does not exist), say so honestly and ask - never force a wrong-looking hit.',
+    {
+      query: z.string().min(2).max(120).describe('Search keywords (keep the language the user used, e.g. 原神 钟离 攻略)'),
+      n: z.number().int().min(1).max(8).optional().describe('How many candidates (default 5, max 8)')
+    },
+    async ({ query, n }) => {
+      try {
+        const out = await biliSearch(query, Math.max(1, Math.min(8, Number(n) || 5)));
+        if (out.error) return { content: [{ type: 'text', text: out.error }], isError: true };
+        return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] };
+      } catch (error) {
+        return { content: [{ type: 'text', text: `bili_search 失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+}
 if (cfg.social?.tools?.ytDownload !== false) {
   registerTool(
     'yt_search',
