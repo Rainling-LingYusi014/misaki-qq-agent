@@ -1,0 +1,14 @@
+# 机密与实例数据——永不入库
+config.json
+state/
+*.log
+
+# 登录二维码与本地杂记
+deploy/qrcode.png
+命名备注.md
+
+# 运行时产物
+node_modules/
+.runtime/
+*.bak
+*.bak-*

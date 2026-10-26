@@ -1,0 +1,1409 @@
+// 社交运行时状态容器
+// social = default default（唯一模式）状态（conversations/paused/sleepWindow）。
+// cfg 静态注入（initSocialCore）。访问器（getSocialState/saveSocialState）本模块。
+import crypto from 'node:crypto';
+import { normalizeSpeakerIds, hasExplicitEnd } from '../lib/sleep-guard.js';
+import { SOCIAL_STATE_FILE } from '../lib/paths.js';
+import { atomicWriteJson, readJsonSafe } from '../lib/json-fs.js';
+import { log } from '../lib/log.js';
+import { canonicalKey } from '../lib/keys.js';
+import { KNOWN_AGENT_TOKENS } from '../lib/text-safe.js';
+import { sanitizeForwardId } from '../forward.js';
+import { collectors, TurnStartAt, pendingWakeKeys, promptQueues, MAX_MEDIA_COUNT, activeAiTurns, wakeConfigUpdatedKeys, markReadCalledKeys, wakeConfigMissCount, messageMediaStore, activeWaits, queued, turnHasBubble } from './session-state.js';
+import { state } from './config.js';
+import { isSessionAllowedInCurrentMode } from './mode.js';
+// 私聊「不抢话」的等待/插话决策（纯函数，见 typing-hold.js）
+import { typingHoldDecision, typingHoldText, STEER_IN_TURN_DEFER_MAX_MS } from './typing-hold.js';
+import { isDirectedAtAi } from '../lib/social-timeline.js';
+import { looksLikeUnfinished } from '../wait.js';
+import { readRoleState } from '../lib/role-access.js';
+import { bjMinutes, parseClockMin } from '../lib/time.js';
+// 会话重置时"必须跨着重置活下来"的已回复账本（真机事故见本文件 resetConversationKeepingLedger 注释）
+import { carryReplyLedger } from './send-idempotency.js';
+
+let cfgRef = null;
+/** main 启动时调用：注入 cfg（此后不再变） */
+export function initSocialCore(cfg) {
+  cfgRef = cfg;
+}
+
+// 固定会话令牌：对 `'qqbridge-tk-v2:' + key + ':' + ownerQQ` 求 SHA-256 并取 hex 前 32 位。
+// 同一 QQ/群（会话 key）在重启与会话轮换后令牌不变，模型上下文稳定；派生异常时回退随机 32 hex。
+// 会话令牌 = 会话本体身份(短、可读、无加密映射): group:N -> N(群号), private:N -> N(QQ号)
+export function fixedTokenForKey(key) {
+  const m = /^(group|private):(\d+)$/.exec(String(key ?? ''));
+  return m ? m[2] : String(key ?? '');
+}
+
+// ── default模式（default）运行时状态与唤醒配置 ────────────────────────
+export const social = {
+  conversations: new Map(), // key -> state
+  paused: false, // 控制台可暂停整个default AI 活动（停止唤醒/等待）
+  sleepWindow: null, // { start: '01:00', end: '06:00' }：群聊睡眠时间段（北京时间），窗口内只响应 @，其余不投递省 token
+};
+
+export function defaultWakeConfig() {
+  const w = cfgRef.social?.wake ?? {};
+  const defaultMode = w.defaultMode === 'active' ? 'active' : 'diving';
+  const defaultInfinite = w.recommendedDefaultInfinite !== false;
+  const recMin = Number(w.recommendedSleepMinMs) || 300000;
+  const recMax = Number(w.recommendedSleepMaxMs) || 7200000;
+  let finiteMs = recMin + Math.random() * Math.max(0, recMax - recMin);
+  const hardMin = Math.max(0, Number(w.sleepMinMs) || 0);
+  const hardMax = Number(w.sleepMaxMs) || 0;
+  if (hardMin > 0 && finiteMs < hardMin) finiteMs = hardMin;
+  if (hardMax > 0 && finiteMs > hardMax) finiteMs = hardMax;
+  /* 2026-09-30：`triggers.probability` 不再是"回不回的阈值"（骰子已删，见 wake-send.js 的
+   * evaluateWakeTrigger 注释），它现在只有两个含义：显式 0 = 明确关闭本会话的普通消息唤醒；
+   * 其它数值不参与任何判断，只在 [WakeRef] 行里如实报出。
+   *
+   * 关键坑（必须这样写）：配置里**没有** recommendedProbability 这个键时，绝不能写成 0 ——
+   * 0 会被上面的语义读成"明确关闭"，于是"旧配置缺键"反而变成永久静默（以前是概率 0 = 骰子
+   * 永远不中，看起来一样，但那时它的名字叫概率，现在它叫开关，含义变了）。缺键 = 不写这个字段。 */
+  const rawRec = w.recommendedProbability;
+  const hasRec = rawRec !== undefined && rawRec !== null && rawRec !== '';
+  const recNum = hasRec ? Number(rawRec) : Number.NaN;
+  const recProb = hasRec && Number.isFinite(recNum) ? Math.min(1, Math.max(0, recNum)) : null;
+  return {
+    mode: defaultMode,
+    infinite: defaultInfinite,
+    sleepUntil: defaultInfinite ? null : new Date(Date.now() + Math.round(finiteMs)).toISOString(),
+    triggers: {
+      atMention: w.recommendedAtMention !== false,
+      nameMention: w.recommendedNameMention !== false,
+      speakerIds: [],
+      keywords: Array.isArray(w.recommendedKeywords) ? w.recommendedKeywords.map(String) : [],
+      question: w.recommendedQuestion !== false,
+      poke: w.recommendedPoke !== false,
+      anyMessage: defaultMode === 'active',
+      // 缺键 → undefined（＝"没有开关"，不是"关闭"）；显式 0 → 明确关闭；其它值只是记录。见上面注释。
+      probability: recProb === null ? undefined : recProb,
+      /* 2026-09-19 需求"插话概率等所有概率都要改好落地"。
+       * 这个值有两个来源：① 用户配置里的 recommendedProbability（这里叫 owner）；
+       * ② 模型自己按语境用 qq_set_wake_config 定的值（model）。
+       * 以前分不清是谁给的 → 在界面上改概率，已经聊过的会话永远不会变（模型早就自己定过一个值）。
+       * 现在带上来源标记：source=owner 的会话会在配置热加载时立刻跟着新值走；
+       * source=model 的会话保留模型的选择（模型是看着语境定的，不该被静默覆盖）。 */
+      probabilitySource: 'owner'
+    },
+    batchWindowMs: Math.max(1000, Number(w.batchWindowMs) || 8000),
+    lastWakeAt: 0,
+    wakeCount: 0,
+    noActionCount: 0,
+    confirmedAt: 0,
+    confirmedBy: 'default'
+  };
+}
+
+/**
+ * 把用户配置里的"普通消息插话概率"应用到正在跑的会话上（2026-09-19）。
+ *
+ * 为什么需要：这个概率有两个来源（用户的 recommendedProbability / 模型自己定的值），
+ * 靠 `triggers.probabilitySource` 区分。
+ *
+ * 2026-09-19 反馈后改口径：原话"我调的 0.15，唤醒词里带的好像是 0.08" —— 老口径是
+ * "source=model 的会话保留模型的选择"，于是在界面上改完，老会话纹丝不动、唤醒提示里还是模型
+ * 早就定下的 0.08，看起来就是"改了不生效"。现在改成：用户一保存，所有会话都按这份配置执行
+ * （包括原来源=model 的，计数在 overridden 里并写日志）；模型之后仍可在会话内自己调整，
+ * 但用户下次保存会再覆盖回来。由 bridge.js 的配置热加载回调与启动同步调用。
+ * @returns {{updated:number, overridden:number, kept:number}}
+ */
+export function applyOwnerWakeProbabilityToSessions() {
+  const w = cfgRef?.social?.wake ?? {};
+  /* 2026-09-30：probability 只把"显式 0"当关闭开关用（骰子已删），所以这里必须能区分
+   * "主人写了 0" 和 "配置里根本没这个键"：
+   *   · 没写（undefined/null/空串/非数字）→ 返回 null = 什么都不做，绝不把会话写成 0（写了就是永久静默）；
+   *   · 写了 0 → 0，照旧同步（这是主人明确要关掉本类会话的普通消息唤醒）；
+   *   · 其它数值 → 原样同步（数值不参与判断，但 [WakeRef] 行会如实报出，保持"界面改了就变"的手感）。 */
+  const toProb = (v) => {
+    if (v === undefined || v === null || v === '') return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.min(1, Math.max(0, n)) : null;
+  };
+  const ownerProb = toProb(w.recommendedProbability);
+  const activeProb = toProb(w.activeProbability);
+  let updated = 0;
+  let overridden = 0;
+  let skipped = 0;
+  for (const [key, st] of social.conversations.entries()) {
+    const tr = st?.wakeConfig?.triggers;
+    if (!tr) continue;
+    // 活跃模式用 activeProbability（它本来就是"墙上说的活跃概率"），潜水模式用 recommendedProbability
+    const want = st.wakeConfig?.mode === 'active' && activeProb !== null && activeProb > 0 ? activeProb : ownerProb;
+    // 配置里没写这个键 → 不动会话（否则"缺键"会被同步成 0 = 明确关闭，群里就再也不理普通消息了）
+    if (want === null) { skipped += 1; continue; }
+    const wasModel = tr.probabilitySource === 'model';
+    if (Number(tr.probability) !== want || wasModel) {
+      tr.probability = want;
+      tr.probabilitySource = 'owner';
+      updated += 1;
+      if (wasModel) overridden += 1;
+      log(`[config] 普通消息唤醒记录值已按主人配置更新 ${key}: ${want}${wasModel ? '（覆盖了模型之前自定的值）' : ''}`);
+    }
+  }
+  if (updated) saveSocialState();
+  return { updated, overridden, kept: skipped };
+}
+
+// 软重置唤醒配置：保留当前"模式"（活跃/潜水）与关键触发条件（指定成员/关键词/概率），// 只把其余参数回归推荐默认——用于"无行动/连续未设置唤醒"等兜底场景，
+// 避免把用户或管理员显式设置的活跃模式冲成默认潜水（默认潜水会让人以为机器人突然失联）。
+export function softResetWakeConfig(st) {
+  const old = st.wakeConfig || {};
+  const oldTr = (old.triggers && typeof old.triggers === 'object') ? old.triggers : {};
+  const def = defaultWakeConfig();
+  const prevMode = old.mode === 'active' ? 'active' : 'diving';
+  const prevProb = Number(oldTr.probability);
+  const next = {
+    ...def,
+    mode: prevMode,
+    infinite: old.infinite === false ? false : def.infinite,
+    triggers: {
+      ...def.triggers,
+      anyMessage: prevMode === 'active' || oldTr.anyMessage === true,
+      atMention: oldTr.atMention === true || def.triggers.atMention,
+      nameMention: oldTr.nameMention === true || def.triggers.nameMention,
+      question: oldTr.question === true || def.triggers.question,
+      poke: oldTr.poke === true || def.triggers.poke,
+      speakerIds: normalizeSpeakerIds(oldTr.speakerIds),
+      keywords: Array.isArray(oldTr.keywords) ? oldTr.keywords.map((k) => String(k).slice(0, 100)).filter(Boolean).slice(0, 50) : def.triggers.keywords,
+      /* 2026-09-30：原来的判据是 `prevProb > 0` —— 显式 0（=明确关闭本会话的普通消息唤醒）
+       * 会被当成"没值"而退回默认值，于是"我刚静默过的群，软重置后又开始理每条消息"。
+       * 现在只要是有效数字就保留（含 0），只有脏值才回退默认。 */
+      probability: Number.isFinite(prevProb) ? Math.min(1, Math.max(0, prevProb)) : def.triggers.probability,
+      // 软重置要保留"这个概率是谁定的"：模型定的就继续归模型，用户配置来的就继续跟用户配置走
+      probabilitySource: oldTr.probabilitySource === 'model' ? 'model' : 'owner'
+    },
+    wakeCount: old.wakeCount || 0,
+    noActionCount: 0,
+    confirmedAt: old.confirmedAt || 0,
+    confirmedBy: old.confirmedBy || 'default'
+  };
+  if (prevMode === 'active') {
+    next.infinite = true;
+    next.sleepUntil = null;
+    next.triggers.anyMessage = true;
+  }
+  st.wakeConfig = next;
+  return st.wakeConfig;
+}
+
+// ── M8 叶子纯判断 ────────────────
+
+// 沉睡前强制观察窗口：防止 AI 聊两句就立刻潜水。返回 true = 当前应阻止直接设置潜水。
+export function preSleepWaitBlocked(st) {
+  if (!st) return false;
+  const w = cfgRef.social?.wake ?? {};
+  if (w.preSleepWaitEnabled === false) return false;
+  if (hasExplicitEnd(st)) return false;
+  // AI 已回应过最新消息（最后发言不早于最后收到消息）：说明它没有逃避话题，
+  // 想收尾/潜水时直接放行，不再强制等满观察窗口——避免每轮回复后卡 5 分钟导致新 @ 全部排队。
+  if (st.lastAiReplyAt && (st.lastIncomingAt || 0) && st.lastAiReplyAt >= st.lastIncomingAt) return false;
+  const waitMs = Math.max(0, Number(w.preSleepWaitMs) || 30000);
+  const now = Date.now();
+  // 已经连续安静满观察窗口：可以直接设置潜水。
+  if ((st.lastIncomingAt || 0) && now - st.lastIncomingAt >= waitMs) return false;
+  // 已经完整等过观察窗口且之后没有新消息：放行。
+  if (st.preSleepWaitSatisfiedAt && (!st.lastIncomingAt || st.lastIncomingAt <= st.preSleepWaitSatisfiedAt)) return false;
+  // 已经做过一次沉睡前观察（可能等到了新消息并已把新消息返回给 AI），只要 AI 之后没有参与、也没有更新的消息，就允许直接沉睡。
+  if (st.preSleepWaitObservedAt && (!st.lastIncomingAt || st.lastIncomingAt <= st.preSleepWaitObservedAt)) return false;
+  return true;
+}
+
+// 唤醒安全判定：按触发条件把唤醒分成 hard/timed/soft 三类并给出 guaranteed/stale 结论
+export function computeWakeSafety(wc) {
+  const tr = wc?.triggers || {};
+  const hard = wc?.mode === 'active' || tr.anyMessage || tr.atMention || tr.nameMention || tr.question || tr.poke ||
+    (Array.isArray(tr.keywords) && tr.keywords.length > 0) ||
+    normalizeSpeakerIds(tr.speakerIds).length > 0;
+  const timed = !wc?.infinite && wc?.sleepUntil && Date.parse(wc.sleepUntil) > Date.now();
+  const soft = Number(tr.probability) > 0;
+  const guaranteed = hard || timed || soft;
+  const confirmedNum = Number(wc?.confirmedAt);
+  const stale = !wc?.confirmedAt || !Number.isFinite(confirmedNum) || Date.now() - confirmedNum > 24 * 60 * 60 * 1000;
+  return { hard, timed, soft, guaranteed, stale };
+}
+
+// 当前北京时间是否落在睡眠时间段窗口内（支持跨午夜，如 start 23:00 end 06:00）。
+export function isInSleepWindow() {
+  const w = social.sleepWindow;
+  if (!w || !w.start || !w.end) return false;
+  const cur = bjMinutes(Date.now()); // 接线 time.js（2026-10-26）
+  const sm = /^(\d{1,2}):(\d{2})$/;
+  const mf = w.start.match(sm), me = w.end.match(sm);
+  if (!mf || !me) return false;
+  const startMin = parseInt(mf[1], 10) * 60 + parseInt(mf[2], 10);
+  const endMin = parseInt(me[1], 10) * 60 + parseInt(me[2], 10);
+  if (startMin === endMin) return false;
+  if (startMin < endMin) return cur >= startMin && cur < endMin;
+  return cur >= startMin || cur < endMin; // 跨午夜
+}
+
+/**
+ * 启动时给"没见过当前人设版本"的会话标记一次补注入（2026-09-20）。
+ *
+ * 为什么需要：人设 / 发言规则已经由 lib/preset-compose.js 合成进系统提示词，唤醒正文不再重复注入
+ * 那整份文本；但这两种情况必须补一次，否则会话会一直用旧人设：
+ *   ① 桥停机期间用户改了 persona.md / speech-rules.md —— 老会话的系统提示词是旧版；
+ *   ② 本次升级之前建的会话（那时正文每次都注入，会话里没有任何"见过哪一版"的记录）。
+ * 判据是 `_personaSeenStamp !== 当前版本`；补过一次就会把 stamp 记上，此后不再重复注入。
+ * @param {string} currentStamp persona.md|speech-rules.md 的版本号（wake-send 的 runtimeOverrideStamp()）
+ * @returns {number} 被标记的会话数
+ */
+export function markStalePersonaReinjects(currentStamp) {
+  if (!currentStamp) return 0;
+  let n = 0;
+  try {
+    for (const [key, st] of social.conversations.entries()) {
+      if (!st) continue;
+      if ((st._personaSeenStamp || '') === currentStamp) continue;
+      if (st._personaNeedsReinject === true) continue;
+      st._personaNeedsReinject = true;
+      n += 1;
+      log(`[preset] ${key} 标记补注入（会话记录的人设版本=${st._personaSeenStamp || '无'}）`);
+    }
+    if (n) saveSocialState();
+  } catch (e) { log('[preset] 标记补注入失败:', e?.message ?? e); }
+  return n;
+}
+
+// ── DND 免打扰时段（cfg 层 social.dndWindows，北京时间实时判定） ─────────
+// 解析免打扰配置 v（三形态）：
+//   undefined  -> 默认 [{ start:'23:00', end:'08:00' }]（整夜免打扰）
+//   字符串      -> "23:00-08:00"，多段用逗号分隔："23:00-08:00,13:00-14:00"
+//   数组        -> [{start:'HH:MM', end:'HH:MM'}, ...]（空数组=关闭）
+// 规则：start>end 视为跨午夜（wrap）；end==start 整天免打扰；空串/空对象=关闭。
+// 返回归一化窗口 [{ start: 北京分钟, end: 北京分钟, allDay: bool }, ...]，无法解析的段忽略。
+export function parseDndWindows(v) {
+  const norm = (m) => m === null ? null : ((m % 1440) + 1440) % 1440;
+  let raw;
+  if (v === undefined) {
+    raw = [{ start: '23:00', end: '08:00' }];
+  } else if (typeof v === 'string') {
+    raw = [];
+    for (const seg of String(v).split(',').map((s) => s.trim()).filter(Boolean)) {
+      const [a, b] = seg.split(/[-~—至到]/).map((s) => s.trim());
+      if (a || b) raw.push({ start: a, end: b });
+    }
+  } else if (Array.isArray(v)) {
+    raw = v;
+  } else if (v && typeof v === 'object') {
+    raw = [v]; // 单对象形态也兼容
+  } else {
+    return []; // null/数字等不可用形态 = 关闭
+  }
+  const out = [];
+  for (const it of raw) {
+    if (!it || typeof it !== 'object') continue;
+    const sRaw = String(it.start ?? '').trim();
+    const eRaw = String(it.end ?? '').trim();
+    if (!sRaw && !eRaw) continue; // 空对象段 = 关闭该段
+    const s = norm(parseClockMin(sRaw));
+    const e = norm(parseClockMin(eRaw));
+    if (s === null || e === null) continue; // 单段解析失败则忽略该段
+    out.push({ start: s, end: e, allDay: s === e });
+  }
+  return out;
+}
+
+// 距当前免打扰窗口结束还有多久（分钟→ms；已过所有窗口或整天免打扰返回 null）。
+// 用于 DND 期间仍保持主动链：到点后自动重排一次 scheduleProactiveCheck。
+function nextDndResumeMs() {
+  if (!cfgRef || !cfgRef.social) return null;
+  const now = bjMinutes();
+  let best = null;
+  for (const w of parseDndWindows(cfgRef.social.dndWindows)) {
+    if (w.allDay) return null; // 整天免打扰：不自动恢复
+    let remain = null;
+    if (w.start < w.end) {
+      if (now >= w.start && now < w.end) remain = w.end - now;
+    } else { // 跨午夜 wrap
+      if (now >= w.start) remain = (1440 - now) + w.end;
+      else if (now < w.end) remain = w.end - now;
+    }
+    if (remain !== null && (best === null || remain < best)) best = remain;
+  }
+  return best === null ? null : Math.max(1, best) * 60000;
+}
+
+// 当前北京时间是否处于任一免打扰窗口内（nowMin 可显式传入分钟，默认 bjMinutes()）。
+// cfgRef 尚未注入（initSocialCore 前）时按无窗口处理。
+export function inDndWindow(nowMin) {
+  if (!cfgRef || !cfgRef.social) return false;
+  const now = Number.isFinite(Number(nowMin)) ? ((Number(nowMin) % 1440) + 1440) % 1440 : bjMinutes();
+  for (const w of parseDndWindows(cfgRef.social.dndWindows)) {
+    if (w.allDay) return true; // 整天免打扰
+    if (w.start < w.end) {
+      if (now >= w.start && now < w.end) return true;
+    } else if (now >= w.start || now < w.end) { // 跨午夜 wrap
+      return true;
+    }
+  }
+  return false;
+}
+
+// 唤醒原因优先级表（子类型取冒号前基名）
+const WAKE_PRIORITY = {
+  private: 100,
+  atMention: 90,
+  question: 80,
+  speaker: 75,
+  nameMention: 70,
+  topic: 65,
+  keyword: 60,
+  friendRequest: 55, // 好友申请知情通知（2026-10-07）：低于真实消息（不抢触发），busy 时进合并窗随下批交付
+  anyMessage: 50,
+  replyCheck: 40,
+  timeout: 30,
+  proactiveCheck: 20
+};
+
+// 唤醒原因可能带子类型（如 keyword:小鲸鱼、speaker:昵称），取冒号前的基名计算优先级。
+export function wakePriority(reason) {
+  const base = String(reason ?? '').split(':')[0];
+  return WAKE_PRIORITY[base] ?? 0;
+}
+
+// default会话见过的 forward id（有界，避免 recentMessages 滚动淘汰后无法读取刚见过的转发）
+export const seenForwardIds = new Map(); // key -> Set<string>
+
+// default social 状态持久化
+export function saveSocialState() {
+  try {
+    const obj = { paused: social.paused, conversations: Object.create(null) };
+    for (const [key, st] of social.conversations) {
+      obj.conversations[key] = {
+        wakeConfig: st.wakeConfig,
+        recentMessages: st.recentMessages.slice(-200),
+        unread: st.unread.slice(-100),
+        lastWakeReason: st.lastWakeReason,
+        lastAiReplyAt: st.lastAiReplyAt,
+        lastActionAt: st.lastActionAt,
+        agentToken: st.agentToken,
+        bootstrapSent: st.bootstrapSent,
+        wakeTimes: st.wakeTimes.slice(-200),
+        sendTimes: st.sendTimes.slice(-500),
+        stickerCollectTimes: Array.isArray(st.stickerCollectTimes) ? st.stickerCollectTimes.slice(-500) : [],
+        lastIncomingAt: st.lastIncomingAt || 0,
+        lastAiSeenAt: Number(st.lastAiSeenAt) || 0,
+        // 「确实被回复过」的消息 id 集合（按 QQ messageId，跨会话轮换也稳定）。
+        // 用途：回合结束判断"某条被暂存的唤醒到底有没有被吞"时按 id 查集合，
+        // 而不是像以前那样比时间戳——时间戳判不出"看过但没回"，也分不清"回过但又被重播"。
+        answeredMessageIds: Array.isArray(st.answeredMessageIds) ? st.answeredMessageIds.slice(-300) : [],
+        pendingUndeliveredText: String(st.pendingUndeliveredText ?? ''),
+        _undeliveredAt: Number(st._undeliveredAt) || 0,
+        sessionToolCalls: Number(st.sessionToolCalls) || 0,
+        _promptInjected: st._promptInjected === true,
+        /* 2026-09-19 修「对话中途也注入首轮提示词」：这个字段必须落盘，理由见下面默认值那行的注释。 */
+        _promptOverrideStamp: (typeof st._promptOverrideStamp === 'string' && st._promptOverrideStamp) ? st._promptOverrideStamp : '',
+        /* 2026-09-20：人设已合成进系统提示词 → 唤醒正文默认不再重复注入。这两个字段记录
+         * "这个会话见过哪一版人设 / 要不要再补一次"（详见 wake-send.js 里 buildWakePrompt 的注释）。 */
+        _personaSeenStamp: (typeof st._personaSeenStamp === 'string' && st._personaSeenStamp) ? st._personaSeenStamp : '',
+        _personaNeedsReinject: st._personaNeedsReinject === true,
+        _standbySessionId: st._standbySessionId || null,
+        _standbyWarming: st._standbyWarming === true,
+        _mediaAttachedSeq: Number(st._mediaAttachedSeq) || 0,
+        rotateTurns: Number(st.rotateTurns) || 0,
+        _promptSessionId: (typeof st._promptSessionId === 'string' && st._promptSessionId) ? st._promptSessionId : null,
+        preSleepWaitSatisfiedAt: st.preSleepWaitSatisfiedAt || 0,
+        preSleepWaitObservedAt: st.preSleepWaitObservedAt || 0,
+        preSleepWaitAccumMs: st.preSleepWaitAccumMs || 0,
+        lastUnreadSeq: st.lastUnreadSeq || 0,
+        // 2026-09-11 23:08："已交给模型的最高 seq"必须落盘：它只在内存里的话，
+        // 每次桥重启都会归零 → 等待工具的基线退回 lastUnreadSeq → 重启前被暂存、还没交付的消息
+        // 就再也交付不了了（实测 15:04 被暂存的 seq12/seq13 就是这样被我自己的重启弄丢的）。
+        lastDeliveredSeq: Number(st.lastDeliveredSeq) || 0,
+        // 投递看门狗的"意图水位"：桥打算交付过的最高 seq（scheduleWake 每次被调用就推进）。
+        // 必须落盘：否则桥一重启，重启前"已经决定要交付、但还没交出去"的那批就再也兜不到了。
+        _wakeIntendedSeq: Number(st._wakeIntendedSeq) || 0,
+        activeTopics: Array.isArray(st.activeTopics) ? st.activeTopics.slice(-50) : [],
+        pendingThoughts: Array.isArray(st.pendingThoughts) ? st.pendingThoughts.slice(-50) : [],
+        memberImpressions: st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {},
+        seenForwardIds: Array.from(seenForwardIds.get(key) || []).slice(-1000)
+      };
+    }
+    atomicWriteJson(SOCIAL_STATE_FILE, obj);
+  } catch (error) {
+    log('保存 social 状态失败:', error?.message ?? error);
+  }
+}
+
+// 把"仍使用默认唤醒配置"的会话刷新为当前推荐/默认参数。
+// 只有 confirmedBy === 'default' 的会话才会被刷新；AI 或管理员显式设置过的（set_wake_config / mark_read）不会被覆盖。
+export function refreshDefaultWakeConfig(st) {
+  if (!st || !st.wakeConfig) return false;
+  if (st.wakeConfig.confirmedBy !== 'default') return false;
+  const def = defaultWakeConfig();
+  const old = st.wakeConfig;
+  st.wakeConfig = {
+    ...def,
+    lastWakeAt: old.lastWakeAt || 0,
+    wakeCount: old.wakeCount || 0,
+    noActionCount: old.noActionCount || 0,
+    confirmedAt: old.confirmedAt || 0,
+    confirmedBy: 'default'
+  };
+  return true;
+}
+
+// 保存推荐/默认参数后，把所有仍使用默认配置的会话同步到新默认值。
+export function refreshAllDefaultWakeConfigs() {
+  let changed = false;
+  for (const st of social.conversations.values()) {
+    if (refreshDefaultWakeConfig(st)) changed = true;
+  }
+  if (changed) saveSocialState();
+  return changed;
+}
+
+// 会话繁忙判定（P4-16 迁入）：有待发唤醒 / 队列中投递 / 在途 DSH turn 都算忙，防止重复唤醒
+export function isConversationBusy(key, st) {
+  if (st && st.pendingWakeTimer) return true;
+  if (pendingWakeKeys.has(key)) return true;
+  const q = promptQueues.get(key);
+  if (q && (q.running || q.queue.length > 0)) return true;
+  const sid = state.sessions[key];
+  if (sid && (TurnStartAt.has(sid) || collectors.has(sid))) return true;
+  return false;
+}
+
+// ── M8 内层 SCC（P4-17 迁入）：访问器 + 调度器。sendWakePrompt 仍驻 main，
+//    经 setWakeSender/dispatchWake 注入解耦。 ──────────────────────────────────
+
+let wakeSender = null;
+/** main 侧注册实际发送函数（sendWakePrompt） */
+export function setWakeSender(fn) {
+  wakeSender = fn;
+}
+function dispatchWake(key, reason) {
+  return wakeSender ? wakeSender(key, reason) : Promise.resolve();
+}
+
+/**
+ * 「会话忙期间把新消息直接塞进正在跑的那一轮」的注入口（实现在 wake-send.js 的 steerIntoRunningTurn）。
+ *
+ * 为什么要它：DSH 的 `session/prompt` 支持 `mode:'steer'` → `agent.steer()` → inbox 投到
+ * 'next-step'（本回合的下一个 step 边界就交给模型）；而 `mode:'queue'` 投的是
+ * 'next-turn'，那必然多出一整轮。原来的 `pendingWakeReasons` 补发走的就是 queue 这条路：
+ * 用户在你思考时补一句话 → 你回一次 → 结束后又被唤醒回一次，多花一整轮模型往返
+ * （那一轮还会把那 8 万字符的 prompt 再重发一遍）。
+ * 塞进去以后模型在同一条回复里就把新消息一起考虑掉了。
+ *
+ * 返回 Promise<boolean>：true = 已塞进在途回合（那条消息仍然照常入队做审计，
+ * 回合结束时的补发逻辑会看到"已被本轮处理"而跳过，不会重复唤醒）。
+ */
+let steerSender = null;
+
+/** main 侧注册实际执行函数（steerIntoRunningTurn） */
+export function setSteerSender(fn) {
+  steerSender = fn;
+}
+function trySteerRunningTurn(key, reason) {
+  if (!steerSender) return Promise.resolve(false);
+  try {
+    return Promise.resolve(steerSender(key, reason)).catch(() => false);
+  } catch {
+    return Promise.resolve(false);
+  }
+}
+
+// 会话状态访问器：只允许内部约定的会话 key 格式，并统一成无前导零的正整数形式，
+// 防止同一会话分裂成多个状态。
+export function getSocialState(key) {
+  const canonical = canonicalKey(key);
+  if (!canonical) {
+    const err = new Error(`无效的会话 key：${String(key ?? '')}`);
+    err.statusCode = 400;
+    throw err;
+  }
+  key = canonical;
+  let st = social.conversations.get(key);
+  if (!st) {
+    st = {
+      wakeConfig: defaultWakeConfig(),
+      recentMessages: [],
+      unread: [],
+      lastWakeReason: '',
+      lastAiReplyAt: 0,
+      lastAiSeenAt: 0, // AI 最后一次"看过消息并收尾"（mark_read/设潜水）的时间；用于区分"真被吞"与"看过选择不接"，根治重复补发唤醒
+      answeredMessageIds: [], // 「确实被回复过」的消息 id（见 §4.7e.4）：被暂存唤醒的吞/未吞判定改用它，不再比时间戳
+      pendingUndeliveredText: '', // 模型写了正文但没调发送工具（桥接不再自动转发）；暂存并提示模型自行补发
+      _undeliveredAt: 0,
+      sessionToolCalls: 0, // 会话内实际工具调用轮数（会话轮换阈值计数，与 wakeCount 取大）
+      rotateTurns: 0, // 用户真实触发回合数（会话轮换的唯一依据；replyCheck/主动等内部唤醒不计）
+      _mediaAttachedSeq: 0, // 最近一次唤醒已附图覆盖到的最高消息 seq（防同一批图反复附）
+      _promptSessionId: null, // 最近一次完整 prompt 注入时对应的 DSH sessionId（会话重建/DSH 重启后强制重新注入）
+      _promptInjected: false, // 首次完整 prompt 是否已注入（持久化：避免桥重启后对同一长驻会话重复全量注入）
+      /* 2026-09-19 修「对话中途也注入首轮提示词」· 线上实测：
+       * `wake-send.js` 用「人设/发言规则文件的 mtime:size」当版本号：注入完整 prompt 时把版本号记进
+       * `_promptOverrideStamp`，下次唤醒比较，不一样就重新注入（人设保存后立即生效的机制）。
+       * 但这个字段从来没被持久化（serialize / load / 默认值三处都没有）→ 落盘再读回来永远是 ''，
+       * 于是 `ovStamp !== ''` 恒成立 → 每次唤醒都走"人设已更新"分支、把 `_promptInjected` 打回 false，
+       * 下一轮又变成"首次唤醒，注入完整 prompt"。
+       * 现场证据：`persona.md` / `speech-rules.md` 的 mtime 一直停在 09-16（文件根本没动），
+       * 而 bridge.log 里「人设/发言规则已更新 → 重新注入完整 prompt」在 16:08~17:57 之间刷了 12 次，
+       * 且 state 里所有会话都没有 `_promptOverrideStamp` 这个字段。 */
+      _promptOverrideStamp: '', // 注入完整 prompt 时的人设文件版本号（mtime:size），人设一变就重新注入
+      /* 2026-09-20：人设已合成进系统提示词，唤醒正文不再无条件重复它：
+       *   _personaSeenStamp   = 这个会话的系统提示词/正文里"见过"的人设版本（默认空 = 还没记过）
+       *   _personaNeedsReinject = 要不要在下一次完整注入时补一遍（人设刚改 / 重启前就存在的老会话） */
+      _personaSeenStamp: '',
+      _personaNeedsReinject: false,
+      _standbySessionId: null, // 已预建并预热的"下一代会话"id（轮换时直接切换）
+      _standbyWarming: false, // 预热创建/请求进行中标记（防重入）
+      lastActionAt: 0,
+      agentToken: fixedTokenForKey(key),
+      bootstrapSent: false,
+      wakeTimes: [],
+      sendTimes: [],
+      stickerCollectTimes: [],
+      pendingWakeTimer: null,
+      sleepTimer: null,
+      replyCheckTimer: null,
+      proactiveTimer: null,
+      lastIncomingAt: 0,
+      preSleepWaitSatisfiedAt: 0,
+      preSleepWaitObservedAt: 0,
+      preSleepWaitAccumMs: 0,
+      lastUnreadSeq: 0,
+      lastDeliveredSeq: 0,   // 已交给模型的最高 seq（wake-send.js 投递水位 / console-server 等待工具水位）
+      _wakeIntendedSeq: 0,   // 桥打算交付的最高 seq（投递看门狗的意图水位，见 sweepUndelivered）
+      activeTopics: [],
+      pendingThoughts: [],
+      memberImpressions: {},
+      // 2026-10-07 每日主动私聊硬配额（主人定的：每天主动找他 1~2 次、首次机会 50% 骰子、绝不超 2 次）：
+      //   proactiveDay     —— 计数器归属的本地日期 "YYYY-MM-DD"（换日自动清零）
+      //   proactiveCount   —— 今天已经"真的开口"的主动私聊次数（模型开口才算，被 gate 拦下的不算）
+      //   proactiveRolled  —— 今天的首枚骰子是否已经掷过（true=今天开口与否已定，不再掷）
+      proactiveDay: '',
+      proactiveCount: 0,
+      proactiveRolled: false
+    };
+    KNOWN_AGENT_TOKENS.add(st.agentToken);
+    social.conversations.set(key, st);
+    scheduleProactiveCheck(key);
+    setupSleepTimer(key);
+  }
+  return st;
+}
+
+// ── 会话重置：清会话状态，但保住「已回复账本」 ────────────────────────────────
+// 2026-09-16 真机事故「reset 之后会重复回复一次」：
+//   所有 reset 路径（控制台 /api/session/reset、/api/social/reset、/api/workspace/reset、
+//   聊天里发 /reset 或 /new、卡死隔离）原来都是 `social.conversations.delete(key)` 一刀切。
+//   被删掉的不只是会话上下文，还有四样"这个会话已经处理到哪了"的账：
+//     · answeredMessageIds  「确实被回复过」的消息 id 集合
+//     · lastDeliveredSeq   已交给模型的最高 seq（投递水位 / 等待工具基线）
+//     · _wakeIntendedSeq   桥打算交付的最高 seq（投递看门狗水位）
+//     · lastUnreadSeq      本地 seq 计数器（appendSocialMessage 用它 +1）
+//   现场证据：private 会话 reset 前 hold 记的是 baselineSeq=63，reset 后立刻变成 baselineSeq=1；
+//   group 会话 reset 前 steer 记的是 seq=1756，reset 后 social-state.json 里只剩 lastDeliveredSeq=5。
+//   账本一没，同一个会话在重置后就成了"白纸"：旧消息的分发水位归零、已回复过的 id 也不认识了，
+//   于是新会话可能把刚回过的内容再回一遍（重复回复）。同时 `_justAutoReset` 提示也随对象一起没了，
+//   模型连"刚换上下文、别重答旧话题"这句都没有。
+//
+//   修法：换成"先快照账本 → 删旧状态 → 立刻把账本写回新状态"。
+//   踩过的坑（必须同生同死）：只保水位不保 seq 计数器是更严重的误杀——重置后新消息的 seq
+//   会从 1 重新数，而 lastDeliveredSeq 还停在 63，看门狗/注入去重会把这些新消息全判成"已交付"，
+//   机器人从此装死不回。所以这四项永远一起搬（见 send-idempotency.js 的 REPLY_LEDGER_FIELDS）。
+export function resetConversationKeepingLedger(key) {
+  const canonical = canonicalKey(key);
+  if (!canonical) return null;
+  const prev = social.conversations.get(canonical) || null;
+  social.conversations.delete(canonical);
+  if (!prev) return null;
+  const carried = carryReplyLedger(prev);
+  if (!carried || !carried.carried.length) return null;
+  // 重建一份干净的会话状态，只把账本写回去（其余 wakeConfig/unread/令牌全部按全新会话走）。
+  const st = getSocialState(canonical);
+  Object.assign(st, carried.patch);
+  saveSocialState();
+  log(`[reset] ${canonical} 会话已重置，保留已回复账本（${carried.carried.join('、')}）`
+    + `——重置前后同一批消息不会因为账本丢失被重新唤醒重复回复`);
+  return carried;
+}
+
+// 从持久化文件加载 social 状态（重启恢复）
+export function loadSocialState() {
+  try {
+    const raw = readJsonSafe(SOCIAL_STATE_FILE, null);
+    social.paused = raw?.paused === true;
+    if (raw && typeof raw.conversations === 'object') {
+      for (const [key, val] of Object.entries(raw.conversations)) {
+        if (!val || typeof val !== 'object') continue;
+        if (!/^(group|private):\d+$/.test(key)) continue;
+        const defaultWc = defaultWakeConfig();
+        // 固定令牌：由会话 key + ownerQQ 派生（跨重启/会话轮换不变，模型上下文稳定）。
+        // 迁移说明：原持久化的随机/存储 token 一律替换为派生值，旧值不再被使用；
+        // KNOWN_AGENT_TOKENS 会对新值 add；旧值若曾 add 仅残留在脱敏集合里（只增语义，无碍）。
+        const agentToken = fixedTokenForKey(key);
+        const st = {
+          wakeConfig: {
+            ...defaultWc,
+            ...(val.wakeConfig ?? {}),
+            triggers: { ...defaultWc.triggers, ...((val.wakeConfig?.triggers) ?? {}) }
+          },
+          recentMessages: Array.isArray(val.recentMessages) ? val.recentMessages : [],
+          // 不恢复持久化的旧 unread(曾经导致几十条历史未读跨重启"复活"、反复重放造成挤压):
+          // 重启后统一由唤醒路径按 lastAiSeenAt 水位从 DB 拉真正的"水位之后"新消息。
+          unread: [],
+          lastWakeReason: String(val.lastWakeReason ?? ''),
+          lastAiReplyAt: Number(val.lastAiReplyAt) || 0,
+          answeredMessageIds: Array.isArray(val.answeredMessageIds)
+            ? val.answeredMessageIds.map((x) => String(x ?? '')).filter(Boolean).slice(-300)
+            : [],
+          lastActionAt: Number(val.lastActionAt) || 0,
+          agentToken,
+          bootstrapSent: !!val.bootstrapSent,
+          wakeTimes: Array.isArray(val.wakeTimes) ? val.wakeTimes : [],
+          sendTimes: Array.isArray(val.sendTimes) ? val.sendTimes : [],
+          stickerCollectTimes: Array.isArray(val.stickerCollectTimes) ? val.stickerCollectTimes : [],
+          pendingWakeTimer: null,
+          sleepTimer: null,
+          replyCheckTimer: null,
+          proactiveTimer: null,
+          lastIncomingAt: Number(val.lastIncomingAt) || 0,
+          lastAiSeenAt: Number(val.lastAiSeenAt) || 0,
+          pendingUndeliveredText: String(val.pendingUndeliveredText ?? ''),
+          _undeliveredAt: Number(val._undeliveredAt) || 0,
+          sessionToolCalls: Number(val.sessionToolCalls) || 0,
+          _promptInjected: val._promptInjected === true,
+          // 2026-09-19：读回来也要认这个字段，否则重启后它又变回 undefined → 又触发"人设已更新"。
+          _promptOverrideStamp: (typeof val._promptOverrideStamp === 'string' && val._promptOverrideStamp) ? val._promptOverrideStamp : '',
+          _personaSeenStamp: (typeof val._personaSeenStamp === 'string' && val._personaSeenStamp) ? val._personaSeenStamp : '',
+          _personaNeedsReinject: val._personaNeedsReinject === true,
+          _standbySessionId: (typeof val._standbySessionId === 'string' && val._standbySessionId) ? val._standbySessionId : null,
+          _standbyWarming: val._standbyWarming === true,
+          _mediaAttachedSeq: Number(val._mediaAttachedSeq) || 0,
+          rotateTurns: Number(val.rotateTurns) || 0,
+          _promptSessionId: (typeof val._promptSessionId === 'string' && val._promptSessionId) ? val._promptSessionId : null,
+          preSleepWaitSatisfiedAt: Number(val.preSleepWaitSatisfiedAt) || 0,
+          preSleepWaitObservedAt: Number(val.preSleepWaitObservedAt) || 0,
+          preSleepWaitAccumMs: Number(val.preSleepWaitAccumMs) || 0,
+          lastUnreadSeq: Number(val.lastUnreadSeq) || 0,
+          lastDeliveredSeq: Number(val.lastDeliveredSeq) || 0,
+          _wakeIntendedSeq: Number(val._wakeIntendedSeq) || 0,
+          activeTopics: Array.isArray(val.activeTopics) ? val.activeTopics : [],
+          pendingThoughts: Array.isArray(val.pendingThoughts) ? val.pendingThoughts : [],
+          proactiveDay: String(val.proactiveDay ?? ''),
+          proactiveCount: Number(val.proactiveCount) || 0,
+          proactiveRolled: val.proactiveRolled === true,
+          memberImpressions: (() => {
+            const rawImp = (val.memberImpressions && typeof val.memberImpressions === 'object') ? val.memberImpressions : {};
+            const clean = {};
+            for (const [k, v] of Object.entries(rawImp)) {
+              if (['__proto__', 'constructor', 'prototype'].includes(k)) continue;
+              clean[k] = v;
+            }
+            return clean;
+          })()
+        };
+        // 旧状态/异常状态里的指定成员名单也统一归一化，防止"null"/非法值污染。
+        if (st.wakeConfig?.triggers && typeof st.wakeConfig.triggers === 'object') {
+          st.wakeConfig.triggers.speakerIds = normalizeSpeakerIds(st.wakeConfig.triggers.speakerIds);
+          if (key.startsWith('private:')) st.wakeConfig.triggers.speakerIds = [];
+        }
+        // 仍使用默认唤醒配置的会话，在重启加载时同步到当前推荐/默认参数。
+        refreshDefaultWakeConfig(st);
+        KNOWN_AGENT_TOKENS.add(st.agentToken);
+        social.conversations.set(key, st);
+        // 重启后从已持久化的消息与 seenForwardIds 字段重建"本会话见过的 forward id"
+        {
+          const rebuilt = new Set();
+          if (Array.isArray(val.seenForwardIds)) {
+            for (const fid of val.seenForwardIds) {
+              const safe = sanitizeForwardId(fid);
+              if (safe) rebuilt.add(safe);
+            }
+          }
+          for (const m of [...(st.recentMessages || []), ...(st.unread || [])]) {
+            if (Array.isArray(m?.forwardIds)) {
+              for (const fid of m.forwardIds) {
+                const safe = sanitizeForwardId(fid);
+                if (safe) rebuilt.add(safe);
+              }
+            }
+          }
+          if (rebuilt.size) seenForwardIds.set(key, rebuilt);
+        }
+        ensureWakeable(st, { skipSave: true, key });
+        scheduleProactiveCheck(key);
+      }
+      // 加载阶段统一落盘一次，避免 ensureWakeable 中途写盘覆盖未加载会话。
+      saveSocialState();
+    }
+  } catch (error) {
+    log('读取 social 状态失败:', error?.message ?? error);
+  }
+}
+
+// 防"永眠"：检查当前 WakeConfig 是否至少有一个可触发唤醒的途径；没有则重置为默认配置。
+// opts.skipSave=true 用于加载状态阶段，避免中途落盘覆盖尚未加载的会话。
+export function ensureWakeable(st, opts = {}) {
+  if (!st || !st.wakeConfig) return;
+  const key = opts.key || st.key;
+  const wc = st.wakeConfig;
+  if (!wc.triggers || typeof wc.triggers !== 'object') wc.triggers = {};
+  const tr = wc.triggers;
+  // 掉垃圾数据只留有效 QQ 号，避免"null"/对象等脏值被当成可唤醒条件绕过防永眠。
+  tr.speakerIds = normalizeSpeakerIds(tr.speakerIds);
+  const timed = !wc.infinite && wc.sleepUntil && Number.isFinite(Date.parse(wc.sleepUntil)) && Date.parse(wc.sleepUntil) > Date.now();
+  const wakeable = wc.mode === 'active' || tr.anyMessage || tr.atMention || tr.nameMention || tr.poke ||
+    (Array.isArray(tr.keywords) && tr.keywords.length > 0) || tr.question || Number(tr.probability) > 0 ||
+    tr.speakerIds.length > 0 || timed;
+  if (!wakeable) {
+    if (st.sleepTimer) {
+      clearTimeout(st.sleepTimer);
+      st.sleepTimer = null;
+    }
+    st.wakeConfig = defaultWakeConfig();
+    if (!opts.skipSave) saveSocialState();
+    if (key) setupSleepTimer(key);
+    log(`[default] 唤醒配置无任何触发条件，已重置为默认配置，避免永眠`);
+  }
+}
+
+export function cancelReplyCheck(key) {
+  const st = social.conversations.get(key);
+  if (!st || !st.replyCheckTimer) return;
+  clearTimeout(st.replyCheckTimer);
+  st.replyCheckTimer = null;
+}
+
+export function cancelProactiveCheck(key) {
+  const st = social.conversations.get(key);
+  if (!st || !st.proactiveTimer) return;
+  clearTimeout(st.proactiveTimer);
+  st.proactiveTimer = null;
+}
+
+// 有限睡眠到期后唤醒
+export function setupSleepTimer(key) {
+  if (cfgRef.social?.enabled === false) return;
+  if (!isSessionAllowedInCurrentMode(key)) return;
+  const st = getSocialState(key);
+  cancelReplyCheck(key); // 有限睡眠配置已接管，取消回复检查
+  if (st.sleepTimer) {
+    clearTimeout(st.sleepTimer);
+    st.sleepTimer = null;
+  }
+  if (social.paused) return;
+  const wc = st.wakeConfig;
+  if (!wc || wc.infinite || !wc.sleepUntil) return;
+  const until = Date.parse(wc.sleepUntil);
+  if (!Number.isFinite(until)) return;
+  const delay = until - Date.now();
+  if (delay <= 0) {
+    void dispatchWake(key, 'timeout').catch((error) => log(`[default] 睡眠到期唤醒异常 ${key}:`, error?.message ?? error));
+    return;
+  }
+  // Node setTimeout 超过 2^31-1ms 会按 1ms 触发；远未来定时器先等满上限后重新续期，而不是提前唤醒。
+  const MAX_TIMEOUT_MS = 2147483647;
+  if (delay > MAX_TIMEOUT_MS) {
+    st.sleepTimer = setTimeout(() => {
+      st.sleepTimer = null;
+      setupSleepTimer(key);
+    }, MAX_TIMEOUT_MS);
+    st.sleepTimer.unref?.();
+    log(`[default] 设置远未来有限潜水定时器 ${key}，首段 ${Math.round(MAX_TIMEOUT_MS / 86400000)} 天后续期`);
+    return;
+  }
+  st.sleepTimer = setTimeout(() => {
+    st.sleepTimer = null;
+    void dispatchWake(key, 'timeout').catch((error) => log(`[default] 睡眠到期唤醒异常 ${key}:`, error?.message ?? error));
+  }, delay);
+  st.sleepTimer.unref?.();
+  log(`[default] 设置有限潜水定时器 ${key}，剩余 ${Math.round(delay / 1000)}s`);
+}
+
+// 主动机会检查（群/私聊独立参数，低概率开口）
+export function scheduleProactiveCheck(key) {
+  if (cfgRef.social?.proactive?.enabled === false) return;
+  if (social.paused) return;
+  // 2026-10-11：按 uid 排除私聊主动冒泡（如“不粘人”的网友）——仅拦无来由的主动，真实消息照常唤醒。
+  if (String(key).startsWith('private:')) {
+    const exclUid = String(key).split(':')[1] || '';
+    const exclList = Array.isArray(cfgRef.social?.proactive?.privateExcludeUids) ? cfgRef.social.proactive.privateExcludeUids.map(String) : [];
+    if (exclList.includes(exclUid)) return;
+  }
+  if (!isSessionAllowedInCurrentMode(key)) return;
+  if (inDndWindow()) {
+    // 免打扰时段不排主动机会；但保留链条：到窗口结束时自动重排一次（每小时兜底重检）。
+    const resumeMs = nextDndResumeMs();
+    if (!resumeMs) return; // 整天免打扰/解析异常：不排
+    const st0 = social.conversations.get(key);
+    if (st0 && !st0.proactiveTimer) {
+      st0.proactiveTimer = setTimeout(() => {
+        st0.proactiveTimer = null;
+        scheduleProactiveCheck(key);
+      }, Math.min(resumeMs, 60 * 60 * 1000));
+      st0.proactiveTimer.unref?.();
+      log(`[default] 免打扰中 ${key}：${Math.round(Math.min(resumeMs, 3600000) / 60000)}min 后恢复主动机会检查`);
+    }
+    return; // 免打扰时段不排主动机会（@/私聊等真实触发仍走 scheduleWake）
+  }
+  // deepsleep 与「单群静默名单」都只针对群聊（私聊照常）：静默群不主动冒泡。
+  if (String(key).startsWith('group:')) {
+    const gpId = String(key).split(':')[1] || '';
+    const silentGroups = Array.isArray(cfgRef.social?.deepsleepGroups) ? cfgRef.social.deepsleepGroups.map(String) : [];
+    if (cfgRef.social?.deepsleep || silentGroups.includes(gpId)) return;
+  }
+  const st = getSocialState(key);
+  if (st.proactiveTimer) return;
+  const p = cfgRef.social?.proactive ?? {};
+  // 私聊用独立更主动的参数（privateCheckIntervalMinMs/MaxMs/privateProbability），群聊用常规参数。
+  const isPrivate = String(key).startsWith('private:');
+  const min = Math.max(60 * 1000, Number(isPrivate ? p.privateCheckIntervalMinMs : p.checkIntervalMinMs) || (isPrivate ? 15 * 60 * 1000 : 30 * 60 * 1000));
+  const max = Math.max(min, Number(isPrivate ? p.privateCheckIntervalMaxMs : p.checkIntervalMaxMs) || (isPrivate ? 40 * 60 * 1000 : 90 * 60 * 1000));
+  const delay = Math.floor(min + Math.random() * (max - min));
+  st.proactiveTimer = setTimeout(() => {
+    st.proactiveTimer = null;
+    ensureWakeable(st, { key });
+    const idleThreshold = Number(p.idleThresholdMs) || 15 * 60 * 1000;
+    const idle = Date.now() - (st.lastIncomingAt || 0);
+    const pendingThoughts = Array.isArray(st.pendingThoughts) ? st.pendingThoughts.filter((t) => t && (!t.expiresAt || Date.now() < Number(t.expiresAt))).length : 0;
+    // 有话题才开口（默认开启 freshContextOnly）：未读/待办想法/近 2h 他人发言都没有就只重排下一轮，
+    // 不触发 LLM——配合 DND 避免凌晨/无话题空转。
+    const fresh = (Array.isArray(st.unread) && st.unread.length > 0)
+      || pendingThoughts > 0
+      || (Array.isArray(st.recentMessages) ? st.recentMessages : []).some((m) => m && !m.isSelf && Date.now() - Number(m.time || 0) < 2 * 60 * 60 * 1000);
+    const gate = proactiveGate({
+      probCfg: isPrivate ? p.privateProbability : p.probability,
+      freshOnly: cfgRef.social?.proactive?.freshContextOnly !== false,
+      fresh,
+      idleMs: idle,
+      idleThresholdMs: idleThreshold,
+      busy: isConversationBusy(key, st)
+    });
+    // 2026-10-07 每日主动私聊硬配额（主人原话更正版："每天必定找我一次。第二次要不要找，看骰子，50%找我"）：
+    //   2026-10-11 起每天固定 2 次（删掉原第 2 次 50% 掷骰）。
+    //   
+    //   计数 ≥2 → 硬拦（绝不超过 2 次）。
+    //   只管"无来由的主动"，真实消息照常唤醒，不受配额影响。计数在模型真的开口后落账（social-flow.js recordSentMessages）。
+    let quotaBlock = false;
+    if (gate.fire && isPrivate) {
+      const today = new Date().toLocaleDateString('en-US', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' });
+      if (st.proactiveDay !== today) {
+        st.proactiveDay = today;
+        st.proactiveCount = 0;
+        st.proactiveRolled = false;
+      }
+      // 2026-10-17 按uid独立配额：privateDailyMaxByUid[uid] 优先，缺省回落 privateDailyMax
+      const byUidMax = (p.privateDailyMaxByUid && typeof p.privateDailyMaxByUid === 'object') ? p.privateDailyMaxByUid : {};
+      const uidHere = String(key).split(':')[1] || '';
+      const dailyMax = Math.max(0, Number(byUidMax[uidHere] ?? p.privateDailyMax) || 2);
+      const used = Number(st.proactiveCount) || 0;
+      if (used >= dailyMax) {
+        quotaBlock = true;
+        log(`[default] proactive 私聊配额判定 ${key}: 今日已主动 ${used}/${dailyMax} 次，封口`);
+      }
+      // 2026-10-11 主人指示：删掉第 2 次 50% 骰子——每天固定 2 次，用完即封口。
+    }
+    if (gate.fire && quotaBlock === false && isPrivate) {
+      // 会开口的这轮先预记账：模型被唤醒后"真的开口"才算数，纯判断(qq_mark_read)会在回调里退还。
+      st._proactivePending = true;
+    }
+    if (gate.fire && !quotaBlock) {
+      void dispatchWake(key, 'proactiveCheck').catch((error) => log(`[default] proactive 唤醒异常 ${key}:`, error?.message ?? error));
+    } else {
+      log(`[default] proactive 本轮不开口(${gate.why}) ${key}`);
+    }
+    scheduleProactiveCheck(key);
+  }, delay);
+  st.proactiveTimer.unref?.();
+  log(`[default] 已安排主动机会检查 ${key}，约 ${Math.round(delay / 60000)}min 后`);
+}
+
+/**
+ * 「这一轮主动机会要不要真的开口」的判定（纯函数，2026-09-30 去概率化）。
+ *
+ * 为什么改（主人原话："修复群聊插话概率的问题，别写死让模型自己判断"，并明确要求
+ * "不要保留任何『多少概率才回』这类机械判断，只保留非决策类硬性护栏"）：
+ * 原来这里是 `Math.random() < prob`，而且 prob 还被四个机械系数乘来乘去
+ * （有想法 ×1.4、刚回过话 ×0.5、深夜 ×0.3、一小时里自己说过 5 句 ×0.3）。
+ * 结果就是"要不要开口"完全由桥拍板、模型只是被叫醒后补一句 —— 概率低的时候它整晚没有
+ * 开口机会，概率高的时候它被叫醒却无话可说，两边都像机器。
+ *
+ * 现在：桥只做**结构性**判定（开关 / 有没有话题 / 是否冷场 / 会话是否正忙），
+ * 剩下的"值不值得开口、开什么口"一律交给模型 —— 被叫醒时 preset 的 [WAKE TYPES] 第 3 条
+ * 就是"没人先说话，觉得值得开口才开，否则 qq_mark_read"，代价是多花一步判断。
+ *
+ * @param {{probCfg?:*, freshOnly?:boolean, fresh?:boolean, idleMs?:number, idleThresholdMs?:number, busy?:boolean}} a
+ * @returns {{fire:boolean, why:string}} fire=true 时把这一步交给模型；why 只用于日志
+ */
+export function proactiveGate(a) {
+  const { probCfg, freshOnly, fresh, idleMs, idleThresholdMs, busy } = a || {};
+  // 显式 0 = 明确关闭这一类会话的主动冒泡（关/开，不是阈值）。缺键 / null / 空串 / 非数字都不算关闭。
+  if (probCfg !== undefined && probCfg !== null && probCfg !== '' && Number(probCfg) === 0) return { fire: false, why: 'off-switch' };
+  // 「有话题才开口」：没有可判断的内容，叫醒模型也只能空转（配置项 social.proactive.freshContextOnly）
+  if (freshOnly !== false && !fresh) return { fire: false, why: 'no-topic' };
+  // 冷场判定：对方还在说话时不主动插一脚（配置项 social.proactive.idleThresholdMs）
+  if (!(Number(idleMs) >= Number(idleThresholdMs))) return { fire: false, why: 'not-idle' };
+  if (busy) return { fire: false, why: 'busy' };
+  return { fire: true, why: 'model-decides' };
+}
+
+// 对方持续输入时，唤醒最多再顺延的总上限（P4-22 迁入）
+// 私聊「等对方打完字」的硬上限（ms）。2026-09-11 从 15000 收到 2500：
+// 原来对方只要还在输入，私聊唤醒窗口最多顺延到 15 秒，加上「停止输入」还有 2 秒合并窗，
+// 再叠加模型两次往返 ≈ 8 秒 —— 体感就是「发完消息它半天不动，突然回一大段」，很割裂。
+// 现在最多等 2.5 秒就开始回：对方要是还有后半句，发出来会再唤醒一次，比干等更顺。
+export const PEER_TYPING_HOLD_MAX_MS = 2500;
+
+// 计划唤醒：合并窗口 + 优先级升级 + busy 暂存 + 定时投递（P4-22 迁入，sendWakePrompt 走 dispatchWake）
+export function scheduleWake(key, reason) {
+  if (cfgRef.social?.enabled === false) return;
+  if (social.paused) return;
+  if (!isSessionAllowedInCurrentMode(key)) {
+    log(`[default] 跳过计划唤醒 ${key}（${reason}）：会话已不在当前模式允许范围内`);
+    return;
+  }
+  // 免打扰时段拦截内部低价值唤醒（reason 可能带 ':分组' 后缀，取冒号前基名）；
+  // timeout/@/提问/私聊/拍一拍/点名等真实触发不拦（免打扰≠失联，被直接叫到仍回）。
+  const baseReason = String(reason ?? '').split(':')[0];
+  if (inDndWindow() && /^(proactiveCheck|replyCheck|probability|anyMessage|keyword)$/.test(baseReason)) {
+    log(`[default] 免打扰窗口，跳过内部唤醒 ${key}（${reason}）`);
+    return;
+  }
+  const st = getSocialState(key);
+  // 2026-09-12 投递看门狗的"意图水位"：只要 scheduleWake 被调用，就说明桥已经决定把这条消息交给模型，
+  // 于是把水位推进到"此刻 unread 的最高 seq"。看门狗（sweepUndelivered）只兜这一类：
+  //   `seq <= _wakeIntendedSeq（桥打算交付） && seq > lastDeliveredSeq（但没交出去）`。
+  // 为什么必须有这个水位："有未读"和"决定唤醒"是两回事。
+  //   群聊在潜水模式下按概率/关键词决定接不接话，绝大多数普通消息根本不会触发唤醒——
+  //   那是功能，不是故障。看门狗如果只按 `seq > lastDeliveredSeq` 判，就会把这些安静略过的消息
+  //   在 25 秒后全部强制唤醒：潜水模式被废掉、还白烧一大堆 token。
+  //   （这个坑实测踩到过：2026-09-12 00:14 群 某群的一条普通消息被误判成"收下没交付"。）
+  try {
+    const maxUnreadSeq = (Array.isArray(st.unread) ? st.unread : [])
+      .reduce((m, x) => Math.max(m, Number(x && x.seq) || 0), 0);
+    if (maxUnreadSeq > 0) st._wakeIntendedSeq = Math.max(Number(st._wakeIntendedSeq) || 0, maxUnreadSeq);
+  } catch (_) {}
+  // 2026-09-11 需求：除了首轮，不要再往对话窗口注入任何消息 —— 要注入到"思考"里。
+  // 该会话此刻正挂着一个 `qq_wait_for_messages` 长轮询：新消息会作为工具结果直接回到模型手里。
+  // 所以这里什么都不做：不 steer（steer 在 DSH 里必然产生一条 user/message → 会出现在对话窗口）、
+  // 不暂存、不补发、不唤醒。这才是"注入到思考里"—— 消息从工具调用返回，而不是被推成一条聊天消息。
+  // 依据：DSH 的 sessionPromptRequestSchema 只有 sessionId/mode/content/clientTimeZone，
+  // 没有任何"不可见"字段；additionalContexts 的类型也是 UserMessage[]。桥推送必然可见。
+  if (activeWaits.has(key)) {
+    log(`[default] ${key} 正在 qq_wait_for_messages 长轮询中，新消息随工具结果交回模型（不注入对话、不唤醒）`);
+    return;
+  }
+  if (st.pendingWakeTimer) {
+    // 合并窗口内已有待发送唤醒：按优先级升级最终原因，避免先概率后 @ 却仍按概率唤醒。
+    const cur = st.pendingWakeReason || reason;
+    if (wakePriority(reason) > wakePriority(cur)) {
+      st.pendingWakeReason = reason;
+      log(`[default] 合并窗口内升级唤醒原因 ${key}: ${cur} -> ${reason}`);
+    }
+    return;
+  }
+  if (isConversationBusy(key, st)) {
+    // 2026-09-12 架构收敛：这里故意不做任何投递，只放行到下面的合并窗。
+    // 与 wake-send.js 的 busy 分支（真正投递那一刻的判定）分工如下：
+    //   · 这里 = "合并窗之前"的判定。此刻刚到的消息还没攒够，必须先走合并窗
+    //     （2026-09-11 的实测教训：为了压延迟把合并窗压到 800ms，两条隔 2 秒的消息被拆成两批，
+    //      "正常人肯定一起回"的话被甩成两条回复）。在这里 steer 会绕过合并窗，等于把那个坑再踩一次。
+    //   · wake-send.js 那份 = "投递那一刻"的判定。那时批已经攒好，才该决定"塞进在途回合"还是"正常唤醒"。
+    // 所以：忙时不暂存、不丢消息，只是等合并窗；到点后由 wake-send 优先 steer 进在途回合，
+    // 塞不进去则走正常唤醒——而正常唤醒现在也是 steer 投递（prompt-deliver.js），
+    // 因此无论哪条路都不可能再卡在 DSH 的 next-turn 队列里（2026-09-11 23:58 报的故障）。
+    log(`[default] ${key} 会话繁忙但模型未在等待工具里 → 先攒合并窗，到点后优先塞进在途回合（不暂存，避免永久卡死）`);
+    // 故意不 return：继续走下面的合并窗 + 正常唤醒流程
+  }
+  cancelReplyCheck(key); // 真实唤醒已接管，取消普通回复检查，避免 30s 后再补一刀
+  if (st.sleepTimer) {
+    clearTimeout(st.sleepTimer);
+    st.sleepTimer = null;
+  }
+  st.pendingWakeReason = reason;
+  // 交互型唤醒（@/提问/名字/拍一拍/私聊）用短合并窗口尽快响应；概率/主动/回复检查类保持合并窗口省 token。
+  // 秒唤醒（2026-09-06 需求）：私聊合并窗 1s；群聊 @/提问 0.8s；概率/anyMessage 类 3s 上限。
+  //
+  // 2026-09-11 再提速：补发轮（`_rebroadcastWake`，也就是"会话忙期间被暂存、回合结束后补发"的那批，
+  // 唤醒正文里的 `[Unread n] owner[QQ=…](id:…): …` 就是它们）不再攒合并窗：
+  //   · 合并窗的意义是"把刚到的连发攒成一轮"，而这批消息已经在"会话忙"期间等过了，再攒 1s 纯属重复等待；
+  //   · 同理也不再因为"对方还在输入"顺延（最多 2.5s）——他早就在等了。
+  // 于是这批消息从"回合结束 → 再等 1s(+最多2.5s) → 投递"变成"回合结束 → 0.2s → 投递"。
+  // 防泄漏：标志由 wake-send 在出 prompt 时清 0，且只在 120s 内有效（见 wake-send.js rbNote）。
+  // 这里必须用同一个 TTL 判定：否则补发轮若被拖过 120s，这一行读到的仍是 >0，
+  // 该会话之后的每一轮普通唤醒都会被误判成补发轮 → 永久 200ms 且永久失去"对方正在输入"等待。
+  const rbAt = Number(st._rebroadcastWake) || 0;
+  const isReplayWake = rbAt > 0 && Date.now() - rbAt < 120000;
+  if (rbAt > 0 && !isReplayWake) st._rebroadcastWake = 0; // 过期即清，杜绝泄漏成“永久提速”
+  const interactiveReasons = /^(atMention|question|nameMention|poke|private)$/;
+  const isPrivateWake = key.startsWith('private:') && /^(private|poke|nameMention|question)$/.test(String(reason).split(':')[0]);
+  let batchMs = isReplayWake
+    ? 200
+    : (interactiveReasons.test(String(reason))
+      ? (isPrivateWake ? 1000 : 800)
+      : Math.min(3000, Math.max(400, Number(st.wakeConfig?.batchWindowMs) || 2000)));
+  // 私聊智能等待（2026-09-15 需求：看对方打字状态、等打完再回，并用概率骰子决定要不要插话）：
+  //   · 命中"等"→ 把唤醒窗口拉长（上限 social.typing.holdMaxMs），期间到的消息全进 unread → 合并成一次注入；
+  //   · 命中"插话"（骰子命中 / 等太久到上限）→ 按正常节奏回，不抢话也不干等。
+  // 补发轮跳过这一条：那批消息早在"会话忙"期间就等着了，再等他打完字只是二次延迟。
+  if (!isReplayWake && key.startsWith('private:')) {
+    const decision = typingHoldDecision({ typingUntil: st.peerTypingUntil, since: st.peerTypingSince, cfg: cfgRef });
+    if (decision.wait) {
+      // 2026-09-16 晚 修「思考期间到的消息被塞进下一个唤醒」：会话正忙（有回合在跑）时，
+      // 绝不许把唤醒窗口拉过这一轮：一旦拖到回合结束，投递就只能走"完整唤醒"= 下一个唤醒/下一轮。
+      // 线上实测 13:39:59 那条消息就是这么被拖出当前轮的（窗口被拉到 5.2s → 13:40:05 投递时
+      // `[steer] 跳过：没有正在跑的模型回合` → `唤醒 private:*（private）`）。
+      // 有回合在跑时窗口最多顺延 STEER_IN_TURN_DEFER_MAX_MS（在途注入那条路才是正解）；
+      // 模型本回合一条都还没发出去时一秒都不等（等下去只是把它拖出这一轮，见 wake-send.js 的 noReplyYet）。
+      const busyNow = isConversationBusy(key, st);
+      const hasBubble = turnHasBubble(key, state.sessions[key], st);
+      const remainMs = decision.remainMs + 500;
+      const waitMs = busyNow
+        ? (hasBubble ? Math.min(remainMs, STEER_IN_TURN_DEFER_MAX_MS) : 0)
+        : Math.min(decision.cfg.holdMaxMs, remainMs);
+      if (waitMs > 0) batchMs = Math.max(batchMs, waitMs);
+      log(`[typing] ${typingHoldText(decision, key)}${busyNow
+        ? `；会话正忙（有回合在跑）→ 唤醒窗口最多顺延 ${(STEER_IN_TURN_DEFER_MAX_MS / 1000).toFixed(1)}s，` +
+          (hasBubble ? '本回合已发过气泡，允许短暂延迟' : '本回合一条都还没发出去，一秒不等、立刻投给在途回合')
+        : ''}；唤醒窗口 ${(batchMs / 1000).toFixed(1)}s`);
+    } else if (decision.breakIn) {
+      log(`[typing] ${typingHoldText(decision, key)}`);
+    }
+  }
+  if (isReplayWake) log(`[default] ${key} 补发轮提速：合并窗 ${batchMs}ms（这批消息已在忙期间等过，不再攒窗/不再等对方输入）`);
+  st.pendingWakeTimerStartedAt = Date.now();
+  st.pendingWakeTimer = setTimeout(() => {
+    st.pendingWakeTimer = null;
+    st.pendingWakeTimerStartedAt = 0;
+    const finalReason = st.pendingWakeReason || reason;
+    st.pendingWakeReason = null;
+    void dispatchWake(key, finalReason).catch((error) => log(`[default] 计划唤醒异常 ${key}:`, error?.message ?? error));
+  }, batchMs);
+  log(`[default] 计划唤醒 ${key}（${reason}），${batchMs >= 1000 ? Math.round(batchMs / 1000) + 's' : batchMs + 'ms'} 后发送`);
+}
+
+// ── 投递看门狗：把"绝不吞消息"从"应该不会"变成"不可能" ─────────────────────────────
+// 2026-09-12：只做一件事：找出桥已经决定要交付、却一直没有交出去的消息，重新排一次唤醒。
+//
+// 判据是两段水位（两个都必须满足）：
+//   ① `seq <= _wakeIntendedSeq` —— 桥打算交付它（每次 scheduleWake 就会推进这个水位）；
+//   ② `seq > lastDeliveredSeq`  —— 但还没交出去。
+// 为什么必须有①："有未读"和"决定唤醒"是两回事。群聊在潜水模式下按概率/关键词决定接不接话，
+//    绝大多数普通消息根本不触发唤醒 —— 那是功能，不是故障。只看②的话，这些被安静略过的消息
+//    会在 25 秒后被全部强制唤醒：潜水模式废掉 + 白烧一堆 token。
+//    （实测踩到：2026-09-12 00:14 某群的一条普通消息被误判成"收下没交付"。）
+// 另一条判据的取舍：交付 = 模型看到了 → 它选择不回是有意识的决定（2026-09-11 选的 B），不该重发；
+//    未交付 = 桥这边某条链路静默失败了 → 必须重试。所以这里兜的是投递，不是"有没有被回复"。
+//
+// 触发条件刻意卡得很紧（正常路径下一次都不会触发——投递在 1~3 秒内完成）：
+//   ① 会话不在 `activeWaits`（等待工具在跑时，消息随工具结果回去，不需要唤醒）；
+//   ② 没有待发合并窗、没有投递在途、没有桥内队列、没有 DSH 断连期间的待补投队列；
+//   ③ 该条 seq 既没有被唤醒正文展示过（turnSeenUnread），也没有被 steer 注入过（turnSteeredSeqs）；
+//   ④ 已经等了 `overdueMs`（默认 25s）——远大于任何正常路径的投递耗时；
+//   ⑤ 同一会话两次兜底至少隔 `minRetryMs`（默认 60s），避免失败时刷屏/刷 token。
+const WATCHDOG_DEFAULT_INTERVAL_MS = 20000;
+const WATCHDOG_DEFAULT_OVERDUE_MS = 25000;
+const WATCHDOG_DEFAULT_MIN_RETRY_MS = 60000;
+
+export function sweepUndelivered(overdueMs = WATCHDOG_DEFAULT_OVERDUE_MS, minRetryMs = WATCHDOG_DEFAULT_MIN_RETRY_MS) {
+  const now = Date.now();
+  let fired = 0;
+  for (const [key, st] of social.conversations) {
+    if (!st) continue;
+    if (cfgRef?.social?.enabled === false) return fired;
+    if (social.paused) return fired;
+    if (activeWaits.has(key)) continue;
+    if (st.pendingWakeTimer) continue;
+    if (pendingWakeKeys.has(key)) continue;
+    const q = promptQueues.get(key);
+    if (q && (q.running || q.queue.length > 0)) continue;
+    // DSH 不可用期间排进 `queued` 的唤醒会在 DSH 恢复后自动补投，别在这里重复排一次。
+    const dshQ = queued.get(key);
+    if (Array.isArray(dshQ) && dshQ.length > 0) continue;
+    // 必须有的前提：只兜"桥打算交付却没交出去"的消息（见 scheduleWake 里 `_wakeIntendedSeq` 的说明）。
+    // 没有意图水位的消息 = 桥根本没打算唤醒它（群聊潜水模式下按概率略过的那些）→ 绝不能兜，
+    // 否则等于把潜水模式废掉。
+    const intended = Number(st._wakeIntendedSeq) || 0;
+    if (intended <= 0) continue;
+    const seen = new Set([
+      ...(Array.isArray(st.turnSeenUnread) ? st.turnSeenUnread : []),
+      ...(Array.isArray(st.turnSteeredSeqs) ? st.turnSteeredSeqs : []),
+    ].map(Number));
+    const delivered = Number(st.lastDeliveredSeq) || 0;
+    const backlog = (Array.isArray(st.unread) ? st.unread : []).filter((m) => {
+      const seq = Number(m && m.seq);
+      if (!Number.isFinite(seq) || seq <= 0) return false;
+      if (seq > intended) return false;      // 桥没打算交付它 → 不是本看门狗的事
+      if (seq <= delivered) return false;
+      if (seen.has(seq)) return false;
+      // 时间戳缺失时保守放行（宁可多兜一次，也不要静默丢掉）
+      const t = Number(m && m.time) || 0;
+      return !t || now - t > overdueMs;
+    });
+    if (!backlog.length) continue;
+    if (now - (Number(st._watchdogAt) || 0) < minRetryMs) continue;
+    st._watchdogAt = now;
+    const seqs = backlog.map((m) => Number(m.seq)).slice(-8).join(',');
+    log(`[watchdog] ${key} 有 ${backlog.length} 条"已决定交付却没交出去"的消息（超过 ${Math.round(overdueMs / 1000)}s）：seq ${seqs}，已交付水位 ${delivered}/意图水位 ${intended} → 重新排一次唤醒`);
+    try { scheduleWake(key, 'deliveryWatchdog'); fired += 1; } catch (error) {
+      log(`[watchdog] ${key} 重新排唤醒失败：${error?.message ?? error}`);
+    }
+  }
+  return fired;
+}
+
+/** 启动投递看门狗（bridge.js 在社交层初始化后调用一次）。 */
+export function startDeliveryWatchdog(intervalMs = WATCHDOG_DEFAULT_INTERVAL_MS) {
+  const timer = setInterval(() => {
+    try { sweepUndelivered(); } catch (error) {
+      log(`[watchdog] 巡检异常：${error?.message ?? error}`);
+    }
+  }, intervalMs);
+  timer.unref?.();
+  log(`[watchdog] 投递看门狗已启动：每 ${Math.round(intervalMs / 1000)}s 巡检一次，发现"收下却没交给模型"的消息就重排唤醒`);
+  return timer;
+}
+
+// 参与度提示行（P4-18 迁入）：近 1 小时发言统计 + 何时该接话/潜水的话术建议
+export function formatParticipation(st) {
+  if (!st) return '';
+  const now = Date.now();
+  const hour = 60 * 60 * 1000;
+  const fiveMin = 5 * 60 * 1000;
+  const recent = Array.isArray(st.recentMessages) ? st.recentMessages : [];
+  const aiCount = recent.filter((m) => m && m.isSelf && now - (Number(m.time) || 0) < hour).length;
+  const otherCount = recent.filter((m) => m && !m.isSelf && now - (Number(m.time) || 0) < hour).length;
+  if (!aiCount && !otherCount) return '';
+  const fiveMinOthers = recent.filter((m) => m && !m.isSelf && now - (Number(m.time) || 0) < fiveMin);
+  const activeSenders = new Set(fiveMinOthers.map((m) => m && (m.sender || m.user_id || '?'))).size;
+  const directUnread = Array.isArray(st.unread) ? st.unread.filter((m) => m && isDirectedAtAi(String(m.plain || m.text || ''))).length : 0;
+  const lastAiGap = now - (Number(st.lastAiReplyAt) || 0);
+  const recentAi2m = recent.filter((m) => m && m.isSelf && now - (Number(m.time) || 0) < 2 * 60 * 1000).length;
+  let hint = '';
+  if (directUnread > 0) {
+    hint = 'Someone addressed you directly - answer first; join other buzz at will.';
+  } else if (recentAi2m >= 2) {
+    hint = 'You replied several times just now - speak less this round, but do not vanish; join in naturally when worth it.';
+  } else if (lastAiGap < 120000) {
+    hint = 'You just spoke - listen for a bit first; join when something is catchable, no need to wait for your name.';
+  } else if (aiCount >= 5) {
+    hint = 'You talked a lot recently - say less this round, but speak up when something really matters.';
+  } else if (fiveMinOthers.length >= 10 || (fiveMinOthers.length >= 6 && activeSenders >= 3)) {
+    hint = `Chat is hot (${fiveMinOthers.length} msgs${activeSenders ? `/${activeSenders} people` : ''} in 5 min) - do not follow every line; join the one worth answering, dive if no opening.`;
+  } else if (otherCount >= 10 && aiCount === 0) {
+    hint = 'Group is busy but nothing is addressed to you - a witty line is fine, or just watch.';
+  } else if (otherCount < 3 && aiCount > 0) {
+    hint = 'Group is a bit cold - do not carry it alone; throw in a line when you have one.';
+  } else if (aiCount <= 1 && otherCount >= 10) {
+    hint = 'Briefly join this round instead of diving - pick one point.';
+  }
+  const burstText = fiveMinOthers.length ? `; ${fiveMinOthers.length} msgs${activeSenders ? `/${activeSenders} people` : ''} in last 5 min` : '';
+  return `Participation: you spoke ${aiCount} times, members sent ${otherCount} msgs in the last hour${burstText}. ${hint}`;
+}
+
+// 推荐 qq_wait_for_messages 的静默时长（P4-18b 迁入）
+// 2026-09-11 质疑"之前不是说这样很慢吗" —— 属实，这里是根源。
+// 旧版三个时长是写死的 8000 / 12000 / 12000，于是"让模型用等待工具取消息"这条路
+// 每个来回都要白等 8~12 秒，正是当初被我判为"比 1 秒合并窗还慢"的原因。
+// 现在全部改成可配（`social.wait.defaultQuietMs / unfinishedQuietMs / burstQuietMs`），
+// 默认调到 1.5~3 秒：既能合并"连发几条"，又不会让每个来回卡十秒。
+export function suggestQuietMs(st) {
+  // 别用 `Number(x) || 默认值`：配置里写 0（=不要静默窗）会被 `||` 吃掉、退回默认值 ——
+  //    这正是"配置里明明写了 defaultQuietMs: 0，实际还是等 8 秒"的原因（2026-09-11 查出）。
+  const num = (v, dflt) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n >= 0 ? n : dflt;
+  };
+  const defaultMs = num(cfgRef.social?.wait?.defaultQuietMs, 8000);
+  const unfinishedMs = num(cfgRef.social?.wait?.unfinishedQuietMs, 12000);
+  const burstMs = num(cfgRef.social?.wait?.burstQuietMs, 12000);
+  if (!st) return defaultMs;
+  const recent = Array.isArray(st.recentMessages) ? st.recentMessages : [];
+  const last = [...recent].reverse().find((m) => m && !m.isSelf);
+  if (!last) return defaultMs;
+  const text = String(last.tail || last.plain || last.text || '').trim();
+  if (looksLikeUnfinished(text)) return unfinishedMs;
+  const burst = recent.filter((m) => m && !m.isSelf && Date.now() - Number(m.time || 0) < 15000).length;
+  if (burst >= 3) return burstMs;
+  return defaultMs;
+}
+
+// ── P4-23：唤醒附图/回复检查/收尾提醒 ──────────────────────────────────────
+
+// 收集最近"新鲜"消息里的图片/表情 media，用于唤醒时直接附图（视觉投递，绕过 MCP 压缩层）。
+// 新鲜 = 消息还在未读里，或晚于自己最后一次回复/已读水位——已经看过的旧图绝不重复附上，
+// 避免"哨兵轮每次都把前面发过的图再带一遍、模型没读新文本就抢先看图回复"。
+// 额外水位 _mediaAttachedSeq：记录最近一次已附图的最高消息 seq——若模型附图后没 mark_read/没回复
+// （比如判断无需回直接收尾），同批图不会在下一次唤醒里再次附上，杜绝"每轮都带同一张旧图"循环；
+// 模型仍可用 qq_get_message_images 主动取图。
+/**
+ * 从一批消息里挑"可以附进 prompt 的图片/表情"——唤醒附图与在途回合注入共用这一条规则。
+ *
+ * 为什么必须共用（2026-09-22 报障"附图片好像有问题"，这就是根因）：
+ *   图片附件原来只挂在唤醒那条路（sendWakePrompt → deliverRef(..., {media})）上，而在途注入
+ *   （wake-send.js 的 steerIntoRunningTurn）是自己直接调 apiRef.sessions.prompt 的，content 里
+ *   只有一个 text 块。偏偏"忙时把消息塞进在途回合"才是主路径（steer 默认开），于是在模型
+ *   正跑着时发的图从来进不了模型的眼睛：模型只看到 `owner[QQ=…](id:…): [图片] [image]` 一行占位文本，
+ *   回一句"图没传过来"。挑选规则只留这里一份，两条路都调它，免得再漂移。
+ *
+ * 规则（与老 collectFreshWakeMedia 的语义一字不差地搬过来）：
+ *   ① 跳过自己发的；② 消息 seq 必须高于已附图水位（同一张图绝不附第二次，
+ *   否则会退化成"每轮都把同一张旧图再附一遍"）；③ 只认 kind=image / face；④ 最多 cap 张。
+ * @param {Array} msgs 候选消息（顺序由调用方决定：唤醒那条路传新→旧）
+ * @param {number} floor 当前"已附图水位"（st._mediaAttachedSeq）
+ * @param {number} limit 本次最多附几张
+ * @returns {{media:Array, floor:number}} floor = 这批里真的采纳了图的最大 seq（调用方在投递成功后落账）
+ */
+export function pickAttachableMedia(msgs, floor = 0, limit = MAX_MEDIA_COUNT) {
+  const out = [];
+  const floor0 = Number(floor) || 0;
+  const cap = Math.max(0, Number(limit) || 0);
+  let floorNext = floor0;
+  for (const m of Array.isArray(msgs) ? msgs : []) {
+    if (out.length >= cap) break;
+    if (!m || m.isSelf) continue;
+    if (!Array.isArray(m.media) || m.media.length === 0) continue;
+    const seqN = Number(m.seq) || 0;
+    if (seqN > 0 && seqN <= floor0) continue; // 已经附图过的消息不再重复附
+    let added = false;
+    for (const md of m.media) {
+      if (out.length >= cap) break;
+      if (md && typeof md === 'object' && (md.kind === 'image' || md.kind === 'face')) { out.push(md); added = true; }
+    }
+    if (added && seqN > floorNext) floorNext = seqN;
+  }
+  return { media: out, floor: floorNext };
+}
+
+export function collectFreshWakeMedia(key, st) {
+  if (!st || !Array.isArray(st.recentMessages)) return [];
+  const unreadSeqs = new Set((Array.isArray(st.unread) ? st.unread : []).map((m) => m && Number(m.seq)).filter((n) => Number.isFinite(n) && n > 0));
+  const lastAiT = Math.max(Number(st.lastAiReplyAt) || 0, Number(st.lastAiSeenAt) || 0);
+  const attachedFloor = Number(st._mediaAttachedSeq) || 0;
+  const out = [];
+  let maxSeqSeen = attachedFloor;
+  /* 2026-09-18：修「不是每张图都能附上对话」—— 报障"谬儿园有证据"。
+   * 原来这里是固定只看最近 8 条（`length - 8`）。群里一波连发十几条时，图夹在中间，
+   * 第 9 条以前的那几张就永远出不了这个窗口；而下面的水位只在"真的附上了"时才推进，
+   * 于是那些图既没被附上、也不会再被扫到 —— 彻底丢掉（现场：group:1073589775 的
+   * _mediaAttachedSeq 停在 180，而 184/185 两张图一直没出现在任何一轮里）。
+   * 现在按「已附图水位」回溯，最多 40 条：水位之后的所有图都有机会被附上，
+   * 既不会漏，也不会退化成"把很旧的图反复附一遍"（水位以下仍然一律跳过）。 */
+  const BACKSCAN = 40;
+  const start = Math.max(0, st.recentMessages.length - BACKSCAN);
+  for (let i = st.recentMessages.length - 1; i >= start && out.length < MAX_MEDIA_COUNT; i--) {
+    const m = st.recentMessages[i];
+    if (!m || m.isSelf) continue;
+    const seqN = Number(m.seq) || 0;
+    if (!(unreadSeqs.has(seqN) || Number(m.time) > lastAiT)) continue;
+    // 挑选规则走 pickAttachableMedia（在途注入那条路用同一套，见该函数注释）
+    const picked = pickAttachableMedia([m], attachedFloor, MAX_MEDIA_COUNT - out.length);
+    if (!picked.media.length) continue;
+    out.push(...picked.media);
+    if (picked.floor > maxSeqSeen) maxSeqSeen = picked.floor;
+  }
+  /* 2026-09-18 同上：水位只应该在"这之前的图都处理过了"时推进。
+   * 旧写法只在真的附上了图时推进 maxSeqSeen，于是"一条没图的消息"不影响水位 —— 看着对，
+   * 但配合上面那个 8 条窗口就出问题：窗口滑过去之后，被漏掉的图再也回不来。
+   * 现在窗口够大（40 条），保持原语义即可；这里只补一句：本轮没附图时也不要推进水位
+   * （推进了就等于宣告"这段看过了"，图上不去）。 */
+  if (maxSeqSeen > attachedFloor && st._mediaAttachedSeq !== maxSeqSeen) {
+    st._mediaAttachedSeq = maxSeqSeen;
+    saveSocialState();
+  }
+  return out;
+}
+
+// 回复检查兜底：AI 收尾后延迟检查一次，未收尾则提醒
+export function scheduleReplyCheck(key) {
+  if (cfgRef.social?.enabled === false) return;
+  if (social.paused) return;
+  if (inDndWindow()) return; // 免打扰时段不安排回复兜底检查（被@等真实唤醒接管）
+  // 私聊不需要「回复检查」——因为私聊不可能漏回，这个兜底在这里是纯重复回合：
+  //   1) evaluateWakeTrigger() 第一行就是 `if (kind === 'private') return 'private';`
+  //      —— 私聊每条消息都无条件唤醒，与 mode/probability/关键词都无关；
+  //   2) 会话忙时私聊消息进 pendingWakeReasons 排队、事后「合并补发」，不会被吞；
+  //   3) 被唤醒频率限制时私聊会挂 20s 一次性重试，也不会被静默吞掉；
+  //   4) 任何一次真实唤醒接管时都会 cancelReplyCheck(key)，把排队的回复检查清掉。
+  //   于是私聊里这个定时器只有两种结局：被真实唤醒取消，或到点时「无未读,跳过」。
+  // 唯一会真跑起来的场合反而是有害的：正好卡在「刚发消息、唤醒还没派发」的窗口里，
+  // 抢先占住会话 → 那条消息被判「会话繁忙」排队几十秒。
+  // 群聊不一样：群唤醒是条件式的（关键词/概率/@），普通消息可能永远不触发，那边的兜底要保留。
+  // 想恢复旧行为（私聊也检查）就把 config.json 的 social.autoReplyCheckPrivateChats 设为 true。
+  if (key.startsWith('private:') && cfgRef.social?.autoReplyCheckPrivateChats !== true) return;
+  const st = getSocialState(key);
+  // 已有真实唤醒/有限睡眠/回复检查在排队时不再重复安排，避免 AI 被连环唤醒。
+  if (st.pendingWakeTimer || st.sleepTimer || st.replyCheckTimer) return;
+  let delay = Math.max(800, Number(cfgRef.social?.autoReplyCheckMs) || 8000);
+  const recent = Array.isArray(st.recentMessages) ? st.recentMessages : [];
+  const recentSelf = recent.filter((m) => m && m.isSelf && Date.now() - Number(m.time || 0) < 15000);
+  const askedQuestion = recentSelf.some((m) => /[?？吗呢怎么有没有能不能]/.test(String(m.text || m.plain || '')));
+  if (askedQuestion) delay = Math.round(delay * 1.5);
+  if (recentSelf.length >= 3) delay = Math.round(delay * 1.3);
+  st.replyCheckTimer = setTimeout(() => {
+    st.replyCheckTimer = null;
+    // 无未读不空转：上一轮已收尾，无需再兜底唤醒。
+    if (Array.isArray(st.unread) && st.unread.length === 0) {
+      log(`[replyCheck] 无未读,跳过 ${key}`);
+      return;
+    }
+    // 同一轮对话只兜底检查一次：AI 最后回复后 90s 内已做过 replyCheck 则跳过
+    // （轻量字段 _lastReplyCheckAt，不持久化）。
+    const lastAi = Number(st.lastAiReplyAt) || 0;
+    const lastCheck = Number(st._lastReplyCheckAt) || 0;
+    if (lastAi > 0 && lastCheck > lastAi && lastCheck - lastAi <= 90 * 1000) {
+      log(`[replyCheck] AI 回复后 90s 内已检查过,跳过 ${key}`);
+      return;
+    }
+    st._lastReplyCheckAt = Date.now();
+    void dispatchWake(key, 'replyCheck').catch((error) => log(`[default] replyCheck 唤醒异常 ${key}:`, error?.message ?? error));
+  }, delay);
+  st.replyCheckTimer.unref?.();
+  log(`[default] 已安排回复检查唤醒 ${key}，${Math.round(delay / 1000)}s 后检查`);
+}
+
+// 回合收尾提醒 prompt（防"忘记收尾进入永眠"的兜底注入）
+// 2026-09-12：令牌标签改英文括号：[Token]（需求）；提示正文里只留"发生了什么 + 动态数值"
+// （观察时长），具体该怎么做在系统提示词 [WAKE TYPES] 第 13 条。
+export function buildWakeReminderPrompt(key) {
+  const roleState = readRoleState();
+  const roleLine = roleState.role ? `Role: ${roleState.role} (full persona card: qq_get_prompt)\n\n` : '';
+  const st = getSocialState(key);
+  const tokenLine = `[Token] ${st.agentToken} (include in every tool call)\n[Session] ${key}\n\n`;
+  const preSleepMs = Math.max(0, Number(cfgRef.social?.wake?.preSleepWaitMs) || 300000);
+  return `${roleLine}${tokenLine}[Reminder] Round not closed: pick the next wake with qq_set_wake_config, or close with qq_mark_read if you saw the messages and decide not to answer. If you mean to dive, observe first via qq_wait_for_messages(timeoutMs=${preSleepMs}), then wind down when nothing needs you.`;
+}
+
+// P5-9 追加：default 定时器清理
+
+export function clearSocialTimers(key) {
+  const st = social.conversations.get(key);
+  if (!st) return;
+  if (st.pendingWakeTimer) {
+    clearTimeout(st.pendingWakeTimer);
+    st.pendingWakeTimer = null;
+  }
+  st.pendingWakeTimerStartedAt = 0;
+  if (st.wakeRetryTimer) {
+    clearTimeout(st.wakeRetryTimer);
+    st.wakeRetryTimer = null;
+  }
+  st.pendingWakeReason = null;
+  if (st.sleepTimer) {
+    clearTimeout(st.sleepTimer);
+    st.sleepTimer = null;
+  }
+  if (st.replyCheckTimer) {
+    clearTimeout(st.replyCheckTimer);
+    st.replyCheckTimer = null;
+  }
+  if (st.proactiveTimer) {
+    clearTimeout(st.proactiveTimer);
+    st.proactiveTimer = null;
+  }
+  if (Array.isArray(st.pendingWakeReasons)) st.pendingWakeReasons.length = 0;
+}
+
+export function clearAllSocialTimers() {
+  for (const key of social.conversations.keys()) clearSocialTimers(key);
+  pendingWakeKeys.clear();
+  wakeConfigUpdatedKeys.clear();
+  markReadCalledKeys.clear();
+  wakeConfigMissCount.clear();
+  messageMediaStore.clear();
+}

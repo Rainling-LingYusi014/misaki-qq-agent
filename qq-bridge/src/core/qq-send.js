@@ -1,0 +1,526 @@
+// QQ 文本发送
+// 依赖全部来自 lib/core；cfg 静态注入（initQqSendCore），bot 运行期注入（setQqSendBot）。
+import { qqTextSeg } from '../lib/onebot-ws.js';
+import { sweepMessageArtifacts, cleanOutboundText, redactKnownTokensOnly } from '../lib/outbound-text.js';
+import { splitForQQ } from '../md-to-plain.js';
+import { escapeCqText, tokenDisclosureIn, looksLikeSerializedBubbleArray } from '../lib/text-safe.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { withTimeout, sleep } from '../lib/async.js';
+import { log } from '../lib/log.js';
+import { enqueueSend, currentSendChain, setSendLinearCfgReader, nextSendPaceMs, typingDelayMs, markSendDelivered, resetSendPace } from './send-chain.js';
+import { getSocialState } from './social-state.js';
+import { activeAiTurns } from './session-state.js';
+import { recordAiTurnOutbound } from './turn-guard.js';
+import { resolveArtifactFaceId } from '../lib/qq-face-parse.js';
+import { writeStickerTmpFile } from './sticker.js';
+import { napcatImageFileArg } from '../lib/napcat-file.js';
+import { isDeliveredUnconfirmed, deliveredUnconfirmedResult, onebotErrText } from '../lib/onebot-delivery.js';
+// 全语音发送模式（state/voice-config.json 的 send.allVoice）：回复正文改语音发出、失败退回文字。
+// 放在这里是因为本文件是模型回复正文的唯一出口（sendMessages → onebotSend）；
+// 开关关闭时 tryAllVoiceReply 是空转（不打日志、不发请求），老用户行为不变。
+import { tryAllVoiceReply } from './voice.js';
+import { recordFromOutbound } from './activity-ledger.js';
+
+export const SEND_TIMEOUT_MS = 15000;
+
+let cfgRef = null;
+let botRef = null;
+/** main 启动时调用：注入 cfg（此后不再变）；并向 send-chain 注册线性节拍配置读取器（读同一可变对象，口头可调即时生效） */
+export function initQqSendCore(cfg) {
+  cfgRef = cfg;
+  setSendLinearCfgReader(() => (cfgRef?.social?.send ?? null));
+}
+/** NapCat 网关就绪后注入 bot（NapCat client） */
+export function setQqSendBot(bot) {
+  botRef = bot;
+}
+
+// 发送单条文本（按 QQ 分条），入发送链
+export function sendToQQ(key, msg) {
+  const rawText = String(msg ?? '');
+  const swept = sweepMessageArtifacts(rawText);
+  const stripped = cleanOutboundText(rawText);
+  // 整条是纯占位（[表情:…]）：绝不按文字发出（根治"文字版表情"）；纯 emoji/颜文字清洗为空则保留原文
+  let safeMsg = stripped;
+  if (safeMsg === '' && swept.removed === 0 && rawText.trim() !== '') safeMsg = redactKnownTokensOnly(rawText);
+  if (!safeMsg) return currentSendChain();
+  const [kind, id] = key.split(':');
+  const parts = splitForQQ(safeMsg);
+  // 这次调用 = 一次新的连发批：清掉上几轮攒下的连续发送计数，批内第 1 条秒回、第 2 条起按字数等。
+  // （本函数只服务于桥自己的通知/命令回执；模型走的是 sendMessages —— 那条路是"内置线性延迟"，见下。）
+  resetSendPace(key);
+  let partIndex = 0;
+  for (const part of parts) {
+    const isFirst = partIndex++ === 0;
+    enqueueSend(async () => {
+      // 发送线性节拍：pace=null 表示线性关闭 → 保留旧 sendDelayMs 尾部停顿；否则按会话连续计数线性等。
+      // 首条 0 → 通知立刻出；第 2 条起按"这条自己打完要多久"等（perChar 模式）。
+      const pace = isFirst ? 0 : nextSendPaceMs(key, part.length);
+      if (pace != null && pace > 0) { log(`[pace] ${key} ${part.length} 字 → 等 ${pace}ms 再发`); await sleep(pace); }
+      try {
+        if (kind === 'private') await withTimeout(botRef.sendPrivateMessage(Number(id), qqTextSeg(escapeCqText(part))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
+        else await withTimeout(botRef.sendGroupMessage(Number(id), qqTextSeg(escapeCqText(part))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
+        if (pace != null) markSendDelivered(key, part.length);
+      } catch (error) { log(`QQ 发送失败 (${key}):`, error?.message ?? error); if (error?.stack) log('[send-stack]', error.stack.split(String.fromCharCode(10)).slice(0, 8).join(' | ')); }
+      if (pace == null) await sleep(cfgRef.sendDelayMs);
+    }, key);
+  }
+  return currentSendChain(key);
+}
+
+// 分条发送：与 sendToQQ 共用同一发送链，严格顺序；条间随机间隔，
+// 有概率使用长间隔（错落感）；最后一条后不再 sleep。
+/* 保留给外部/旧插件调用：核心发送流程自 2026-09-24 起统一走 sendMessages，
+ * MCP 侧不再暴露"连发"工具（qq_send_burst 已删除）。 */
+export function sendBurstToQQ(key, messages, socialCfgOrMin, maybeMax) {
+  const [kind, id] = key.split(':');
+  // 节奏统一走 send-chain.js 的「按字数」打字节拍（social.send.linear*）；
+  // 这里的 min/max/longGap* 只服务于"显式传入固定间隔"的老调用方（本函数当前无调用方，保留兼容）。
+  let min, max, longProb = 0, longMin = 0, longMax = 0;
+  if (typeof socialCfgOrMin === 'object' && socialCfgOrMin !== null) {
+    const cfg = socialCfgOrMin;
+    // burstIntervalMinMs/MaxMs 已废弃（节奏统一走线性节拍）；这里用内联兜底值。
+    // 注意本函数当前无调用方，保留仅为兼容。
+    min = Math.max(0, 1000);
+    max = Math.max(min, 3000);    longProb = Math.min(1, Math.max(0, Number(cfg.longGapProbability) || 0));
+    longMin = Math.max(0, Number(cfg.longGapMinMs) || 8000);
+    longMax = Math.max(longMin, Number(cfg.longGapMaxMs) || longMin);
+  } else {
+    min = Math.max(0, Number(socialCfgOrMin) || 0);
+    max = Math.max(min, Number(maybeMax) || min);
+  }
+
+  const sent = [];
+  for (let i = 0; i < messages.length; i++) {
+    const sweptOne = sweepMessageArtifacts(messages[i]);
+    const strippedOne = cleanOutboundText(messages[i]);
+    // 纯占位条（[表情:…]）直接跳过不发；纯 emoji/颜文字清洗为空则保留原文
+    let msg = strippedOne;
+    if (msg === '' && sweptOne.removed === 0 && String(messages[i] ?? '').trim() !== '') msg = redactKnownTokensOnly(messages[i]);
+    if (msg === '') continue;
+    enqueueSend(async () => {
+      // 打字节拍：批内首条秒回；第 2 条起间隔 = 这条气泡字数 × linearPerCharMs（见 send-chain.js）
+      const pace = i === 0 ? 0 : nextSendPaceMs(key, msg.length);
+      if (pace != null && pace > 0) { log(`[pace] ${key} ${msg.length} 字 → 等 ${pace}ms 再发`); await sleep(pace); }
+      try {
+        if (kind === 'private') await withTimeout(botRef.sendPrivateMessage(Number(id), qqTextSeg(escapeCqText(msg))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
+        else await withTimeout(botRef.sendGroupMessage(Number(id), qqTextSeg(escapeCqText(msg))), SEND_TIMEOUT_MS, `QQ发送 ${kind}:${id}`);
+        sent.push(msg);
+        if (pace != null) markSendDelivered(key, msg.length);
+      } catch (error) { log(`QQ 发送失败 (${key}):`, error?.message ?? error); if (error?.stack) log('[send-stack]', error.stack.split(String.fromCharCode(10)).slice(0, 8).join(' | ')); }
+      // 2026-09-15 清理：这里原本还有一段"线性关闭时按 gapBaseMs+字数×gapPerCharMs 兜底"的旧节奏。
+      // 已定稿只留"按字数"一种节拍（send-chain.js），两套并存只会互相打架 —— 已删除。
+      // 现在 pace==null 就等于"不做打字延迟"（linearEnabled=false 的语义），要节奏就调 linearPerCharMs。
+    }, key);
+  }
+  return currentSendChain(key).then(() => sent);
+}
+
+// ── P5-7 追加：onebotSend/sendMessages（自 bridge.js 抽取，1:1） ──────
+
+/* ── 引用怎么发（不要 reply 段 / 要 reply 段）─────────────────────────────────────
+ * 2026-09-18 线上实测 · 终于钉住的引用根因：
+ * 用户报"引用有框、框下面没内容"，一直以为是 reply 段本身的问题。真因是全语音模式：
+ *   · 那个会话 `state/voice-config.json` 的 `send.allVoice=true` → 每条回复都先转语音发。
+ *   · 于是所有"带引用的回复"实际发出去的都是 `[{type:'reply'},{type:'record'}]`，
+ *     而 QQ 客户端渲染不了"引用 + 语音气泡"这个组合 —— 引用框在，语音没了。
+ *   · 连之前那次"对照实验"也没逃掉：脚本打的是 `/api/social/send-message`，
+ *     而那条路先试语音，所以所谓"A 文字+引用"其实也是语音+引用。
+ * 读内核消息表可以逐条对上（线上 16:14–16:15 的实测）：
+ *   16:14:25 [reply+record] 16:15:14 [reply+record] 16:15:31 [reply+record]   ← 全是语音
+ * 日志也写着 `[voice] 全语音模式：已用语音发出 …`。
+ *
+ * 所以规矩是：要引用的时候就用文字发。语音只在没有引用时才用。
+ * 三种模式（config: `social.send.quoteMode`）：
+ *   · `native-text`（默认）：带引用的回复跳过语音、按文字发，并保留 QQ 原生 reply 段（引用框最好看）；
+ *   · `prefix`：连 reply 段都不用 —— 把被引内容当正文前缀（`> 原话\n我的回复`）发成纯文字气泡，
+ *     任何客户端都一定渲染得出来（原生引用万一在别的客户端也渲染不出来时用这条兜底）；
+ *   · `native`：老行为（引用时也允许走语音）；`off`：干脆不引用。 */
+function quoteModeOf() {
+  const m = String(cfgRef?.social?.send?.quoteMode ?? 'native-text').trim().toLowerCase();
+  return ['native-text', 'prefix', 'native', 'off'].includes(m) ? m : 'native-text';
+}
+
+/** 这种模式下，"带引用的这条"要不要强制走文字（而不是语音）？ */
+function quoteForcesText() {
+  const m = quoteModeOf();
+  return m === 'native-text' || m === 'prefix';
+}
+
+/** prefix 模式用：从会话记录里把被引用那条的原文捞出来（截断成一行）。 */
+function lookupQuotedText(key, rid) {
+  try {
+    const st = getSocialState(key);
+    const list = [
+      ...(Array.isArray(st?.recentMessages) ? st.recentMessages : []),
+      ...(Array.isArray(st?.unread) ? st.unread : []),
+    ];
+    const hit = list.find((m) => m && String(m.messageId ?? '') === String(rid));
+    const t = String(hit?.text ?? hit?.plain ?? hit?.tail ?? '')
+      .replace(/\s+/g, ' ').trim();
+    if (!t) return '';
+    return redactKnownTokensOnly(t).slice(0, 60);
+  } catch { return ''; }
+}
+
+export async function onebotSend(kind, id, message, replyToMessageId, atUserId = null, imagePath = null) {
+  const segments = [];
+  const replyId = (replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '')
+    ? String(replyToMessageId).trim()
+    : '';
+  if (replyId && !/^-?[1-9]\d*$/.test(replyId)) throw new Error('replyToMessageId 必须是非零整数（消息 id 可能为负数）');
+  const qMode = quoteModeOf();
+  let quotePrefix = '';
+  if (replyId) {
+    if (qMode === 'prefix') {
+      const q = lookupQuotedText(`${kind}:${id}`, replyId);
+      if (q) quotePrefix = `> ${q}\n`;
+      else log(`[quote] prefix 模式：引用目标 ${replyId} 在会话记录里翻不到原文，这条按"不引用"发`);
+    } else if (qMode !== 'off') {
+      segments.push({ type: 'reply', data: { id: replyId } });
+    }
+  }
+  let atSegment = null;      // atUserId 推入的 at 段（自愈时要去掉的就是它）
+  let atSpacer = null;       // 紧跟在它后面的那个占位空格段
+  if (atUserId !== undefined && atUserId !== null && String(atUserId).trim() !== '') {
+    const at = String(atUserId).trim();
+    // 只允许正整数 QQ 号，禁止 @all，避免被滥用成 @全体成员
+    if (!/^\d+$/.test(at)) throw new Error('atUserId 必须是正整数 QQ 号，且不能为 all');
+    atSegment = { type: 'at', data: { qq: at } };
+    segments.push(atSegment);
+    // QQ 规范：@昵称 后跟图片/表情/文本都要用空格隔开（文本走 pushTextWithAtSpace，这里先兜底补一格）
+    // 记下引用：自愈去掉 @ 时必须连它一起摘掉，否则消息会以一个莫名的空格开头。
+    atSpacer = { type: 'text', data: { text: ' ' } };
+    segments.push(atSpacer);
+  }
+  const rawMessage0 = String(message ?? '');
+  const tokenLeak = tokenDisclosureIn(rawMessage0);
+  if (tokenLeak) {
+    log(`发送内容疑似泄露会话令牌(${tokenLeak.kind})，已阻止发送 (${kind}:${id})`);
+    throw new Error('发送内容疑似泄露会话令牌，已阻止发送');
+  }
+  /* 2026-09-20 硬失败 · 实测：正文整体是"被序列化的工具参数数组"就不是人话：
+   * 现场 qq_send_message 的 messages 被模型整体序列化成一个字符串传下来（且引号嵌套），
+   * JSON.parse 失败 → 旧代码把它当"一条消息"原样发进 QQ，用户看到的就是
+   *   ["直接跟我说就行", "比如"谬友圈活跃19点到23点"", ...]
+   * 现在一律拒发并让模型重传：多气泡 = 真正的 JSON 数组（不是字符串），
+   * 真要发 JSON/代码本身 = 用 ``` 代码块包起来（包起来就不算参数形状，见 arrayPayloadInner）。 */
+  if (looksLikeSerializedBubbleArray(rawMessage0)) {
+    log(`[send] ${kind}:${id} 正文是"被序列化的气泡数组"形状，已拒发（硬失败）: ${rawMessage0.slice(0, 80)}`);
+    throw new Error('这条正文整体是一个被序列化的气泡数组（形如 ["a","b"]），它是工具参数的容器、不是消息内容，已拒发。多条气泡请把真正的 JSON 数组传给 messages（如 messages=["第一句","第二句"]），不要把数组写进字符串；确实要发 JSON/代码本身就用 ``` 代码块包起来。');
+  }
+  // 出站文本清洗：输入法 emoji 剥离 + 表情/图片占位符清扫。
+  // 根治规则：整条=纯占位（[表情:…] 之类）时先尝试翻译成真 QQ face（能识别出 id）；翻译不出就整条丢弃，
+  // 绝不以文字形式发出"文字版表情"；只有整条是纯 emoji/颜文字（清扫占位数为 0）清洗为空时才保留原文，避免误删纯表情消息。
+  const swept = sweepMessageArtifacts(rawMessage0);
+  const strippedText = cleanOutboundText(rawMessage0);
+  let rawMessage = strippedText;
+  let artifactFaceId = null;
+  if (swept.removed > 0 && strippedText === '') {
+    const faceIdGuess = resolveArtifactFaceId(swept.tokens[0] ?? '');
+    if (faceIdGuess != null) artifactFaceId = faceIdGuess;
+    else log(`占位表情未能翻译成 QQ face，已丢弃不发 (${kind}:${id}): ${rawMessage0.slice(0, 50)}`);
+  } else if (strippedText === '' && swept.removed === 0 && rawMessage0.trim() !== '') {
+    rawMessage = redactKnownTokensOnly(rawMessage0);
+  }
+  if (artifactFaceId != null) segments.push({ type: 'face', data: { id: artifactFaceId } });
+  // prefix 引用：把"被引用原文"当正文前缀一起发出去（纯文字气泡，不依赖 QQ 的 reply 段）
+  if (quotePrefix) rawMessage = quotePrefix + rawMessage;
+  if (imagePath) {
+    // 本地图片路径：gif 用本地路径才能播放动画；webp/png/jpg 直接发。
+    // 本机部署（bridge 与 NapCat 同机，Windows/裸机）：把源图片复制到本机可写临时目录
+    // qq-bridge/state/sticker-tmp（writeStickerTmpFile 已迁移为本机路径），图段直接传该本机绝对路径，
+    // NapCat 同机可读。（已迁移：曾映射服务器 Docker 挂载对 /root/napcat/... ↔ /app/napcat/...，
+    //   以及 blue-fish-gifs / whale-memes 服务器专属目录，本机不存在 → ENOENT；
+    //   不再构造死路径，源资源缺失时给友好提示。）
+    let srcStat = null;
+    try { srcStat = fs.statSync(imagePath); } catch {}
+    if (!srcStat || !srcStat.isFile()) {
+      throw new Error(`图片文件不存在或不可访问: ${imagePath}。请传本机真实存在的图片绝对路径；发内置表情包里的表情请用 qq_meme_search + qq_send_meme，发收藏表情请用 qq_send_sticker。`);
+    }
+    const buf = fs.readFileSync(imagePath);
+    const ext = String(path.extname(imagePath) || '').replace(/^\./, '') || 'img';
+    // 2026-09-15 修「表情包一张都发不出去」：临时文件路径不能原样交给 NapCat：
+    // 服务器上 NapCat 在 Docker 里，读不到宿主路径 → 必须按配置换成容器路径或 base64。
+    const napcatFile = napcatImageFileArg(writeStickerTmpFile(buf, ext), cfgRef);
+    segments.push({ type: 'image', data: { file: napcatFile } });
+  }
+  if (rawMessage) {
+    // 解析 AI 手写的 [CQ:at,qq=xxx] 为真正的 at 消息段（纯文本 @ 不触发 QQ 提醒）；其余 [CQ: 仍转义防注入。
+    const atPattern = /\[CQ:at,qq=(\d{5,12})\]/g;
+    let hasAt = false;
+    const atMatches = [];
+    let m;
+    while ((m = atPattern.exec(rawMessage)) !== null) {
+      hasAt = true;
+      atMatches.push({ qq: m[1], start: m.index, end: m.index + m[0].length });
+    }
+    // at 段后紧跟文本时补一个空格（QQ 规范：@昵称 后带空格，避免粘连成“@名字哎哎哎…”）
+    const pushTextWithAtSpace = (txt) => {
+      let t = txt;
+      if (segments.length && segments[segments.length - 1].type === 'at' && !/^\s/.test(t)) t = ' ' + t;
+      segments.push({ type: 'text', data: { text: escapeCqText(t) } });
+    };
+    if (hasAt) {
+      let last = 0;
+      for (const a of atMatches) {
+        if (a.start > last) pushTextWithAtSpace(rawMessage.slice(last, a.start));
+        segments.push({ type: 'at', data: { qq: a.qq } });
+        last = a.end;
+      }
+      if (last < rawMessage.length) pushTextWithAtSpace(rawMessage.slice(last));
+    } else {
+      pushTextWithAtSpace(rawMessage);
+    }
+  }
+  const action = kind === 'private' ? 'send_private_msg' : 'send_group_msg';
+  const buildParams = () => (kind === 'private' ? { user_id: Number(id), message: segments } : { group_id: Number(id), message: segments });
+  const httpUrl = String(cfgRef.napcat?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
+  // 瞬时网络类错误自动重试一次(间隔 2.5s), 降低偶发抖动误报; 持续失败仍如实报错, 不做无限重试。
+  //
+  // 2026-09-11 补：原来只认响应体里的 1006514/网络连接异常，而日志里真实出现过的是
+  // `QQ 发送失败 (private:*): fetch failed` —— fetch 层就失败了，拿不到响应，正则匹配不上，
+  // 于是不重试、静默丢弃（只在日志留一行）。现在把 fetch 层失败也纳入，但只重试
+  // "确定没送出去"的连接级错误：超时(AbortError/TimeoutError)绝不重试 —— 请求可能已经被
+  // NapCat 处理并发出去了，重试会真的发两遍（比丢一条更糟）。
+  const CONN_ERR = /ECONNREFUSED|ENOTFOUND|EHOSTUNREACH|ENETUNREACH|EAI_AGAIN|ECONNABORTED/i;
+  const isConnError = (e) => {
+    const name = String(e?.name ?? '');
+    if (name === 'AbortError' || name === 'TimeoutError') return false; // 超时可能已送出，禁止重试
+    const code = String(e?.cause?.code ?? e?.code ?? '');
+    return CONN_ERR.test(code);
+  };
+  const attemptSend = async () => {
+    try {
+      const res = await fetch(`${httpUrl}/${action}`, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          ...(cfgRef.napcat?.accessToken ? { authorization: `Bearer ${cfgRef.napcat.accessToken}` } : {})
+        },
+        body: JSON.stringify(buildParams()),
+        signal: AbortSignal.timeout(15000)
+      });
+      const body = await res.json().catch(() => ({}));
+      return { res, body, fetchErr: null };
+    } catch (fetchErr) {
+      return { res: null, body: null, fetchErr };
+    }
+  };
+  let { res, body, fetchErr } = await attemptSend();
+  if (!res && fetchErr) {
+    if (isConnError(fetchErr)) {
+      const code = fetchErr?.cause?.code ?? fetchErr?.code ?? fetchErr?.message;
+      log(`[send] ${kind}:${id} 连接级失败(${code})自动重试(1/1)`);
+      await sleep(2500);
+      ({ res, body, fetchErr } = await attemptSend());
+    }
+    if (!res && fetchErr) {
+      const code = fetchErr?.cause?.code ?? fetchErr?.code ?? '';
+      const abort = ['AbortError', 'TimeoutError'].includes(String(fetchErr?.name ?? ''));
+      throw new Error(`OneBot ${action} 请求失败: ${fetchErr?.message ?? fetchErr}${code ? ` (${code})` : ''}${abort ? '（超时未重试：请求可能已送出，重试会导致重复发送）' : ''}`);
+    }
+  }
+  const errText = onebotErrText(body);
+  /* 2026-09-18：EventChecker Failed = 消息已进 QQ 内核（日志先有「发送 ->」），只是事件确认失败，
+   * 属于已送达未确认，重试只会真的发第二遍 —— 所以这类回执既不重试也不报错，直接按送达处理。 */
+  const deliveredUnconfirmed = isDeliveredUnconfirmed(errText);
+  if (!res.ok || body.status !== 'ok' || body.retcode !== 0) {
+    if (!deliveredUnconfirmed && /1006514|网络连接异常|网络.*异常/i.test(errText)) {
+      log(`[send] ${kind}:${id} 触发网络异常重试(1/1): ${body.retcode || body.wording || res.status}`);
+      await sleep(2500);
+      const again = await attemptSend();
+      res = again.res; body = again.body; fetchErr = again.fetchErr;
+      if (!res && fetchErr) throw new Error(`OneBot ${action} 请求失败: ${fetchErr?.message ?? fetchErr}`);
+    }
+  }
+  // 2026-09-15 自愈：NapCat 读不到我们给的图片路径时的兜底重发（只在明确"图没发出去"时触发）：
+  // 服务器 NapCat 在 Docker 里，宿主路径它读不到 → `文件处理失败: 识别URL失败, uri= /root/...`。
+  // 配置（napcat.imageFileMode/dockerPathMap）配对了就不会走到这里；这里是配置漂移时的保险：
+  // 把 image 段换成 base64:// 再发一次。该错误意味着这条消息整体没发出去，重发不会重复。
+  const fileErrRe = /文件处理失败|识别URL失败|ENOENT|no such file/i;
+  if (fileErrRe.test(errText)) {
+    const imgSeg = segments.find((s) => s.type === 'image' && typeof s.data?.file === 'string' && !/^(base64|file|https?):\/\//i.test(s.data.file));
+    if (imgSeg) {
+      try {
+        const buf = fs.readFileSync(imgSeg.data.file);
+        imgSeg.data.file = `base64://${buf.toString('base64')}`;
+        log(`[send] ${kind}:${id} NapCat 读不到路径（${errText.trim().slice(0, 60)}），改用 base64 重发(1/1)`);
+        const again = await attemptSend();
+        res = again.res; body = again.body; fetchErr = again.fetchErr;
+        if (!res && fetchErr) throw new Error(`OneBot ${action} 请求失败: ${fetchErr?.message ?? fetchErr}`);
+      } catch (eB64) {
+        log(`[send] ${kind}:${id} base64 兜底重发失败: ${eB64?.message ?? eB64}`);
+      }
+    }
+  }
+  /* 2026-09-16 自愈 · 堵住"双发触发源"的第二层：
+   * atUserId 指向的号 NapCat 解析不出 uid 时（`Get Uid Error`）→ 去掉 @ 段重发一次：
+   *   · 判据/证据：该错误发生在 uid 解析阶段，这条消息整体没发出去。两次真机现场印证过：
+   *     14:12:34 与 14:28:15 两个批次里带 @ 的那条都失败了（日志 `QQ 发送失败: … Get Uid Error`
+   *     + `工具统一发送部分成功 1/2 条`），失败的那条从未进群（social-state.json 的 recentMessages 里
+   *     只有成功那一条），所以去掉 @ 重发不会产生重复。
+   *   · 为什么值得做：不修的话"带 @ 发失败"= 整批部分失败 = 模型重发整批 = 已送到的那条被再发一次
+   *     （双发）。降级成"不带 @ 照常发"以后，这一批整体成功，重发这条链就不存在了。
+   *   · 为什么放在这里而不是提前用缓存猜：真号但不在群 / 号码写错这类情况只有 NapCat 说了算；
+   *     config 里没有全量群成员名单（group-cache.js 只缓存群主/管理员），拿缓存猜会误杀普通成员。
+   *   · 只去掉 atUserId 推入的那一段（模型自己写的 [CQ:at,qq=…] 不动），并连同它后面的占位空格一起摘掉。 */
+  const uidErrRe = /Get Uid Error|uid.*(?:not found|invalid)/i;
+  if (atSegment && uidErrRe.test(errText)) {
+    const idxAt = segments.indexOf(atSegment);
+    if (idxAt >= 0) {
+      segments.splice(idxAt, 1);
+      const idxSpacer = atSpacer ? segments.indexOf(atSpacer) : -1;
+      if (idxSpacer >= 0) segments.splice(idxSpacer, 1);
+      log(`[send] ${kind}:${id} atUserId=${atSegment.data.qq} 无法解析成 QQ uid（${errText.trim().slice(0, 40)}）—— 去掉 @ 重发一次（该错误在 uid 解析阶段，这条消息整体没发出去，重发不会重复）`);
+      try {
+        const again = await attemptSend();
+        res = again.res; body = again.body; fetchErr = again.fetchErr;
+        if (!res && fetchErr) throw new Error(`OneBot ${action} 请求失败: ${fetchErr?.message ?? fetchErr}`);
+      } catch (eAt) {
+        log(`[send] ${kind}:${id} 去掉 @ 的重发也失败: ${eAt?.message ?? eAt}`);
+      }
+    }
+  }
+  if (!res.ok || body.status !== 'ok' || body.retcode !== 0) {
+    // 已送达未确认（EventChecker Failed）：不回错误、不重试。见 lib/onebot-delivery.js。
+    if (isDeliveredUnconfirmed(onebotErrText(body))) {
+      log(`[send] ${kind}:${id} 回执 EventChecker Failed —— QQ 内核已受理并发出（只是事件确认失败），按已送达处理、不重试`);
+      try { recordFromOutbound(rawMessage); } catch { /* 账本失败不影响发送 */ }
+      return deliveredUnconfirmedResult();
+    }
+    const hint = res.status === 426 ? '（HTTP 426：napcat.httpUrl 可能指向了 WebSocket 端口，请检查 config.json 的 napcat.httpUrl 是否为 OneBot HTTP API 地址）' : '';
+    throw new Error(`OneBot ${action} 失败: ${body.wording || body.errMsg || body.retcode || res.status}${hint}`);
+  }
+  try { recordFromOutbound(rawMessage); } catch { /* 账本失败不影响发送 */ }
+  return body.data;
+}
+
+/* ── 2026-09-20 定稿：彻底去掉"桥自己猜着引用"────────────────────────────────
+ * 存在过的东西（2026-09-13 ~ 09-20）：桥在发消息时按"共同词"从本回合投递过的消息里挑一条，
+ * 自动加上引用框（pickSmartQuote + SMART_QUOTE_* 一串调参）。它有过两次线上事故：
+ *   ① 零共同词也引用 → 张冠李戴（群里答"投降喵"却挂着「决定，绝地反击」的引用框）；
+ *   ② 每句话都挂引用框，观感机械；后来加"答最新那条就不引用"才压住。
+ * 但这些都只是调参，根子上是错的：桥不知道模型在答哪一句，猜错就是引用错误。
+ * 2026-09-20 定调："去除，把引用完全交给模型"。现在规则只剩一条 ——
+ *   只有模型显式传 replyToMessageId 才有引用；桥永远不加。
+ * 模型那边有 `(id:xxx)` 展示与 qq_get_recent_messages / qq_get_message_detail，
+ * 它自己认得出该引哪条（引用前必须核对该条自己的 id，见 preset 第 9b 条）。
+ * 本文件不再有任何"智能引用"代码；回归用例见 tests/no-auto-quote.test.js。 */
+/**
+ * 全语音模式用：把模型写的正文洗成"能朗读的那部分"。
+ *
+ * 为什么不能直接把原文交给 TTS（三个坑，都在 onebotSend 里已经处理过一遍）：
+ *   ① 出站文本要先去输入法 emoji + 表情/图片占位符（`[表情:xx]`）——否则 TTS 会把占位符念出来；
+ *   ② 整条就是纯占位符（`[表情:…]`）时清洗结果为空：那种消息会被转成真 QQ face 发出，
+ *      不能改成语音（改了就丢表情），所以这里返回 ''，全语音模式也会按原样发；
+ *   ③ 会话令牌绝不能"念出来"：onebotSend 会拦住并报错，这里提前返回 '' 让它照旧走文字通道拦截
+ *      （语音通道没有这套拦截，把令牌合成进去就等于泄露）。
+ * @returns {string} 可朗读的正文；'' = 这条不该/不能用语音发
+ */
+function speakableForVoice(raw) {
+  const rawText = String(raw ?? '');
+  if (!rawText.trim()) return '';
+  try {
+    if (tokenDisclosureIn(rawText)) return '';
+    const swept = sweepMessageArtifacts(rawText);
+    let t = cleanOutboundText(rawText);
+    if (t === '' && swept.removed === 0) t = redactKnownTokensOnly(rawText);
+    return String(t).trim();
+  } catch {
+    return '';   // 清洗炸了就按文字发（不丢消息优先）
+  }
+}
+
+export function sendMessages(key, messages, delays, replyToMessageId, atUserId = null, images = []) {
+  // 循环复读监测：AI 回合内通过本函数发出的文本计入本回合输出（2026-09-03）
+  try {
+    if (activeAiTurns.has(key) && Array.isArray(messages)) {
+      const rawList = messages.map((m) => (m && typeof m === 'object') ? String(m.text ?? m.message ?? '') : String(m ?? ''));
+      recordAiTurnOutbound(key, rawList);
+    }
+  } catch {}
+  const [kind, id] = key.split(':');
+  /* 2026-09-24：撤销"那次把连发合并进来时顺手加上的每次调用清零"。
+   * 模型的多气泡回复本来就是一条气泡一次工具调用（不是一次调用带一个数组），
+   * 所以"每次调用都算新批"= 每条气泡都被当成批内首条 = 内置在 qq_send_message 里的线性延迟永远算 0。
+   * 现在本函数不看清零、也不看批内序号：**每条气泡都按它自己的字数等它自己的打字时间**（见下面 pace）。 */
+  const sent = [];
+  const failed = [];
+  const total = Math.max(messages.length, images.length);
+  for (let i = 0; i < total; i++) {    const msg = messages[i] ?? '';
+    const img = images[i] ?? null;
+    /* 2026-09-20 定稿：引用只可能来自模型显式传的 replyToMessageId。
+     * 旧写法在这里有第二个分支：没传引用时调 pickSmartQuoteFor() 让桥自己挑一条 —— 已删除
+     * （理由见本文件上方那段注释；猜错就是"引用错误"）。多气泡时只有第一条能带引用。 */
+    const explicitQuote = replyToMessageId !== undefined && replyToMessageId !== null && String(replyToMessageId).trim() !== '';
+    const useAt = i === 0 ? atUserId : null;
+    enqueueSend(async () => {
+      const useReply = (i === 0 && explicitQuote) ? String(replyToMessageId).trim() : null;
+      /* 内置线性延迟（2026-09-24 复原）：每条气泡都先等"它自己打完要多久"再发 ——
+       *   等 = clamp(本条字数 × linearPerCharMs × (1 ± linearJitterRatio), linearMinMs, linearCapMs)。
+       * 不看清零、不看批内序号：模型是一次工具调用发一条气泡，任何"只给第 2 条起算"的写法
+       * 在真实调用形态下都等于完全不延迟（342 次调用 / 0 次一次带多条）。
+       * linearEnabled=false（或 perChar=0）→ typingDelayMs 返回 null → 不延迟，节奏交回调用方。 */
+      const paceLen = String(msg || '').length;
+      const pace = typingDelayMs(paceLen);
+      if (pace != null && pace > 0) log(`[pace] ${key} ${paceLen} 字 → 等 ${pace}ms 再发`);
+      if (pace != null && pace > 0) await sleep(pace);
+      try {
+        /* ── 全语音发送模式（state/voice-config.json 的 send.allVoice）──────────────
+         * 开关打开时：这条回复先试着用语音发；只要语音没成功（合成失败/超单条上限/
+         * 当日额度用尽/被限流/念不出来/这条带图），就原地退回下面的文字发送 —— 不丢消息是这个
+         * 功能的第一条规矩，所以这里绝不能写 `return`/`continue` 把兜底路径绕过去。
+         * 放在发送任务里面（而不是函数开头）的原因：语音要沿用同一套节奏、同一个串行链，
+         * 也要沿用 console-server 在调用前就检查/预占好的发送频率额度（那里在 sendMessages 之前）。
+         * 开关关闭时 tryAllVoiceReply 直接返回 off（不打日志、不发请求），老用户完全无感。 */
+        /* 2026-09-18：修「引用有框、框下面没内容」—— 这一条带引用时不走语音。
+         * 根因：QQ 渲染不了 `[{reply},{record}]` 这个组合 —— 引用框在、语音没了；
+         * 而全语音模式下每条回复都先转语音，所以"带引用的回复"永远是这个坏组合（详见 quoteModeOf 注释）。
+         * 定稿：「改成引用的时候发文字」。spoken='' 就是本文件里"这条别用语音"的既有写法。 */
+        const quoteWantsText = !!useReply && quoteForcesText();
+        const spoken = (img || quoteWantsText) ? '' : speakableForVoice(msg);
+        if (quoteWantsText) log(`[quote] ${key} 这条带引用 → 不走语音、按文字发（quoteMode=${quoteModeOf()}）`);
+        const voiceOut = await tryAllVoiceReply(key, spoken, { replyToMessageId: useReply, hasMedia: !!img });
+        if (voiceOut.ok) {
+          // 与模型自己调 qq_send_voice 的记录格式保持一致（见 console-server `/api/voice/send`）：
+          // 记成 `[语音] 说了什么`，上下文里模型才知道自己刚才"说"过这句。
+          sent.push({
+            text: `[语音] ${voiceOut.text}`,
+            messageId: voiceOut.messageId != null ? String(voiceOut.messageId) : null,
+            quoted: useReply ? String(useReply) : null,
+            voice: true,
+          });
+          if (pace != null) markSendDelivered(key, voiceOut.text.length);
+        } else {
+          const sendData = await onebotSend(kind, id, msg, useReply, useAt, img);
+          // 记录真实 QQ message_id：撤回（qq_withdraw_message）与 (id:xxx) 展示都依赖它。
+          // 2026-09-15：需求"检查它是否知道自己引用了"→ 把实际用上的引用目标也带回去
+          // （auto 引用以前是桥偷偷加的，工具结果里 quoted:null → 模型压根不知道自己引用了谁，
+          //   于是它既无法解释、也无法自我纠正）。现在 sent[i].quoted 就是那条被引用的消息 id。
+          sent.push({
+            text: msg || (img ? '[图]' : ''),
+            messageId: sendData && sendData.message_id != null ? String(sendData.message_id) : null,
+            quoted: useReply ? String(useReply) : null,
+          });
+          if (pace != null) markSendDelivered(key, msg ? String(msg).length : 0);
+        }
+      } catch (error) {
+        log(`QQ 发送失败 (${key}):`, error?.message ?? error); if (error?.stack) log('[send-stack]', error.stack.split(String.fromCharCode(10)).slice(0, 8).join(' | '));
+        failed.push(error);
+      }
+      // delays 可选：部分调用方（如音乐分享 sendMessages(key, [text])）不传；
+      // 线性节拍关闭时直接取 length 会 TypeError（被发送链吞掉，'条间延迟'静默失效）。
+      if (pace == null && Array.isArray(delays) && i < delays.length) await sleep(delays[i]);
+    }, key);
+  }
+  return currentSendChain(key).then(() => {
+    if (failed.length > 0) {
+      const err = new Error(`QQ 发送失败 ${failed.length}/${messages.length} 条：${failed[0]?.message ?? '未知错误'}`);
+      err.sent = sent.slice();
+      throw err;
+    }
+    return sent;
+  });
+}

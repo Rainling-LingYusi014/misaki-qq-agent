@@ -1,0 +1,22 @@
+# DSH home 级 patch（作用于本 home 下所有 profile）
+# 用户自己的 overlay 写在下面即可；qq-bridge 只维护带 BEGIN/END 标记的那一段。
+# === qq-bridge compaction BEGIN ===
+# 由 qq-bridge 自动维护（lib/dsh-compaction.js）：这段之内的内容每次启动/改配置都会重写，
+# 手改会被覆盖；想长期自定义就改 qq-bridge/config.json 的 dshCompaction 段。
+# 策略：上下文用到窗口的 16.0% 就开始治理：先剪掉超过 8192 字的工具结果（不发模型请求、聊天不动），仍超阈值才把最老一段摘要；最近 2.0% 的上下文逐字保留。
+- id: compaction-basic
+  disabled: false
+  config:
+    auto: true
+    thresholdRatio: 0.16
+    retainRatio: 0.02
+    maxTokens: 4096
+    compactionRetries: 1
+    maxOverflowRetries: 1
+- id: tool-result-pruner
+  disabled: false
+  config:
+    thresholdChars: 8192
+    headChars: 4915
+    tailChars: 1638
+# === qq-bridge compaction END ===

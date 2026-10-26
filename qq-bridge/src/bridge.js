@@ -1,0 +1,895 @@
+// QQ ↔ DeepSeek Harness 桥接主程序。
+//
+// 链路：
+//   QQ 消息 → NapCat (OneBot v11 WS) → 本进程 → DSH Web API session.prompt
+//   DSH agent 回复/提问/审批 → events.mux 事件流 → 本进程 → send_msg → QQ
+//
+// 用法：node src/bridge.js （先编辑 ../config.json）
+import fs from 'node:fs';
+import http from 'node:http';
+import path from 'node:path';
+import crypto from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
+import { fileURLToPath } from 'node:url';
+import { OneBotWsClient } from './lib/onebot-ws.js';
+import { watchOverrideFiles } from './lib/preset-compose.js';
+import { NodeApiClient, unwrap, createTurnCollector } from './dsh-client.js';
+import { mdToPlain, splitForQQ } from './md-to-plain.js';
+import { SENSITIVE_RE, sensitiveHitKind, sensitiveHitSample } from './sensitive.js';
+import { looksLikeUnfinished } from './wait.js';
+import { safeFetchBuffer, validateFetchUrl, looksLikeImageBuffer } from './safe-fetch.js';
+import { extractForwardIds, forwardIdFromData, sanitizeForwardId, formatForwardResponse } from './forward.js';
+import {
+  loadSlang,
+  saveSlang,
+  upsertSlangEntry,
+  buildSlangContext,
+  buildExtractionPrompt,
+  buildResearchPrompt,
+  parseExtractionJson,
+  parseResearchJson,
+  createSlangEntry,
+  mergeEvidence,
+  SLANG_STATUS
+} from './slang-learner.js';
+import {
+  loadStickerStore,
+  saveStickerStore,
+  mergeStickerLibrary,
+  findSticker,
+  formatStickerList,
+  buildStickerContext,
+  buildStickerStrategyHint,
+  applyStickerNote,
+  markStickerUsed
+} from './sticker-lib.js';
+import { resolveFaceRef, formatFaceList } from './qq-faces.js';
+import { makeDocx } from './make-docx.js';
+import { segmentsToText, parseJsonCardText, extractMediaFromSegments, extractFilesFromSegments,
+  execFileBuffer, decodeTextBuffer, extractDocxText, parseFileBuffer, fetchFileBytes, readFileContent } from './lib/message-parse.js';
+import {
+  ROOT, STATE_DIR, STATE_FILE, ROLE_STATE_FILE, SLANG_FILE, SLANG_SESSION_FILE,
+  SOCIAL_STATE_FILE, STICKER_FILE, FEEDBACK_FILE, TOOL_LOG_FILE, ACTIVITY_LOG, BRIDGE_LOG,
+  CROSSCHAT_FILE, LOCK_FILE,
+} from './lib/paths.js';
+import { readJsonSafe, atomicWriteJson, atomicWriteText } from './lib/json-fs.js';
+import { randInt } from './lib/rand.js';
+import { BJ_WEEK, bjMinutes, bjMinToText, beijingTs, beijingDateKey, parseClockMin, fmtBeijing } from './lib/time.js';
+import { isCjkChar, splitByCjkSpaces, isCjkLikeChar, convertExampleSpacesToComma } from './lib/cjk-split.js';
+import { clampGap, computeGaps } from './lib/send-gaps.js';
+import { normalizeLoopSignature, isDuplicateSendText } from './lib/loop-guard.js';
+import { faceIdFromArtifactContent, resolveArtifactFaceId } from './lib/qq-face-parse.js';
+import { compressImageBuffer, finalizeImageBuffer } from './lib/image-compress.js';
+import { isSafeLocalMediaPath, isProbablySafeImageFileRef } from './lib/media-guard.js';
+import { KNOWN_AGENT_TOKENS, redactSensitiveText, SENSITIVE_ARG_KEYS, redactSensitive, sanitizeToolArgs, escapeCqText, unquoteJsonString } from './lib/text-safe.js';
+import { normalizeOwnerQQ, normalizeIdList, allowed } from './lib/config.js';
+import { readRoleState, writeRoleState, sanitizeRoleName, listRoles } from './lib/role-access.js';
+import { sleep, withTimeout } from './lib/async.js';
+import { convKey, canonicalKey } from './lib/keys.js';
+import { EXPLICIT_END_RE, hasExplicitEnd, isSleepingConfig, normalizeSpeakerIds } from './lib/sleep-guard.js';
+import { isEmojiLikeCp, stripImeEmoji } from './lib/emoji.js';
+import { singleLineForQQ, splitLongSegment } from './lib/segment.js';
+import { mimeFromBuffer, mimeFromUrl, base64FromMaybe } from './lib/media-meta.js';
+import { log, appendActivity, readActivityTail } from './lib/log.js';
+import { SILENT_MARKER, isSilentMarker, SEND_TOOL_RE, isSendToolName, SPACE_SPLIT_HINT, DIRECTION_HINT } from './lib/markers.js';
+import { state, loadConfig, loadState, saveState, watchConfigFile } from './core/config.js';
+import { acquireLock, releaseLock } from './core/runtime.js';
+import { enqueueSend, currentSendChain } from './core/send-chain.js';
+import { sendToQQ, sendMessages, initQqSendCore, setQqSendBot } from './core/qq-send.js';
+// Pixiv 登录态自检：登录态失效时主动发一条私聊提醒（长期令牌 + 旧 cookie 两条路），见 core/pixiv-watch.js
+import { startPixivCookieWatch } from './core/pixiv-watch.js';
+// Pixiv 长期令牌自动轮换（PHPSESSID 换一次 refresh_token 之后，桥自己每小时换 access_token）
+import { startPixivTokenRefresh, pixivAuthState, bootstrapPixivFromConfigCookie } from './lib/pixiv-auth.js';
+import { redactKnownTokensOnly, sweepMessageArtifacts, stripMessageArtifacts, cleanOutboundText } from './lib/outbound-text.js';
+import { planSocialTimeline, isDirectedAtAi, withTimeText, findCjkSpaceWarning, findSplitBoundaryWarning } from './lib/social-timeline.js';
+import { createMediaDomain } from './core/media.js';
+import {
+  DOC_TMP_HOST_DIR, DOC_TMP_CONTAINER_DIR, MAX_DOCX_CHARS, docxQuota,
+  loadDocxQuota, docxQuotaReserve, docxQuotaCommit, writeDocxToMount,
+  uploadFileToQQ, sendDocx, initDocxCore,
+} from './core/docx.js';
+import {
+  stickerEnabled, saveStickerStoreSafe, syncStickerLibrary, listStickersFor,
+  getStickerImageData, sendSticker2, sendQqFace2,
+  stickerEntries, stickerSyncedAt, updateStickerEntries, initStickerCore, setStickerBot,
+  writeStickerTmpFile, applyStickerNote2, setStickerRemark2, collectSticker2,
+} from './core/sticker.js';
+import { postRandomQzone, initQzoneCore, startQzoneAutoLike, startQzoneWeeklyScheduler } from './core/qzone.js';
+import {
+  cancelPendingEntry, handlePendingAnswer, handlePokeNotice, handleInputStatusNotice,
+  registerPending, initEventsAuxCore, setEventsAuxApi,
+} from './core/events-aux.js';
+import {
+  memDb, initMemoryDb, getProfile, setProfileField, formatProfileText,
+  profileDisplayName, formatContactsLine, resolveNameToUid,
+  persistChatMessage, searchChatMessages, deleteChatMessages, clearChatHistory,
+  markChatRecalled,
+  formatMemory, appendMemory, initMemoryCore,
+} from './core/memory.js';
+import {
+  evaluateWakeTrigger, buildWakePrompt, sendWakePrompt, steerIntoRunningTurn,
+  initWakeCore, setWakeApi, setWakeDeliver, runtimeOverrideStamp,
+} from './core/wake-send.js';
+import { resolveGroupMemberName, resolveReplyInfo, expandIncomingForwardPreview, setMessageCacheBot } from './core/message-cache.js';
+import {
+  shouldAuditKey, shouldBlockSilentReply, handleSensitiveIntercept, auditAndSend, initAuditCore,
+  readFeedbackEntries, appendFeedbackEntry, readToolLog, appendToolLog,
+} from './core/audit.js';
+import {
+  armPendingWakeLease, disarmPendingWakeLease, clearAllPendingWakeLeases,
+  quarantineSession, recordAiTurnOutbound, finishTurnLoopGuard,
+  armTurnWatchdog, armTurnTotalTimer, clearTurnTotalTimer, clearAllTurnTotalTimers,
+  setTurnGuardApi, TURN_TIMEOUT_MS, TURN_TOTAL_TIMEOUT_MS,
+} from './core/turn-guard.js';
+import {
+  collectors, TurnStartAt, pendingWakeKeys, sessionPromises, promptQueues,
+  sendToolSucceededSessions, turnTimeoutTimers, turnTotalTimers, loopRepeatState,
+  loopRecoverTimes, activeAiTurns, pendingTurnOutbound, toolCallNames, pendingSendToolCalls,
+  activeWaits, pendingWakeLeaseTimers, lastWakeRebroadcast, wakeConfigUpdatedKeys,
+  markReadCalledKeys, wakeConfigMissCount, reverse,
+  queued, queuedHintAt, queueRetries, pending, visionModelAppliedSessions,
+  resetVisionModelApplications,
+  messageMediaStore, activityWakeCooldown, MAX_MEDIA_COUNT,
+} from './core/session-state.js';
+import {
+  activityWindows, loadActivityWindows, saveActivityWindows, getActivityWindows,
+  inActivityWindow, nextActivityWindowStart, activityStatusLine,
+  startActivityTick, activityTickTimer,
+} from './core/activity.js';
+import {
+  ensureSession, ensureVisionModel, bumpSessionEpoch,
+  initDshSessionCore, setDshSessionApi, dshReady, setDshReady,
+} from './core/dsh-session.js';
+import {
+  saveSlangStore, queueSlangTask, invalidateSlangLearnerSession, runSlangExtraction,
+  runSlangResearch, maybeQueueSlangExtraction, feedSlangWindow, allowSlangSubmit,
+  publicSlangEntry, confirmedSlangList, withSlangContext,
+  slangEntries, slangWindows, slangExtractionCooldowns, slangSubmitTimes, feedbackTimes,
+  slangResearchingIds, learnerSessions, learnerCollectors, learnerWaiters,
+  lastSendDedup, sendCallTimes, slangLearnerSessionId,
+  setSlangEntries, setSlangLearnerSessionId, initSlangCore, setSlangApi,
+} from './core/slang.js';
+import {
+  initPersonaLearnCore, setPersonaLearnApi, initPersonaAutoLearn,
+} from './core/persona-learn.js';
+import { initPortraitLearn } from './core/portrait-learn.js';
+import { initVoiceCore } from './core/voice.js';
+import { initNapcatTokens, probeNapcatLogin } from './core/napcat-tokens.js';
+import { initNapcatGuard, startNapcatGuard } from './core/napcat-guard.js';
+import { initSendDice } from './core/send-dice.js';
+import { ensureLearningToken } from './core/learning-token.js';
+import {
+  initSessionArchiveCore, setSessionArchiveApi, startSessionArchiveTicker,
+  loadArchivedCache, liveSessionIdsOnDisk,
+} from './core/session-archive.js';
+
+/* 2026-09-16：磁盘上真实存在的会话 id，按 60 秒缓存：事件泵的活跃会话筛选与启动自愈都用它。 */
+let _liveIdsCache = null;
+let _liveIdsAt = 0;
+function liveSessionIdsOnDiskCache() {
+  const now = Date.now();
+  if (!_liveIdsCache || now - _liveIdsAt > 60000) {
+    _liveIdsCache = liveSessionIdsOnDisk();
+    _liveIdsAt = now;
+  }
+  return _liveIdsCache;
+}
+import {
+  initSlangNightly,
+} from './core/slang.js';
+import {
+  initTokenMeter, setConvKeyResolver, setTokenReconcileHome, startTokenReconcile, setTokenBudgetCfg,
+} from './core/token-meter.js';
+import { initTokenReportCore } from './core/token-report.js';import {
+  enqueueForRetry, flushQueue, deliverPrompt, drainPromptQueue, drainAllPromptQueues,
+  QUEUE_MAX, initPromptDeliverCore, setPromptApi, setPromptMediaResolver,
+} from './core/prompt-deliver.js';
+import {
+  appendSocialMessage, appendSocialPoke, resolveReplyTarget, isQuoteTargetSelf,
+  findMessageMedia, recordSentMessages, initSocialFlowCore,
+} from './core/social-flow.js';
+import {
+  getImageDimensions, fetchOneBotImage, fetchFaceMedia, resolveMediaList, fetchMediaData,
+  MAX_MEDIA_BYTES, MAX_MEDIA_PIXELS, MAX_MEDIA_STORE_PER_KEY,
+  initMediaPipeCore, setMediaPipeBot,
+} from './core/media-pipe.js';
+// 独立识图模型（语言模型与识图模型分开配）：只做 init，真正调用发生在 media-pipe 里
+import { initVisionCore, visionSplitEnabled } from './core/vision.js';
+import {
+  tunableListItems, findTunable, applyTunable, rearmProactiveTimersAfterChange,
+  tokenBelongsToOwner, TUNABLE_SPECS, setTunableCfg, resolveIsolatedDshHome,
+} from './core/tunables.js';
+// 上下文治理：把压缩策略写进 DSH home 的 cordis.patch.yml（见该文件顶部为什么不能在桥侧改历史）
+import { syncDshCompactionPatch } from './lib/dsh-compaction.js';
+// 剪枝省下多少（读 DSH 会话日志实测；用量面板那块"剪枝省下"就是它）
+import { initContextSavings, reconcileContextSavings, getContextSavings } from './core/context-savings.js';
+import {
+  social, defaultWakeConfig, softResetWakeConfig, initSocialCore,
+  preSleepWaitBlocked, computeWakeSafety,
+  wakePriority, seenForwardIds, saveSocialState,
+  refreshDefaultWakeConfig, refreshAllDefaultWakeConfigs, isConversationBusy,
+  getSocialState, loadSocialState, ensureWakeable, cancelReplyCheck,
+  cancelProactiveCheck, setupSleepTimer, scheduleProactiveCheck, setWakeSender, setSteerSender,
+  formatParticipation, suggestQuietMs, PEER_TYPING_HOLD_MAX_MS, scheduleWake,
+  scheduleReplyCheck, buildWakeReminderPrompt,
+  startDeliveryWatchdog,
+  // 配置里的插话概率一改 → 立刻同步到正在跑的会话（只动 source=owner 的，见 social-state.js）
+  applyOwnerWakeProbabilityToSessions,
+  // 人设已合成进系统提示词 → 启动时给"没见过当前人设版本"的会话标记一次补注入
+  markStalePersonaReinjects,
+  clearSocialTimers, clearAllSocialTimers,
+} from './core/social-state.js';
+import {
+  loadScheduledTasks, parseScheduledAt, createScheduledTask, cancelScheduledTask, setScheduledRecorder,
+} from './core/scheduler.js';
+// 好友申请拟人化延迟审批（2026-10-07）：黑名单秒拒、owner/白名单秒过、其余随机晾一会儿再通过
+import {
+  handleFriendRequest, loadFriendRequests, setFriendApprovalBot, initFriendApprovalCore,
+} from './core/friend-approval.js';
+import {
+  addCrossMail, unreadCrossMails, markCrossMailsRead,
+  buildCrossChatBlock, initCrossChatCore,
+} from './core/crosschat.js';
+import {
+  VALID_MODES, currentMode, closedAgentPreset, selfNickname,
+  setCurrentMode, setClosedAgentPreset, setSelfNickname,
+  modeAllowed, modePreset, isSessionAllowedInCurrentMode, initModeCore,
+} from './core/mode.js';
+import {
+  warmGroupName, getGroupDisplayName, formatGroupListLine, warmGroupInfo,
+  getCachedGroupInfo, formatGroupInfoLine, initGroupCacheCore, setGroupCacheBot,
+} from './core/group-cache.js';
+
+import { handleIncoming, pumpMux, initMuxCore, setMuxApi, setMuxBot } from './core/mux.js';
+import { startDshWatch, writeLastMode, initDshWatchCore, setDshWatchApi, setDshWatchBot } from './core/dsh-watch.js';
+import { startConsoleServer, initConsoleCore, setConsoleApi, setConsoleBot, setConsoleMedia, setConsoleLastModeSink } from './core/console-server.js';
+import { resolveDshTarget, isInstalled, installToIsolatedDsh, installPresets, ensureBuiltinPlugins, setDshSideConfig, patchProfileCordis } from './lib/dsh-side.js';
+
+// 路径与 JSON 读写已外置：lib/paths.js、lib/json-fs.js（见上方 import）
+
+// 控制台鉴权 token：未配置时自动生成并持久化到 state/console-token，避免默认无鉴权。
+
+
+
+// 回复审计：agent 回复若命中以下特征（本机路径/凭据），硬性拦截不发送。
+// 宁可误拦，不可泄露。
+
+
+// 分句规则提示：真人聊天不会主动用空格，因此空格被桥接当作“分条信号”。
+// 中英文/数字之间的空格同样会分条，所以不想分条就不要加空格。
+// 群聊指向性提示：引用/回复段表示“这句话是在对被引用的人说”，避免 AI 把群友之间的对话误当成指向自己。
+
+
+
+
+
+
+// ── 工具 ────────────────────────────────────────────────────────────────────
+
+
+
+
+
+// ── 主流程 ──────────────────────────────────────────────────────────────────
+async function main() {
+  const cfg = loadConfig();
+  // 内置隔离 DSH 端自安装（幂等、异步、非阻塞）：把 qq-bridge 的 preset/MCP/插件装到
+  // 隔离 DSH home（项目 .runtime 或 manager 隔离 home，自动探测），默认绝不碰桌面端 DSH。
+  void (async () => {
+    try {
+      const target = resolveDshTarget();
+      if (target.refusedDesktop || !target.booted) return;
+      // 2026-09-12：preset 每次启动都刷新：它是桥自带的代码资产（persona / [WAKE TYPES] / [RULES]），
+      // 不是用户数据；而原来的逻辑是"装过一次就靠 marker 全跳过"，导致改了 agent.cordis.yml
+      // 之后重启桥根本不会把新 preset 装进去（实测活体 preset 一直停在旧哈希）。
+      // MCP/插件那些开销大的部分仍由 marker 把关，不受影响。
+      try {
+        installPresets(target);
+        log(`[dsh-side] preset 已刷新到 ${path.join(target.home, '.agent-presets')}`);
+        /* 2026-09-19：外面改系统提示词、里面也要跟着改 —— 盯住 persona.md / speech-rules.md：
+         * 一改就重新合成进已安装的 preset（新会话直接生效），日志留一行。 */
+        try {
+          watchOverrideFiles({ home: target.home, root: ROOT, log });
+          log('[dsh-side] 人设/发言规则监视已启动（改动即重新合成进系统提示词）');
+        } catch (eWatch) { log(`[dsh-side] 人设监视启动失败：${eWatch?.message ?? eWatch}`); }
+      } catch (ePre) {
+        log(`[dsh-side] preset 刷新失败（继续用现有 preset）: ${ePre?.message ?? ePre}`);
+      }
+      /* 2026-09-20 长期记忆插件：每次启动都幂等装配一遍（link + profile 注册 + settings 的 memory 段）。
+       * 为什么不能只在 installToIsolatedDsh 里做：那条路被 marker 挡住，装过一次就不再跑，
+       * 于是升级上来的老安装永远不会有它（与 preset 那次踩的坑同型）。 */
+      try {
+        ensureBuiltinPlugins(target);
+        log('[dsh-side] 内置插件已装配（qq-mode-console / 长期记忆 dsh-memory）');
+      } catch (ePlug) {
+        log(`[dsh-side] 内置插件装配失败（记忆/控制台插件可能不可用）: ${ePlug?.message ?? ePlug}`);
+      }
+      if (isInstalled(target)) return;
+      log(`[dsh-side] 内置隔离 DSH 未安装 qq-bridge 端（${target.home}），自动安装…`);
+      await installToIsolatedDsh();
+    } catch (error) {
+      log(`[dsh-side] 自动安装失败（可稍后执行 node scripts/setup-dsh.mjs）：${error?.message ?? error}`);
+    }
+  })();
+  initMuxCore(cfg);
+  initConsoleCore(cfg);
+  fs.mkdirSync(STATE_DIR, { recursive: true });
+  acquireLock();
+  loadState();
+  initStickerCore(cfg);
+  initDocxCore(cfg);
+  initQqSendCore(cfg);
+  setTunableCfg(cfg);
+  // 2026-10-25（工具型裁剪）：QZone 全家（说说/点赞/cookie）默认下线——工具型不碰 QQ 空间，
+  // 顺带消灭审计 P1 第 8 条（GET /api/qzone-cookie）的实际暴露面；要重开置 social.qzoneEnabled=true
+  if (cfg.social?.qzoneEnabled === true) { initQzoneCore(cfg); startQzoneAutoLike(); startQzoneWeeklyScheduler(); } else log('[qzone] 已按工具型默认下线（social.qzoneEnabled 未开启）');
+  initEventsAuxCore(cfg);
+  initMemoryCore(cfg);
+  initWakeCore(cfg);
+  setWakeDeliver(deliverPrompt);
+  initGroupCacheCore(cfg);
+  initSocialCore(cfg);
+  // 投递看门狗：兜"桥已经收下、却因为某条链路静默失败而一直没交给模型"的消息。
+  // 判据是 lastDeliveredSeq（未交付）而不是"有没有被回复"——模型看到后选择不回是它的自由，
+  // 但没看到必须被兜住。正常路径下它一次都不会触发（投递 1~3 秒内完成）。
+  try { startDeliveryWatchdog(); } catch (error) { log('[watchdog] 启动失败:', error?.message ?? error); }
+  initModeCore(cfg);
+  initDshWatchCore(cfg);
+  initCrossChatCore(cfg);
+  initAuditCore(cfg);
+  initDshSessionCore(cfg);
+  initSlangCore(cfg);
+  initPersonaLearnCore(cfg);
+  // 语音能力（MiMo TTS/ASR）：配置存在 state/voice-config.json，管理端保存即生效，无需重启桥
+  initVoiceCore(cfg);
+  // NapCat 鉴权令牌：写进 NapCat 自己的配置 + 重启容器（管理端「NapCat 令牌」卡走这里）
+  initNapcatTokens(cfg);
+  // NapCat 会话守护（2026-10-26 半版）：get_rkey 探针 + 报警（不自动重启；密码回退激活后开 autoHeal）。
+  // 为什么需要：静默死两次亲历（2026-09-16 泠娜 / 2026-10-25 本部署）——TCP 活着、isLogin 仍 true，
+  // 只有 get_rkey（真打腾讯服务器）能逮住。
+  initNapcatGuard(cfg, { callAction: (action, params) => bot.raw(action, params), send: (key, text) => sendToQQ(key, text) });
+  // 发送抽签（语音 / 表情包的概率与冷却）：桥侧掷骰后写进唤醒正文，不让模型自己猜概率
+  initSendDice(cfg);
+  initTokenMeter(cfg);
+  // 2026-10-25 预算闸门：配置进 meter（social.budget.dailyGlobal / dailyPerConv，缺省不限额）。
+  // 2026-10-26 owner 豁免：把 ownerQQ 一起注入（checkTokenBudget 对 owner 私聊免闸——主人免上限，非主人受限）。
+  setTokenBudgetCfg(cfg.social?.budget ? { ...cfg.social.budget, ownerQQ: cfg.ownerQQ } : (cfg.ownerQQ ? { ownerQQ: cfg.ownerQQ } : null));
+  /* 2026-09-21：/token 指令：用与「学习」页实测区同一套口径算今日花费（单价走 cfg.tokenCost）。 */
+  initTokenReportCore(cfg);
+  /* 2026-09-21：把配置注给 dsh-side：napcat MCP 要不要走 mcp-compressor 压缩代理由它决定。
+   * 代理开关变了要重写 cordis.patch.yml（幂等）并重启隔离 DSH 才生效，与工具档位同一条路径。 */
+  setDshSideConfig(cfg);
+  try { patchProfileCordis(resolveDshTarget()); } catch (e) { log(`[dsh-side] 重写 MCP 块失败（不影响启动）：${e?.message ?? e}`); }
+  // 用量对账：DSH 自己的 projcache 里有按会话累计的权威 token 数（tokenUsage.totals）。
+  // 单帧漏记（帧里没有 sessionId / 会话刚好结束）会让面板偏低，这里定期把差额补成
+  // reconciled:true 的行，使面板 == DSH 侧真实值。找不到 DSH home 时静默跳过（不影响主流程）。
+  try {
+    const dshTarget = resolveDshTarget();
+    if (dshTarget && !dshTarget.refusedDesktop && dshTarget.home) {
+      setTokenReconcileHome(dshTarget.home);
+      startTokenReconcile();
+      log(`[token] 用量对账已启用：${path.join(dshTarget.home, 'storages', 'session_projcache', 'sessions')}`);
+    } else {
+      log('[token] 未找到可用的 DSH home，跳过用量对账（面板数字只按 usage 帧累计）');
+    }
+  } catch (error) {
+    log(`[token] 用量对账初始化失败（忽略）: ${error?.message ?? error}`);
+  }
+  /* 2026-09-19：上下文剪枝省下多少：读 DSH 自己的会话日志（compaction/prune 的 shadowedTokenCount
+   * × 它之后同会话还发生过多少次请求）。这里只做初始化 + 首次扫描，之后由用量面板按需增量刷新。
+   * 为什么不用事件流：官方 rc.1 没有全局广播，桥是逐会话 follow，只覆盖自己映射的会话；
+   * 而会话日志是 DSH 落的权威记录，任何会话的剪枝都算数（真机验证过：日志里 prune 事件带 shadowedTokenCount）。 */
+  try {
+    const dshHomeForSavings = (() => {
+      try {
+        const t = resolveDshTarget();
+        if (t && !t.refusedDesktop && t.home) return t.home;
+      } catch { /* 下面退回环境变量 */ }
+      return process.env.QQB_DSH_HOME || '';
+    })();
+    initContextSavings({ ...cfg, dshHome: dshHomeForSavings });
+    if (dshHomeForSavings) {
+      reconcileContextSavings({ log: (m) => log(`[savings] ${m}`) })
+        .then((r) => {
+          const s = getContextSavings(7);
+          log(`[savings] 剪枝计量就绪：扫描 ${r.scanned ?? 0} 份会话日志（复用 ${r.reused ?? 0} 份），`
+            + `今日已剪掉 ${s.today.prunedTokens} token / 少读 ${s.today.rereadSaved} token`);
+        })
+        .catch((e) => log(`[savings] 首次扫描失败（忽略）: ${e?.message ?? e}`));
+    } else {
+      log('[savings] 未找到 DSH home，跳过剪枝计量（面板不显示该项）');
+    }
+  } catch (error) {
+    log(`[savings] 剪枝计量初始化失败（忽略）: ${error?.message ?? error}`);
+  }
+  initSessionArchiveCore(cfg);
+  try { setConvKeyResolver((sessionId) => reverse.get(String(sessionId)) ?? null); } catch (_) {}
+  initPromptDeliverCore(cfg);
+  initSocialFlowCore(cfg);
+  initFriendApprovalCore(cfg);
+  initMediaPipeCore(cfg);
+  initVisionCore(cfg);
+  log(visionSplitEnabled()
+    ? `[vision] 已启用独立识图模型：${String(cfg.dsh?.visionModel || '')} @ ${String(cfg.dsh?.visionBaseUrl || '')}（图片先转文字再交给语言模型）`
+    : '[vision] 未配置独立识图模型：图片按附件发给主模型（识图模型留空时用主模型）');
+  /* 2026-09-19 上下文治理：把压缩策略写进隔离 DSH home 的 cordis.patch.yml（home 级 patch 层）。
+   * 为什么在桥侧做：桥知道 DSH home 在哪（QQB_DSH_HOME 由启动脚本给出，本机由管理器配置给出），
+   * 而且 DSH 的 profile 是 `patchReload: live` —— 改这份文件不用重启 DSH 就生效，改动不打断会话。
+   * 写不进去只是没有治理，绝不影响桥启动（失败只记一行日志）。 */
+  try {
+    const cRes = syncDshCompactionPatch({ home: resolveIsolatedDshHome(), cfg: cfg.dshCompaction, log });
+    if (!cRes.ok) log(`[compaction] 上下文治理配置未写入（忽略）：${cRes.error}`);
+    else if (!cRes.changed) log(`[compaction] 上下文治理配置已是最新（${cRes.path}）`);
+    else {
+      const v = cRes.values;
+      log(v.enabled
+        ? `[compaction] 已写入上下文治理配置 ${cRes.path}：窗口 ${(v.thresholdRatio * 100).toFixed(1)}% 触发，`
+          + `最近 ${(v.retainRatio * 100).toFixed(1)}% 逐字保留，工具结果超 ${v.toolResultMaxChars} 字剪枝（保留头 ${v.headChars}/尾 ${v.tailChars}）`
+        : `[compaction] 已关闭上下文治理（${cRes.path}）——回到 DSH 默认（窗口 80% 才压缩）`);
+    }
+  } catch (error) {
+    log('[compaction] 写上下文治理配置异常（忽略）:', error?.message ?? error);
+  }
+  setScheduledRecorder(recordSentMessages);  setWakeSender(sendWakePrompt);
+  // 会话忙时把新消息塞进在途回合（DSH mode:'steer'），省掉"结束后再唤醒一轮"的整轮往返
+  setSteerSender(steerIntoRunningTurn);
+  if (typeof steerIntoRunningTurn === 'function') log('[steer] 已注册「在途回合注入」(session/prompt mode:steer)');
+  else log('[steer] 注册失败：steerIntoRunningTurn 不是函数（导入异常）');
+  // buildMusicCard 也交给管理端/工具链路：音乐卡片的字段解析与降级梯子都放在 media 域里（唯一实现）
+  const { sendRich, musicSearch, buildMusicCard } = createMediaDomain(cfg);
+  setConsoleMedia(sendRich, musicSearch, buildMusicCard);
+
+  /* Pixiv 登录态看护：只在"登录态失效"时才向 owner 发一条私聊提醒（最多一天一次）。
+   * 2026-09-20 起登录态的主流形态是 OAuth 长期令牌（自动轮换），cookie 只当旧安装的兼容路径。
+   * 2026-10-25（工具型裁剪）：不配 pixiv.refreshToken/cookie 就不启动看护（原来无条件启动）。 */
+  try {
+    if (String(cfg.pixiv?.refreshToken ?? '').trim() || String(cfg.pixiv?.cookie ?? '').trim()) {
+      startPixivCookieWatch({
+        logger: (m) => log(m),
+        ownerKey: () => (cfg.ownerQQ ? `private:${cfg.ownerQQ}` : ''),
+        send: (key, text) => sendToQQ(key, text),
+      });
+    } else {
+      log('[pixiv] 未配置登录态，看护未启动（工具型默认）');
+    }
+  } catch (error) {
+    log('[pixiv] 登录态看护启动失败（不影响主流程）:', error?.message ?? error);
+  }
+
+  /* Pixiv「粘贴一次就自动轮换」的最后一公里（2026-09-28）：配置里贴了 cookie、但还没有长期令牌时，
+   * 桥自己拿这份 cookie 去换一次 refresh_token（≡ tools/pixiv-login.mjs 那一步）。
+   * 现场：主人在管理端贴了 PHPSESSID 却一直没有登录态 —— 因为改配置从不触发 OAuth 交换，
+   * 而填进配置的 cookie 只打开旧的"每次请求都带 cookie"那条路，且随时会过期/被覆盖。
+   * 异步发起：pixiv 不可达时最多等一个请求超时，不阻塞桥起来；失败只记一行日志、不重试。 */
+  void bootstrapPixivFromConfigCookie({ logger: (m) => log(m) })
+    .catch((error) => log('[pixiv] 用配置里的 cookie 引导登录态异常（不影响主流程）:', error?.message ?? error));
+
+  /* Pixiv 长期令牌自动轮换：每 50 分钟看一眼，access_token 快过期就换，并把轮换后的 refresh_token 落盘。
+   * 只有手里真的有 refresh_token 才说这句话 —— 没配的时候不该在启动日志里假装有个登录态。 */
+  try {
+    startPixivTokenRefresh({ logger: (m) => log(m) });
+    if (pixivAuthState().hasRefreshToken) log('[pixiv] token 自动轮换已启动（间隔 50 分钟）');
+  } catch (error) {
+    log('[pixiv] token 自动轮换启动失败（不影响主流程）:', error?.message ?? error);
+  }
+
+  if (!cfg.allow.private.length && !cfg.allow.groups.length && cfg.allowAllWhenEmpty) {
+    log('⚠️  白名单为空且 allowAllWhenEmpty=true：将转发所有私聊/群聊消息给 agent');
+  }
+
+  // DSH 侧：官方 dsh（0.1.2+）web/API 都要 cookie —— manager 会把隔离 DSH 日志路径经
+  // DSH_ISOLATED_LOG_FILE 注入本进程，NodeApiClient 从日志解析最新 web token 换 dsh-auth cookie；
+  // 无该 env（手动直跑/旧版无 token 实例）自动退化为免鉴权直连。
+  // seqFile：把"每会话已处理的最高事件 seq"落盘。否则桥一重启就丢水位，follow 快照会把
+  // 整段历史重放一遍，而重放帧与实时帧同形、pumpMux 分不出来 → 历史回合副作用被重跑
+  // （重复计 token、重放"无正文收尾"误标新未读、旧回复被写回 pendingUndeliveredText 触发重复回复、
+  // 重放帧重新武装看门狗造成重启后 180s 批量误杀会话）。
+  const api = new NodeApiClient(cfg.dsh.baseUrl, undefined, {
+    dshLogFile: process.env.DSH_ISOLATED_LOG_FILE || '',
+    seqFile: path.join(STATE_DIR, 'dsh-seq.json'),
+  });
+  setTurnGuardApi(api);
+  setWakeApi(api);
+  setDshSessionApi(api);
+  setSlangApi(api);
+  setPersonaLearnApi(api);
+  initPersonaAutoLearn(cfg); // 人格自动间隔学习（learning-config persona.autoIntervalEnabled）
+  initPortraitLearn();       // 群友画像学习（立即 / 间隔 / 每日定时，learning-config portrait.*）
+  // 学习会话专用令牌：启动就生成/登记，别等第一次学习提醒才建文件 ——
+  // 否则「模型拿着令牌来提交」和「桥这边还没建过令牌」的时序会打架。
+  try { ensureLearningToken(); } catch (error) { log('学习令牌初始化失败:', error?.message ?? error); }
+  setPromptApi(api);
+  setPromptMediaResolver(resolveMediaList);
+  setEventsAuxApi(api);
+  setMuxApi(api);
+  setConsoleApi(api);
+  setDshWatchApi(api);
+  setSessionArchiveApi(api);
+  // 活动感知回合看门狗：只在“完全静默”超过该时长（无任何 turn/tool/流式事件）才判定卡死。
+  // default 防“忘记设置唤醒条件”：key -> 当前是否等待 AI 处理唤醒回合 / 本回合已更新唤醒配置 / 连续未设置次数
+  /* 2026-09-16 启动自愈：剔掉指向"磁盘上已经不存在的会话"的映射。
+   * 实测：手动清理过会话目录后，`state/sessions.json` 里还留着旧 id → 事件泵每秒重开一次死会话的
+   * session/follow（日志刷 `follow 流终结 … (error)`，约 280 次/分钟），唤醒投递被拖慢甚至像"不回复"。
+   * 这里对齐一次磁盘，只保留真实存在的会话；顺带把内存 reverse 也建干净。 */
+  let sessionsPruned = 0;
+  try {
+    const alive = liveSessionIdsOnDisk();
+    /* 2026-09-22 修 M1·"全员失忆"风险：`alive` 为空有两种含义，旧写法把它们混成一种：
+     *   ① 真的所有会话都不存在了 → 该清；
+     *   ② 枚举不到（归档根路径拿不到 / 候选目录不存在 / 只留本桥 slug 而同名目录缺失）→ 不该清。
+     * 旧写法 `if (alive.size || 映射数)` 在 ② 下恒真 → 每个 sid 都"找不到" → 删光 state.sessions 并落盘，
+     * 记忆/画像/贴纸的会话身份随之丢失且不可恢复（现场日志：`磁盘上只剩 0 个会话`，全量只剩这一条）。
+     * 现在空集一律跳过清理（与同文件 `:525` 对空集"未知"的语义对齐）。 */
+    if (alive.size > 0 && Object.keys(state.sessions || {}).length) {
+      for (const [key, sid] of Object.entries(state.sessions || {})) {
+        if (!sid || alive.has(String(sid))) continue;
+        delete state.sessions[key];
+        sessionsPruned += 1;
+      }
+      if (sessionsPruned > 0) {
+        saveState();
+        log(`[state] 清理了 ${sessionsPruned} 个指向已不存在会话的映射（磁盘上只剩 ${alive.size} 个会话），避免事件泵空转`);
+      }
+    }
+  } catch (error) {
+    log(`[state] 会话映射自愈跳过：${error?.message ?? error}`);
+  }
+  for (const [key, sessionId] of Object.entries(state.sessions)) reverse.set(sessionId, key);
+  // rc.1 无全局 mux：事件泵按活跃会话逐个 open session/follow。把会话集合(正式映射 +
+  // 黑话/人格学习者 + 预热备用会话)注册给客户端，pumpMux 每轮拉取并自动订阅/退订。
+  {
+    const activeSids = () => {
+      const out = [];
+      const seen = new Set();
+      // 2026-09-16：只把"磁盘上确实存在"的会话交给事件泵：死会话会让 follow 反复报错、拖慢唤醒投递。
+      // 磁盘集合按 60 秒缓存一次（会话轮换/归档后自动跟上），拿不到就退回不筛选（宁可不筛也别漏跟）。
+      let alive = null;
+      try {
+        const now = Date.now();
+        if (!activeSids._cache || now - activeSids._cacheAt > 60000) {
+          activeSids._cache = liveSessionIdsOnDiskCache();
+          activeSids._cacheAt = now;
+        }
+        alive = activeSids._cache;
+      } catch { alive = null; }
+      const ok = (sid) => Boolean(sid) && (!alive || alive.size === 0 || alive.has(String(sid)));
+      for (const sid of reverse.keys()) if (ok(sid) && !seen.has(sid)) { seen.add(sid); out.push(sid); }
+      for (const sid of state?.sessions ? Object.values(state.sessions) : []) if (ok(sid) && !seen.has(sid)) { seen.add(sid); out.push(sid); }
+      try { for (const sid of learnerSessions ?? []) if (ok(sid) && !seen.has(sid)) { seen.add(sid); out.push(sid); } } catch {}
+      try { for (const st of social?.conversations?.values() ?? []) { const bs = st?._standbySessionId; if (ok(bs) && !seen.has(bs)) { seen.add(bs); out.push(bs); } } } catch {}
+      return out;
+    };
+    api.setSessionIdSource(activeSids);
+  }
+
+  // DSH 重启期间收到的 QQ 消息先入队（不丢），DSH 恢复后按序补投。
+  setConsoleLastModeSink(writeLastMode);
+
+  loadSocialState();
+
+  /* 启动时把"配置里的插话概率"同步到已有会话（2026-09-19：插话概率等所有概率都要改好落地）：
+   * 老会话数据里没有来源标记，以前会一直用历史上存下来的那个值（常见是模型早期拍的 0.12），
+   * 后来在界面上改成 0.05/0.2 也永远不会变。这里在启动时对齐一次。
+   * 2026-09-19 改口径：连"模型之前自定的"也一起覆盖 —— 现场是"我调的 0.15，唤醒词里带的
+   * 好像是 0.08"，就是因为老口径保留了模型的值。现在配置这份值说了算。 */
+  try {
+    const r = applyOwnerWakeProbabilityToSessions();
+    if (r.updated) log(`[config] 启动时同步插话概率：更新 ${r.updated} 个会话（其中覆盖模型自定的 ${r.overridden} 个）`);
+  } catch (e) { log('[config] 启动同步插话概率失败:', e?.message ?? e); }
+
+  /* 启动时给"没见过当前人设版本"的会话标记一次补注入（2026-09-20）。
+   * 人设/发言规则已经合成进系统提示词，唤醒正文默认不再重复注入它；但桥停机期间改过
+   * persona.md / speech-rules.md 的话，老会话的系统提示词是旧版、新写的又不在里面 —— 必须补一次。 */
+  try {
+    const r = markStalePersonaReinjects(runtimeOverrideStamp());
+    if (r) log(`[preset] 启动时标记 ${r} 个会话需要在下一轮补注入人设/发言规则`);
+  } catch (e) { log('[preset] 启动标记补注入失败:', e?.message ?? e); }
+
+  // QQ 侧（NapCat OneBot WebSocket 客户端）
+  const bot = new OneBotWsClient({
+    url: cfg.napcat.wsUrl,
+    accessToken: cfg.napcat.wsAccessToken || cfg.napcat.accessToken || undefined,
+    reconnect: true
+  });
+  // 2026-09-16 保登录态：连接是否活着（下面 open/close 里维护）+ "不回复"排查用的登录态巡检
+  let napcatUp = false;
+  setStickerBot(bot);
+  setQqSendBot(bot);
+  setGroupCacheBot(bot);
+  setMessageCacheBot(bot);
+  setMediaPipeBot(bot);
+
+  setMuxBot(bot);
+  setConsoleBot(bot);
+  setDshWatchBot(bot);
+  setFriendApprovalBot(bot); // 好友申请延迟审批要经它调 set_friend_add_request / get_stranger_info
+  bot.onPrivateMessage(async (event) => {
+    if (event.user_id === event.self_id) return;
+    try { await handleIncoming('private', event.user_id, event, cfg); } catch (error) { log('处理私聊消息出错:', error?.message ?? error); }
+  });
+  bot.onGroupMessage(async (event) => {
+    if (event.sender?.user_id === event.self_id || event.user_id === event.self_id) return;
+    try { await handleIncoming('group', event.group_id, event, cfg); } catch (error) { log('处理群消息出错:', error?.stack ?? error?.message ?? error); }
+  });
+  bot.onNotice('notify', async (event) => {
+    try { await handlePokeNotice(event); } catch (error) { log('处理拍一拍事件出错:', error?.message ?? error); }
+    try { await handleInputStatusNotice(event); } catch (error) { log('处理输入状态事件出错:', error?.message ?? error); }
+  });
+  // 撤回事件（对方撤回）：在上下文里标记 [已撤回]，AI 不再引用；并同步落库 chat_messages.recalled_at，
+  // 让 SQLite 成为撤回状态的可靠事实源（重启后 /recent、未读恢复、引用解析回退都读得到）。
+  bot.onNotice(async (event) => {
+    const nt = String(event?.notice_type ?? '');
+    if (nt !== 'group_recall' && nt !== 'friend_recall') return;
+    try {
+      const msgId = String(event.message_id ?? '');
+      const key = nt === 'group_recall' ? `group:${event.group_id}` : `private:${event.user_id}`;
+      if (!msgId) return;
+      // DB 落库放在内存会话守卫之前：即使该会话尚未加载（重启后极早期/新会话），撤回也要覆盖 chat_messages。
+      try {
+        const dbMark = await markChatRecalled(key, msgId);
+        log(`[recall] DB 已标记撤回 ${key} ${msgId}（updated=${dbMark.updated ?? 0}）`);
+      } catch (error) { log(`[recall] DB 标记撤回失败: ${error?.message ?? error}`); }
+      if (!social.conversations.has(key)) return;
+      const stR = getSocialState(key);
+      let marked = 0;
+      if (Array.isArray(stR.recentMessages)) {
+        for (const m of stR.recentMessages) {
+          if (m && String(m.messageId || '') === msgId && !m.recalled) { m.recalled = true; marked += 1; }
+        }
+      }
+      if (marked > 0) {
+        saveSocialState();
+        log(`[recall] 对方撤回消息已标记 ${key} ${msgId}（${marked} 条）`);
+      }
+    } catch (error) { log('处理撤回事件出错:', error?.message ?? error); }
+  });
+  // 好友请求：拟人化延迟审批（2026-10-07）。
+  // autoFriendApproval === false = 最高优先级总开关：完全不碰好友申请（申请自然挂着）。
+  // friendApproval.enabled === false = 回退旧「黑名单秒拒 / 其余秒过」逻辑（legacyAutoApprove）。
+  // 默认（两者都开）：黑名单秒拒 + owner/allow 白名单秒过，其余随机晾 10 分钟~6 小时再自动通过，
+  // 全过程以伪消息通知 owner 会话（泠娜知情不决策）。见 core/friend-approval.js。
+  const legacyAutoApprove = async (event) => {
+    try {
+      const flag = String(event.flag ?? '');
+      const uid = String(event.user_id ?? '');
+      if (!flag) return;
+      const denied = (Array.isArray(cfg.deny?.private) ? cfg.deny.private : Array.isArray(cfg.deny?.privates) ? cfg.deny.privates : []).map(String).includes(uid);
+      await bot.setFriendAddRequest(flag, !denied);
+      log(`[friend] 自动${denied ? '拒绝' : '同意'}好友请求 ${uid}`);
+      if (denied) {
+        try { await sendToQQ('private:' + String(cfg.ownerQQ), `已自动拒绝黑名单用户 ${uid} 的好友请求。`); } catch {}
+      }
+    } catch (error) { log('自动审批好友请求出错:', error?.message ?? error); }
+  };
+  bot.onRequest('friend', async (event) => {
+    if (cfg.social?.autoFriendApproval === false) return;
+    if (cfg.social?.friendApproval?.enabled === false) return legacyAutoApprove(event);
+    try { await handleFriendRequest(event); } catch (error) { log('延迟审批好友请求出错:', error?.message ?? error); }
+  });
+
+  /* 2026-09-30：napcat 登录态改为 SSE 实时探测。
+   * 链路真的开了/断了 → 强制重探一次登录态（绕过 3 秒 TTL），订阅者（SSE）立刻收到新状态。
+   * 只有这两个真实事件会 force，平时探测靠 TTL 合并，不会去轰炸 NapCat。 */
+  bot.on('open', () => {
+    napcatUp = true;
+    log(`NapCat 已连接：${cfg.napcat.wsUrl}`);
+    void probeNapcatLogin({ force: true }).catch(() => {});
+  });
+  bot.on('close', (info) => {
+    napcatUp = false;
+    log(`NapCat 连接断开（code=${info?.code ?? '?'} reason=${String(info?.reason ?? '').slice(0, 80)}），重连中…`);
+    void probeNapcatLogin({ force: true }).catch(() => {});
+  });
+  // 2026-09-15：以前这里直接把 error 对象丢给 log，而 Error 经 JSON.stringify 是 `{}` ——
+  // 日志里只看到 `NapCat 错误: {}`，一点线索都没有（排查"不回复"时被这个坑了一次）。
+  // 现在把 message/code/cause 都打出来，并带上 WS 状态与 URL，一眼能看出是握手被拒还是断线。
+  bot.on('error', (error) => {
+    const detail = [error?.message, error?.code, error?.cause?.code, error?.cause?.message]
+      .filter(Boolean).join(' | ') || String(error);
+    log(`NapCat 错误: ${detail}（wsUrl=${cfg.napcat.wsUrl}）`);
+  });
+
+  /* 2026-09-23：去除探针与状态检测。
+   * 以前这里每分钟、在 WS 没连上时去问一次 NapCat「QQ 到底登录没有」，只为把"掉登录态"和
+   * "桥断线"两类原因写进日志。现在整体去掉：
+   *   · 这本身就是一个周期性自动探针（明确要求不要）；
+   *   · 而且它早期版本走的正是 NapCat 的 WebUI 登录接口（要占页面自己那份额度）。
+   * 桥现在不主动查 NapCat 任何状态。真要判断，看桥自己的重连日志（退避封顶 10s）或直接开 NapCat 界面。
+   */
+  const loginWatch = null;
+  void loginWatch;
+
+  // 2026-09-12 修「启动不顺畅 / 桥自己死掉」
+  // onebot-ws 的老语义是：首次 open 之前就 close → reject(NAPCAT_CONN) → 这里 await 抛出去 →
+  // main() 崩 → process.exit(1)。可 NapCat 启动要十几秒、首次还要扫码，于是：
+  //   · 「一键启动整套」按顺序拉起时，桥几乎必然在 NapCat 就绪前先连一次 → 直接退出（今天 13:29/13:30 连死两次）；
+  //   · 用户看到的是"整套启动成功"但机器人根本不收消息，还得再手动点一次桥的启动。
+  // 现在改成：首次连接失败就带退避重试（NapCat 还没起/还没扫码都是正常情况），
+  // 预算内连上就继续；预算用完也不退出 —— 桥保留控制台与后台重连循环，等 NapCat 起来自己接上。
+  const connectNapcat = async (budgetMs) => {
+    const t0 = Date.now();
+    for (let attempt = 1; ; attempt += 1) {
+      try {
+        await bot.connect();
+        return true;
+      } catch (error) {
+        if (error?.code !== 'NAPCAT_CONN') throw error;
+        const waited = Date.now() - t0;
+        if (waited >= budgetMs) return false;
+        const delay = Math.min(15000, 1500 * attempt);
+        log(`[napcat] 第 ${attempt} 次连接未成功（NapCat 可能在启动/等待扫码）：${delay / 1000}s 后重试`);
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    }
+  };
+  // 读取机器人昵称（用于社交模式"被提到"识别）
+  // 未连上时不要在这里等：getLoginInfo 会一直等回包（实测把后续 startConsoleServer 拖了 30 秒，
+  // 用户看到的正是"桥起来半天、点开是白屏"）。没连上就交给后台重连成功后那次 fetchNickname。
+  // （声明提前到连接之前：下面改成了后台连接，连上后要回调它。）
+  const fetchNickname = async () => {
+    try {
+      const login = await Promise.race([
+        bot.getLoginInfo(),
+        new Promise((r) => setTimeout(() => r(null), 8000)),
+      ]);
+      if (login?.nickname) {
+        setSelfNickname(String(login.nickname).toLowerCase());
+        log(`机器人昵称: ${login.nickname}`);
+      }
+    } catch { /* 拿不到昵称不影响主流程 */ }
+  };
+  /* 2026-09-29 修「本机没开 NapCat 时 WebUI 迟迟不监听、管理器判 failed」。
+   * 现场（实测时间线）：本机 NapCat 没在跑，走管理器重启 bridge-local →
+   *   0s  返回 success/starting
+   *  47s  /api/state: phase=failed, reachable=false, error="等待就绪超时（45s）…"
+   * 133s  3100 才 LISTENING + GET /api/status 200，phase 转 running、reachable=true
+   * 中间 88 秒界面点开就是白屏。日志里全程只有 `NapCat 错误: TypeError（wsUrl=ws://127.0.0.1:3001）`
+   * 和 `[napcat] 第 N 次连接未成功…重试`，"本地控制台已启动"那一行到最后才出现。
+   * 根因就是下面这行原来写着 `await connectNapcat(预算)`：它把 startConsoleServer()（文件更下面）
+   * 堵在 NapCat 握手之后。预算默认 120000ms 且每次 connect() 自己还带 20s 硬超时，
+   * NapCat 完全不可达时要 2 分多钟才轮到监听 —— 于是必然跨过管理器的 45s 就绪门限。
+   * 语义不变（NapCat 断开时依赖 QQ 的接口照旧如实报"未连接"，端口/进度/状态接口先可用），
+   * 只把顺序反过来：监听先起，连接交给它自己那套"预算内快速重试 → 之后每 15s 无限重试"。
+   * 绝不能因为"暂时连不上 NapCat"把 WebUI 一起堵死。 */
+  const napcatBootBudgetMs = Math.max(0, Number(cfg.social?.napcatStartupBudgetMs) || 120000);
+  const napcatFirstAttempt = connectNapcat(napcatBootBudgetMs);
+  log('[napcat] 首次连接已转入后台（不阻塞 WebUI 监听启动），NapCat 就绪后自动接住');
+  void (async () => {
+    let napcatConnected = false;
+    try {
+      napcatConnected = await napcatFirstAttempt;
+    } catch (error) {
+      log(`[napcat] 首次连接异常（已忽略，交给后台重连）：${error?.message ?? error}`);
+    }
+    if (napcatConnected) {
+      void fetchNickname();
+      return;
+    }
+    log('[napcat] 启动预算内仍未连上：桥继续运行（控制台可用），后台每 15s 再试一次，NapCat 就绪后自动接上');
+    // 后台常驻重连：连上即停。绝不能因为"暂时连不上 NapCat"把整条桥弄死。
+    for (;;) {
+      await new Promise((r) => setTimeout(r, 15000));
+      try {
+        if (await connectNapcat(1)) {
+          log('[napcat] 已接上 NapCat（后台重连成功）');
+          void fetchNickname();
+          return;
+        }
+      } catch (error) {
+        log('[napcat] 后台重连异常：', error?.message ?? error);
+      }
+    }
+  })();
+  log('桥接已启动。按 Ctrl+C 退出。');
+  // 恢复定时发消息任务（需在所有 const 定义之后调用）
+  try { loadScheduledTasks(); } catch (error) { log(`[scheduled] 恢复定时任务失败: ${error?.message ?? error}`); }
+  // 恢复待审批好友申请（拟人化延迟审批；过期条目加抖动后立即补审）
+  try { loadFriendRequests(); } catch (error) { log(`[friend] 恢复待审批申请失败: ${error?.message ?? error}`); }
+  try { loadDocxQuota(); } catch (error) { log(`[docx] 恢复每日额度失败: ${error?.message ?? error}`); }
+  try { loadActivityWindows(); } catch (error) { log(`[activity] 恢复活跃时段失败: ${error?.message ?? error}`); }
+  startActivityTick();
+  // DSH 空闲会话自动归档：定时把「QQ 聊天」工作区里不再被引用的旧会话归档，防止 session 目录堆积。
+  try { loadArchivedCache(); startSessionArchiveTicker(); } catch (error) { log('[archive] 自动归档启动失败:', error?.message ?? error); }
+  // 预热表情库：启动时同步一次 QQ 收藏表情，失败不阻塞（AI 首次调用工具时还会再试）。
+  if (cfg.social?.sticker?.enabled !== false) {
+    syncStickerLibrary(true).catch((error) => log('启动预热表情库失败:', error?.message ?? error));
+  }
+  startDshWatch();
+  // NapCat 会话守护：探针定时器在这里起（放在 OneBot 客户端建好之后，没配 httpUrl 时还能走 WS 探活）
+  startNapcatGuard();
+  startConsoleServer();
+  // 配置热加载：管理器保存 config.json 后原地更新 cfg（不换对象引用——它已被 initXxxCore 注入到
+  // 十几个模块），免重启即生效。模型相关字段变化时清掉"已 selectModel"缓存，让已存在的会话下一轮就换新模型。
+  // 以前这里没有监听，管理器改完桥接还拿着启动时的旧值，甚至把旧值写回 config.json 把改动抹掉。
+  try {
+    watchConfigFile(cfg, {
+      onChange: (changed) => {
+        if (changed.some((k) => k.startsWith('dsh'))) {
+          resetVisionModelApplications();
+          log('[config] 模型配置已变化，已清空会话模型缓存（下一轮起用新模型）');
+        }
+        /* 2026-09-19：插话概率等所有概率都要改好落地 —— 一改唤醒概率/活跃概率，
+         * 正在跑的会话必须立刻跟着变 —— 否则界面上改了数字，已经聊过的会话照旧用旧值
+         * （那正是"改了概率没反应"的机制原因）。
+         * 2026-09-19 改口径：这份配置说了算：连"模型之前自定过概率"的会话也一起覆盖
+         * （旧行为是保留模型的值，结果唤醒提示里一直是 0.08、看着像没生效）。 */
+        if (changed.some((k) => k === 'social.wake.recommendedProbability' || k === 'social.wake.activeProbability' || k.startsWith('social.wake'))) {
+          try {
+            const r = applyOwnerWakeProbabilityToSessions();
+            if (r.updated) log(`[config] 插话概率同步：更新 ${r.updated} 个会话（其中覆盖模型自定的 ${r.overridden} 个）`);
+          } catch (e) { log('[config] 同步插话概率失败:', e?.message ?? e); }
+        }
+        /* 2026-09-19：上下文治理 / 永久会话改了要立刻生效：
+         *   · dshCompaction.* → 重写 DSH home 的 cordis.patch.yml（那里的 patchReload: live 会即时应用，
+         *     不必重启 DSH、不必重启桥，正在聊的会话也不会被打断）；
+         *   · social.autoReset.permanent → 轮换判定每轮现读 cfg，改完下一轮就按新值走（这里只打一行日志）。 */
+        if (changed.some((k) => k.startsWith('dshCompaction'))) {
+          try {
+            const r = syncDshCompactionPatch({ home: resolveIsolatedDshHome(), cfg, log });
+            if (r.ok) log(`[compaction] 配置热加载：${r.changed ? '已更新' : '无变化'} ${r.path}`);
+            else log(`[compaction] 配置热加载失败（忽略）：${r.error}`);
+          } catch (e) { log('[compaction] 配置热加载异常:', e?.message ?? e); }
+        }
+        if (changed.some((k) => k === 'social.autoReset.permanent')) {
+          log(cfg.social?.autoReset?.permanent
+            ? '[rotate] 已切换为「永久会话」：不再按轮数换会话，上下文交给 DSH 压缩治理'
+            : `[rotate] 已关闭「永久会话」：回到按轮数轮换（阈值 ${cfg.social?.autoReset?.wakeThreshold ?? 10} 轮）`);
+        }
+        /* 2026-10-25：预算闸（social.budget）也走热加载——删掉配置块即关闭（不限额），加回来即恢复，都不必重启。 */
+        if (changed.some((k) => k === 'social.budget' || k.startsWith('social.budget.'))) {
+          setTokenBudgetCfg(cfg.social?.budget ? { ...cfg.social.budget, ownerQQ: cfg.ownerQQ } : (cfg.ownerQQ ? { ownerQQ: cfg.ownerQQ } : null));
+          log(cfg.social?.budget
+            ? `[budget] 配置热加载：已启用（global=${cfg.social?.budget?.dailyGlobal ?? '∞'} conv=${cfg.social?.budget?.dailyPerConv ?? '∞'}）`
+            : '[budget] 配置热加载：已关闭（不限额）');
+        }
+      },
+    });
+  } catch (error) { log('[config] 热加载监听启动失败:', error?.message ?? error); }
+  // 黑话每晚定时学习（北京时，管理端 learning-config 可改时间；从学习标记处增量拉取 sqlite）
+  // 2026-10-25（工具型裁剪）：slang.enabled=false（新 config 默认）即不启动夜间学习
+  if (cfg.slang?.enabled !== false) {
+    try { initSlangNightly(cfg); } catch (error) { log('黑话定时学习初始化失败:', error?.message ?? error); }
+  }
+
+  await pumpMux();
+}
+
+/* 本地语音引擎（Genie / GPT-SoVITS sidecar，2026-09-28）是桥拉起的**子进程**：
+ * 桥被 Ctrl+C / 被管理器停掉时，它不会自己退出，会一直占着那几百 MB 内存挂在后台。
+ * 所以两条退出路径都要顺手带走它（用同步版：退出回调里 await 已经没人等了）。
+ * 动态 import + try：语音模块缺失/加载失败绝不能影响桥的退出。 */
+function shutdownLocalVoiceEngine() {
+  import('../lib/genie-tts.js').then((m) => m.killServerSync()).catch(() => {});
+}
+
+process.on('SIGINT', () => {
+  log('退出中…');
+  shutdownLocalVoiceEngine();
+  saveState();
+  releaseLock();
+  process.exit(0);
+});
+process.on('SIGTERM', () => {
+  shutdownLocalVoiceEngine();
+  saveState();
+  releaseLock();
+  process.exit(0);
+});
+process.on('unhandledRejection', (error) => log('未处理异常:', error?.message ?? error));
+process.on('exit', () => { shutdownLocalVoiceEngine(); releaseLock(); });
+
+// 2026-09-12 保命护栏：stdout/stderr 的管道断了（管理器被重启/被 Electron 壳 taskkill 之后就是这种情况）
+// 会让下一次 console.log 抛 EPIPE —— Node 对 stdout 的未处理 error 直接打死进程，
+// 而且死得毫无痕迹：崩栈也写不进那个已经断掉的 stderr。实测表现就是"重启一下管理器，桥悄悄没了，
+// 机器人不再回消息，日志里连一句错误都没有"（桥侧日志停在最后一条正常业务行）。
+// 管理端已经改成把子进程 stdout 直写日志文件（spawnWithLogFile），这里是双保险：
+// 任何情况下丢日志都可以接受，丢机器人不行。
+for (const s of [process.stdout, process.stderr]) {
+  try { s.on('error', () => {}); } catch { /* 忽略 */ }
+}
+
+main().catch((error) => {
+  console.error('[bridge] 启动失败:', error);
+  process.exit(1);
+});
+
