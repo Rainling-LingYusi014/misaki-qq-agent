@@ -82,8 +82,10 @@ import {
   stickerEntries, stickerSyncedAt, updateStickerEntries, initStickerCore, setStickerBot,
   writeStickerTmpFile, applyStickerNote2, setStickerRemark2, collectSticker2,
 } from './sticker.js';
-import { resolveNameToUid } from './memory.js';
+import { resolveNameToUid, forgetPersonCognition } from './memory.js';
 import { markMessagesRead } from './memory.js';
+// misaki@reset -1 的聊天存档清除（该会话全部消息 + FTS 重建）
+import { clearChatHistory, rebuildChatFts } from './chat-db.js';
 /* 2026-09-21 需求：/token 自动发出今日 token 总量与花费（口径与管理端实测区一致）。 */
 import { buildTokenReportText } from './token-report.js';
 import {
@@ -103,7 +105,7 @@ import {
   armPendingWakeLease, disarmPendingWakeLease, clearAllPendingWakeLeases,
   quarantineSession, recordAiTurnOutbound, finishTurnLoopGuard,
   armTurnWatchdog, armTurnTotalTimer, clearTurnTotalTimer, clearAllTurnTotalTimers,
-  touchTurnTotalTimer,
+  touchTurnTotalTimer, sessionUsedSubagent,
   setTurnGuardApi, TURN_TIMEOUT_MS, TURN_TOTAL_TIMEOUT_MS,
 } from './turn-guard.js';
 import {
@@ -188,7 +190,12 @@ import {
   formatParticipation, suggestQuietMs, PEER_TYPING_HOLD_MAX_MS, scheduleWake,
   scheduleReplyCheck, buildWakeReminderPrompt,
   clearSocialTimers, clearAllSocialTimers, resetConversationKeepingLedger,
+  applyMisakiCommand, setStopNote, setResetExecutor, armPendingReset, cancelPendingReset,
 } from './social-state.js';
+// misaki@ 指令解析（纯函数，见 companion-mode.js）
+import { parseMisakiCommand, STOP_ACK_TEXT, NOTHING_TO_STOP_TEXT, RESET_DONE_TEXT, fmtWanTokens, helpText } from './companion-mode.js';
+// misaki@consumption 额度查询：与限额闸同一函数/同一口径（token-meter.js）
+import { checkTokenBudget, todayBillingUsage } from './token-meter.js';
 import {
   loadScheduledTasks, parseScheduledAt, createScheduledTask, cancelScheduledTask, setScheduledRecorder,
 } from './scheduler.js';
@@ -254,13 +261,17 @@ export { parseSetModeCommand, parseClockRange, complementWindows, fmtClockMin };
 //   · markSteerCycleStart / clearSteerPending：复位"本周期已注入"闸门、收掉跨回合的攒批记账；
 //   · flushStepBatch：把这一步里攒下的消息合成一个 [Mid-turn] 块注入（理由见 turn-hold.js 的注释）。
 // mux → turn-hold → wake-send 是单向的（这两个模块都不 import mux），不会形成循环依赖。
-import { markSteerCycleStart, clearSteerPending } from './wake-send.js';
+import { markSteerCycleStart, clearSteerPending, steerIntoRunningTurn } from './wake-send.js';
 import { flushStepBatch } from './turn-hold.js';
 import { clearInboxMarks } from './inbox-marks.js';
 
 // 运行期注入：main 持有同一 cfg/api/bot 实例
 let cfgRef = null;
-export function initMuxCore(cfg) { cfgRef = cfg; }
+export function initMuxCore(cfg) {
+  cfgRef = cfg;
+  // misaki@reset -1 锁定期到点执行器（social-state 的定时器回调；boot 恢复在 loadSocialState 末尾 rearm）
+  setResetExecutor(executeMisakiResetNow);
+}
 let apiRef = null;
 export function setMuxApi(api) { apiRef = api; }
 let botRef = null;
@@ -297,7 +308,206 @@ function isDuplicateInbound(key, messageId) {
   return false;
 }
 
-export async function handleIncoming(kind, id, event, cfgRef) {
+  // ── misaki@stop / misaki@reset -1（2026-10-26）：一次性动作指令，桥层硬拦截、零 token。──
+  // 会话级全套卸载：提取自原 /reset 内联块，owner 的 /reset 与 misaki@reset -1 共用这一份实现。
+  // 返回 true = 存在 DSH 会话映射并已卸载；false = 本来就没有会话（misaki@reset 仍会做认知清除）。
+  async function hardResetConversation(key) {
+    const old = state.sessions[key];
+    if (!old) return false;
+    bumpSessionEpoch();
+    cancelKeyedSends(key); // 取消该会话已入链的旧发送任务，避免重置后旧内容仍发出
+    delete state.sessions[key];
+    reverse.delete(old);
+    collectors.delete(old);
+    sendToolSucceededSessions.delete(old);
+    pendingSendToolCalls.delete(old);
+    TurnStartAt.delete(old);
+    toolCallNames.delete(old);
+    silentTurnQueue.delete(old);
+    const pe = pending.get(key);
+    if (pe) {
+      clearTimeout(pe.timer);
+      cancelPendingEntry(pe).catch(() => {});
+    }
+    pending.delete(key);
+    queued.delete(key);
+    queuedHintAt.delete(key);
+    sessionPromises.delete(key);
+    drainPromptQueue(key, '会话已重置');
+    messageMediaStore.delete(key);
+    slangWindows.delete(key);
+    slangExtractionCooldowns.delete(key);
+    slangSubmitTimes.delete(key);
+    clearSocialTimers(key);
+    pendingWakeKeys.delete(key);
+    wakeConfigUpdatedKeys.delete(key);
+    markReadCalledKeys.delete(key);
+    wakeConfigMissCount.delete(key);
+    const removed = social.conversations.get(key);
+    if (removed?.agentToken) KNOWN_AGENT_TOKENS.delete(removed.agentToken);
+    // 2026-09-16 /reset · /new 也是 reset 家族：原来直接 delete 会把「已回复账本」
+    // （answeredMessageIds / lastDeliveredSeq / _wakeIntendedSeq / lastUnreadSeq）一起抹掉，
+    // 重置后刚回过的内容可能又被回一遍（真机事故「reset 之后重复回复」）。
+    // 改成"清会话、留账本"，见 social-state.resetConversationKeepingLedger。
+    const carriedCmd = resetConversationKeepingLedger(key);
+    if (!carriedCmd) log(`[reset] ${key} 无账本需要保留（该会话此前没有已回复记录）`);
+    clearSocialTimers(key); // 重建账本会重新装配定时器；本命令语义是"清完等下次唤醒重建"
+    seenForwardIds.delete(key);
+    keyRecentSids.delete(key);      // 2026-10-26 stop 追杀面：会话没落也一并清掉追踪线索
+    keyPendingSubagents.delete(key);
+    saveSocialState();
+    saveState();
+    return true;
+  }
+
+  // misaki@stop：硬停当前会话正在跑的任务。不隔离会话、不丢上下文、不撤回已发出的消息。
+  // 2026-10-26 实测修复：「有没有活在跑」不能只看主会话回合标记——看门狗隔离只归档不 cancel，
+  // 被隔离会话（及其 subagent）在 DSH 服务端照样跑完并交付；主会话回合结束的瞬间标记也会清空。
+  // 追杀面 = 主会话 + 本会话名下近期见过的 sid（keyRecentSids，隔离不清除）+ 未完结 subagent 登记
+  // （keyPendingSubagents，按 key 存，隔离不清除）——任何一个活着就硬停，逐个 session/cancel。
+  // 注意：stop 只停任务回合，绝不触碰 misaki@reset -1 的锁定期（pendingReset）——主人定规，不可否决。
+  async function handleMisakiStop(key) {
+    const now = Date.now();
+    const main = state.sessions[key] || null;
+    const RECENT_SID_MS = 30 * 60 * 1000; // 僵尸追杀窗口：比 subagent 总宽限（20min）再放宽一档
+    const PEND_STALE_MS = 20 * 60 * 1000; // 对齐 turn-guard 的 SUBAGENT_TOTAL_GRACE_MS
+    const candidates = new Set(main ? [main] : []);
+    const seen = keyRecentSids.get(key);
+    if (seen) for (const [sid, at] of seen) { if (now - at <= RECENT_SID_MS) candidates.add(sid); }
+    const pend = (keyPendingSubagents.get(key) ?? []).filter((e) => now - e.at <= PEND_STALE_MS);
+    for (const e of pend) candidates.add(e.sid);
+    const isLive = (sid) => TurnStartAt.has(sid) || collectors.has(sid) || sessionUsedSubagent(sid);
+    const liveSids = [...candidates].filter(isLive);
+    if (liveSids.length === 0 && pend.length === 0) {
+      try { await sendToQQ(key, NOTHING_TO_STOP_TEXT); } catch (e) { log(`[misaki-cmd] 回执失败 ${key}: ${e?.message ?? e}`); }
+      try { recordSentMessages(key, [{ text: NOTHING_TO_STOP_TEXT }]); } catch {}
+      return;
+    }
+    const mainWasLive = !!(main && isLive(main));
+    const targets = new Set([...(main ? [main] : []), ...liveSids, ...pend.map((e) => e.sid)]);
+    let cancelled = 0;
+    for (const sid of targets) {
+      if (!sid) continue;
+      try { await apiRef.sessions.cancel({ sessionId: sid }); cancelled += 1; }
+      catch (error) { log(`[misaki-cmd] ${key} session/cancel 失败（${sid}）: ${error?.message ?? error}`); }
+    }
+    log(`[misaki-cmd] ${key} 任务已硬停（session/cancel 成功 ${cancelled}/${targets.size} 个会话）`);
+    // 主会话 cancel 失败且它确实在跑：兜底 steer 软停止（往在途回合里塞一条停工指令）。
+    if (mainWasLive && main && !targets.has(undefined) && cancelled === 0) {
+      try { await steerIntoRunningTurn(key, 'stop', { force: true }); } catch { /* 尽力而为 */ }
+    }
+    // cancel 之后 turn/end 不会再来：清回合痕迹，防止 180s 后看门狗按"卡死"误隔离。
+    // 主会话只清标记不摘映射（对话上下文保留）；其余 sid 连 reverse 一起摘掉，事件流不再认领。
+    for (const sid of targets) {
+      if (!sid) continue;
+      collectors.delete(sid);
+      TurnStartAt.delete(sid);
+      toolCallNames.delete(sid);
+      pendingSendToolCalls.delete(sid);
+      sendToolSucceededSessions.delete(sid);
+      silentTurnQueue.delete(sid);
+      if (sid !== main && reverse.get(sid) === key) reverse.delete(sid);
+    }
+    keyPendingSubagents.delete(key);
+    keyRecentSids.delete(key);
+    pendingWakeKeys.delete(key);
+    cancelKeyedSends(key); // 已排队未发出的气泡一并取消（已发出的不撤回）
+    setStopNote(key);       // 挂起"另行说明已经被停止"：下一轮唤醒注入 [Stopped] 行
+    appendActivity(`${key} 任务被 misaki@stop 终止（cancel ${cancelled}/${targets.size} 个会话）`);
+    try { await sendToQQ(key, STOP_ACK_TEXT); } catch (e) { log(`[misaki-cmd] 回执失败 ${key}: ${e?.message ?? e}`); }
+    try { recordSentMessages(key, [{ text: STOP_ACK_TEXT }]); } catch {}
+  }
+
+  // misaki@reset -1：进入 1 小时锁定期。期间对方任何一条普通回话立即取消；一条都没有，到点自动执行。
+  // 锁定期不能被 misaki@stop 否决（它不是任务回合，handleMisakiStop 不触碰 pendingReset）。
+  // -1 仅防误输入，不是档位。指令必须独占一个气泡（解析层已强制），引用/附带其他文字不会触发。
+  const RESET_HOLD_MS = 60 * 60 * 1000;
+  async function handleMisakiReset(key) {
+    const executeAt = armPendingReset(key, RESET_HOLD_MS);
+    appendActivity(`${key} misaki@reset -1 进入锁定期，执行时刻 ${Math.floor(executeAt / 1000)}`);
+    const text = `好。已进入清空锁定期：北京时间 ${fmtBeijing(executeAt)}（时间戳 ${Math.floor(executeAt / 1000)}）我会清空关于你的全部记忆——对话、记住的事、档案，全部还原到刚认识的样子，模式也回到常规。此操作无法被 misaki@stop 取消；这期间你发来的任何一条普通消息都会立即取消清空，一条都没有，到点自动执行。`;
+    try { await sendToQQ(key, text, { single: true }); } catch (e) { log(`[misaki-cmd] 回执失败 ${key}: ${e?.message ?? e}`); }
+    try { recordSentMessages(key, [{ text }]); } catch {}
+  }
+
+  // 锁定期到期（或 boot 补执行）的真正清空动作。不可逆，只在 social-state 的定时器回调里触发。
+  async function executeMisakiResetNow(key) {
+    const uid = key.startsWith('private:') ? key.split(':')[1] : '';
+    const had = await hardResetConversation(key);
+    if (!had) {
+      // 没有 DSH 会话也要把桥侧会话状态清掉（近期消息/话题/唤醒配置都在这里）
+      resetConversationKeepingLedger(key);
+      clearSocialTimers(key);
+      seenForwardIds.delete(key);
+      saveSocialState();
+    }
+    let wiped = '';
+    if (uid) {
+      try {
+        const cleared = clearChatHistory(key);
+        if (cleared?.ok) wiped += `聊天存档 ${cleared.deleted} 条`;
+        try { rebuildChatFts({ reason: 'misaki-reset-1' }); } catch { /* FTS 不可用时检索退回 LIKE */ }
+      } catch (error) { log(`[misaki-cmd] ${key} 聊天存档清除失败: ${error?.message ?? error}`); }
+      try {
+        const mem = forgetPersonCognition(uid, key);
+        if (mem?.ok) wiped += `${wiped ? '、' : ''}长期记忆 ${mem.memoryDeleted} 条、档案 ${mem.profileDeleted} 行`;
+        else wiped += `${wiped ? '、' : ''}长期记忆清除失败（${mem?.error ?? '?'}）`;
+      } catch (error) { log(`[misaki-cmd] ${key} 长期记忆清除失败: ${error?.message ?? error}`); }
+    }
+    log(`[misaki-cmd] ${key} 认知已清空（misaki@reset -1，不可逆）：${wiped || '无存量'}`);
+    appendActivity(`${key} 认知已清空（misaki@reset -1）：${wiped || '无存量'}`);
+    try { await sendToQQ(key, RESET_DONE_TEXT, { single: true }); } catch (e) { log(`[misaki-cmd] 回执失败 ${key}: ${e?.message ?? e}`); }
+    try { recordSentMessages(key, [{ text: RESET_DONE_TEXT }]); } catch {}
+  }
+
+  // misaki@consumption[ tokens|paintings]（2026-10-26）：任意模式可直接查询今日额度，固定语句、零 token。
+  // 口径与限额闸一致：token 用 checkTokenBudget（计费日北京 08:00 换日；owner 豁免→显示"不限"，
+  // 附全局实际用量）；生图读 mcp-napcat-safe 同一份配额文件 state/gen-image-quota.json（北京自然日 00:00 换日，owner 豁免）。
+  function readImageQuotaToday(key, cfgRef) {
+    const limit = Math.max(1, Number(cfgRef?.zhipu?.dailyImageLimit) || 5);
+    try {
+      const s = JSON.parse(fs.readFileSync(path.join(ROOT, 'state', 'gen-image-quota.json'), 'utf8'));
+      const today = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+      if (!s || typeof s !== 'object' || s.day !== today) return { used: 0, limit };
+      return { used: Number(s.counts?.[String(key)]) || 0, limit };
+    } catch { return { used: 0, limit }; }
+  }
+
+  async function handleMisakiConsumption(key, kind, cfgRef) {
+    const isOwner = key === `private:${String(cfgRef?.ownerQQ ?? '')}`;
+    const lines = ['今日额度查询'];
+    if (kind !== 'action-consumption-paintings') {
+      try {
+        const b = checkTokenBudget(key);
+        if (b.ownerExempt) {
+          // owner 免上限：显示全局实际用量（监控视角）
+          const t = todayBillingUsage();
+          lines.push(`会话：${fmtWanTokens(t.used)} tokens（不限）`);
+        } else if (b.limit > 0) {
+          lines.push(`会话：${fmtWanTokens(b.used)}/${fmtWanTokens(b.limit)}tokens`);
+        } else {
+          const t = todayBillingUsage();
+          lines.push(`会话：${fmtWanTokens(t.used)} tokens（未设限额）`);
+        }
+      } catch (error) {
+        log(`[misaki-cmd] ${key} token 额度查询失败: ${error?.message ?? error}`);
+        lines.push('会话：查询失败');
+      }
+    }
+    if (kind !== 'action-consumption-tokens') {
+      if (isOwner) lines.push('生图：不限');
+      else {
+        const q = readImageQuotaToday(key, cfgRef);
+        lines.push(`生图：${q.used}/${q.limit}张`);
+      }
+    }
+    lines.push('额度重置时间：tokens 每日 08:00 · 生图 每日 00:00（北京时间）');
+    const text = lines.join('\n');
+    try { await sendToQQ(key, text, { single: true }); } catch (e) { log(`[misaki-cmd] 回执失败 ${key}: ${e?.message ?? e}`); }
+    try { recordSentMessages(key, [{ text }]); } catch {}
+  }
+
+  export async function handleIncoming(kind, id, event, cfgRef) {
   const key = convKey(kind, id);
   if (!modeAllowed(key, kind, id, cfgRef, currentMode)) {
     log(`忽略未授权会话 ${key}（当前模式 ${currentMode}，来自 ${event.user_id}）`);
@@ -411,6 +621,44 @@ export async function handleIncoming(kind, id, event, cfgRef) {
     log('画像学习指令处理出错:', error?.message ?? error);
   }
 
+  // misaki@ 指令通道（2026-10-26）：统一前缀 `misaki@` 的桥层硬拦截——不进模型、零 token、不受模型发挥影响。
+  // 仅私聊；句中提及不触发（解析只认 misaki@ 开头）；misaki@白名单后缀（如 ling014.com 邮箱）原样放行；
+  // 未知串回固定提醒（列出可用指令）；精确匹配 off 但已在常规模式 → 当普通消息放行。
+  if (kind === 'private') {
+    const mcmd = parseMisakiCommand(plainContent, cfgRef);
+    // misaki@reset -1 锁定期：**指令本身也算消息**（主人定规）——锁定期内收到任何东西都取消挂起的清空，
+    // 唯一例外是 reset 自身（取消后由 handleMisakiReset 重新进入/顺延锁定期，不重复回"已取消"）。
+    // 取消回执先发，消息/指令随后照常处理。
+    if (cancelPendingReset(key)) {
+      const isResetSelf = mcmd && mcmd.kind === 'action-reset';
+      if (!isResetSelf) {
+        appendActivity(`${key} 锁定期内收到消息，misaki@reset -1 已取消`);
+        try { await sendToQQ(key, '锁定期已解除：这次清空已取消。', { single: true }); } catch (e) { log(`[misaki-cmd] 回执失败 ${key}: ${e?.message ?? e}`); }
+        try { recordSentMessages(key, [{ text: '锁定期已解除：这次清空已取消。' }]); } catch {}
+      }
+    }
+    if (mcmd && mcmd.kind !== 'passthrough') {
+      // 一次性动作指令（桥层直接执行，不进模型）。锁定期取消已在上面统一处理（指令也算消息）。
+      if (mcmd.kind === 'action-help') {
+        const text = helpText();
+        try { await sendToQQ(key, text, { single: true }); } catch (e) { log(`[misaki-cmd] 回执失败 ${key}: ${e?.message ?? e}`); }
+        try { recordSentMessages(key, [{ text }]); } catch {}
+        return;
+      }
+      if (mcmd.kind === 'action-stop') { await handleMisakiStop(key); return; }
+      if (mcmd.kind === 'action-reset') { await handleMisakiReset(key); return; }
+      if (mcmd.kind === 'action-consumption' || mcmd.kind === 'action-consumption-tokens' || mcmd.kind === 'action-consumption-paintings') {
+        await handleMisakiConsumption(key, mcmd.kind, cfgRef); return;
+      }
+      const replyText = applyMisakiCommand(key, mcmd);
+      if (replyText != null) {
+        try { await sendToQQ(key, replyText); } catch (e) { log(`[misaki-cmd] 回执发送失败 ${key}: ${e?.message ?? e}`); }
+        try { recordSentMessages(key, [{ text: replyText }]); } catch { /* 回执入库失败不影响主流程 */ }
+        return;
+      }
+    }
+  }
+
   // 管理命令：仅管理员（ownerQQ）可用，且由桥接直接执行（硬性，不经过模型）。
   // 只识别英文 / 斜杠指令(如 /active /silent /wake /start /deepsleep /set active)。
   // 2026-09-24：斜杠指令只支持英文，删掉中文别名与历史简写 —— 下面这些分支一律只比对
@@ -438,51 +686,9 @@ export async function handleIncoming(kind, id, event, cfgRef) {
     // 2026-09-13 需求：删掉 /help（原来是发《小鲸鱼能力概览》docx）：
     // 该指令不再拦截，会按"其它 /xxx"的通用规则交给模型，由它正常回应。
     if (plainContent === '/reset' || plainContent === '/new') {
-      const old = state.sessions[key];
-      if (old) {
-        bumpSessionEpoch();
-        cancelKeyedSends(key); // 取消该会话已入链的旧发送任务，避免重置后旧内容仍发出
-        delete state.sessions[key];
-        reverse.delete(old);
-        collectors.delete(old);
-        sendToolSucceededSessions.delete(old);
-        pendingSendToolCalls.delete(old);
-        TurnStartAt.delete(old);
-        toolCallNames.delete(old);
-        silentTurnQueue.delete(old);
-        const pe = pending.get(key);
-        if (pe) {
-          clearTimeout(pe.timer);
-          cancelPendingEntry(pe).catch(() => {});
-        }
-        pending.delete(key);
-        queued.delete(key);
-        queuedHintAt.delete(key);
-        sessionPromises.delete(key);
-        drainPromptQueue(key, '会话已重置');
-        messageMediaStore.delete(key);
-        slangWindows.delete(key);
-        slangExtractionCooldowns.delete(key);
-        slangSubmitTimes.delete(key);
-        clearSocialTimers(key);
-        pendingWakeKeys.delete(key);
-        wakeConfigUpdatedKeys.delete(key);
-        markReadCalledKeys.delete(key);
-        wakeConfigMissCount.delete(key);
-        const removed = social.conversations.get(key);
-        if (removed?.agentToken) KNOWN_AGENT_TOKENS.delete(removed.agentToken);
-        // 2026-09-16 /reset · /new 也是 reset 家族：原来直接 delete 会把「已回复账本」
-        // （answeredMessageIds / lastDeliveredSeq / _wakeIntendedSeq / lastUnreadSeq）一起抹掉，
-        // 重置后刚回过的内容可能又被回一遍（真机事故「reset 之后重复回复」）。
-        // 改成"清会话、留账本"，见 social-state.resetConversationKeepingLedger。
-        const carriedCmd = resetConversationKeepingLedger(key);
-        if (!carriedCmd) log(`[reset] ${key} 无账本需要保留（该会话此前没有已回复记录）`);
-        clearSocialTimers(key); // 重建账本会重新装配定时器；本命令语义是"清完等下次唤醒重建"
-        seenForwardIds.delete(key);
-        saveSocialState();
-        saveState();
-        await sendToQQ(key, '已重置会话，下次消息将开新上下文');
-      }
+      // 2026-10-26：卸载逻辑提取为 hardResetConversation（misaki@reset -1 共用这一份，见其定义处）
+      const had = await hardResetConversation(key);
+      if (had) await sendToQQ(key, '已重置会话，下次消息将开新上下文');
       return;
     }
     if (plainContent === '/status') {
@@ -791,6 +997,24 @@ export async function handleIncoming(kind, id, event, cfgRef) {
   // 一代（reserved 观望状态机）代码不可达，已删除（2026-09-06 单模式化）。
 }
 
+// ── misaki@stop 追杀面（2026-10-26 实测修复）──────────────────────────────────
+// 桥侧回合标记只反映「桥认领的会话」：看门狗隔离（quarantineSession）会清掉该 sid 的全部痕迹，
+// 但被隔离会话与其 subagent 在 DSH 服务端可能仍在跑，跑完还能通过工具端口把消息发出来——
+// 实测事故：18:30 隔离后子代理 18:35 照样交付 PPT，期间 misaki@stop 误报「现在没有在跑的活」。
+// 下面两张表按会话 key 记录，隔离路径不清除，专门给 misaki@stop 提供追杀线索。
+const keyRecentSids = new Map();       // key -> Map<sid, lastEventAt>：本会话名下见过的所有 DSH 会话
+const keyPendingSubagents = new Map(); // key -> [{sid, callId, at}]：未完结的 subagent 工具调用
+function noteKeySidActivity(key, sid) {
+  if (!key || !sid) return;
+  let m = keyRecentSids.get(key);
+  if (!m) { m = new Map(); keyRecentSids.set(key, m); }
+  m.set(sid, Date.now());
+  if (m.size > 8) { // 上限保护：只留最近 8 个（轮换+隔离重建频繁的会话也不会膨胀）
+    const oldest = [...m.entries()].sort((a, b) => a[1] - b[1])[0];
+    if (oldest) m.delete(oldest[0]);
+  }
+}
+
 export async function pumpMux() {
   for (;;) {
     try {
@@ -826,6 +1050,7 @@ export async function pumpMux() {
             }
             continue;
           }
+          noteKeySidActivity(key, frame.sessionId);
           // 追踪当前 turn 是否成功调用过 MCP 发送类工具：
           // 只有“发送成功”才跳过自动转发；如果工具调用失败，仍允许 AI 的文本正常发出。
           if (frame.event.type === 'turn/start') {
@@ -862,6 +1087,13 @@ export async function pumpMux() {
             const rawArgs = rawArgsForName;
             const args = sanitizeToolArgs(rawArgs);
             appendToolLog({ type: 'call', time: new Date().toISOString(), key, sessionId: frame.sessionId, tool: toolName, args, target: extractToolTargetKey(rawArgs) || undefined });
+            // 2026-10-26 stop 追杀面：subagent 派遣按 key 登记（quarantineSession 会清 sid 级痕迹，
+            // 但子代理可能在母会话隔离后仍在服务端跑完并交付——misaki@stop 必须还能追到它）。
+            if (toolName === 'subagent' && callId != null) {
+              let pendArr = keyPendingSubagents.get(key);
+              if (!pendArr) keyPendingSubagents.set(key, (pendArr = []));
+              pendArr.push({ sid: frame.sessionId, callId: String(callId), at: Date.now() });
+            }
             /* 2026-09-20 根治「模型漏引号 → 消息发不出去」：
              * 现场：`{"key":"…","messages": 今天挺热的啊,"token":"…"}` 不是合法 JSON，
              * DSH 的宽松解析把这个字段整个丢掉 → 发送端点只看到 messages 为空 → 模型看到报错、原样重试。
@@ -912,6 +1144,15 @@ export async function pumpMux() {
             });
             if (callId != null) {
               toolCallNames.get(frame.sessionId)?.delete(String(callId));
+              // 2026-10-26 stop 追杀面：subagent 调用完结（无论成败）→ 从 key 级登记里摘掉。
+              const pendArr = keyPendingSubagents.get(key);
+              if (pendArr?.length) {
+                const rest = pendArr.filter((e) => !(e.sid === frame.sessionId && e.callId === String(callId)));
+                if (rest.length !== pendArr.length) {
+                  if (rest.length) keyPendingSubagents.set(key, rest);
+                  else keyPendingSubagents.delete(key);
+                }
+              }
               /* 2026-09-20 根治：这次调用是不是"漏引号导致 messages 被丢掉"？
                * 是 → 桥把那段裸文本捞回来自己发（见 tool/call 分支的说明）。 */
               const stashed = unquotedArgsByCall.get(String(callId));
@@ -1243,6 +1484,10 @@ export async function pumpMux() {
                   if (String(key).startsWith('private:') && stOk?._proactivePending === true) {
                     stOk._proactivePending = false;
                     log(`[proactive] 私聊配额退还 ${key}: 模型这轮没开口，不计入今日主动次数`);
+                  }
+                  if (String(key).startsWith('private:') && stOk?._companionPending === true) {
+                    stOk._companionPending = false;
+                    log(`[companion] 陪伴主动退还 ${key}: 模型这轮没开口，不计入今日陪伴主动次数`);
                   }
                 } catch {}
                 continue;

@@ -320,6 +320,42 @@
           "科技 测评"
         ]
       }
+    },
+    "misakiCommands": {
+      "_note": "misaki@ 指令通道（桥层硬拦截，零 token）：companion mode on/off、stop、reset -1（1h 锁定期）、consumption、help。未知指令回提醒；句中提及不触发。",
+      "passthroughSuffixes": [
+        "ling014.com"
+      ]
+    },
+    "companionMode": {
+      "_note": "陪伴模式参数档（节奏与常规模式完全独立；breakProbability 代码强制 0）",
+      "typingHoldMaxMs": 30000,
+      "typingRefreshMs": 5000,
+      "linearPerCharMs": 480,
+      "linearMinMs": 1500,
+      "linearCapMs": 6000,
+      "linearJitterRatio": 0.2,
+      "checkIntervalMinMs": 3600000,
+      "checkIntervalMaxMs": 7200000,
+      "idleThresholdMs": 900000,
+      "dailyMax": 2,
+      "quietStart": "23:30",
+      "quietEnd": "07:30",
+      "unansweredWindowMs": 21600000,
+      "unansweredStreakLimit": 2,
+      "backoffDailyMax": 1,
+      "allowedTools": [
+        "reply",
+        "sendMessage",
+        "markRead",
+        "sendSticker",
+        "listStickers",
+        "getStickerImage",
+        "getImages",
+        "memoryRemember",
+        "memorySearch",
+        "memory"
+      ]
     }
   }
 }

@@ -28,8 +28,10 @@ import { midTurnSteerGate, midTurnSteerText, STEER_IN_TURN_DEFER_MAX_MS } from '
 import {
   getSocialState, saveSocialState, social, seenForwardIds,
   cancelReplyCheck, setupSleepTimer, collectFreshWakeMedia, pickAttachableMedia, isInSleepWindow,
-  formatParticipation, isConversationBusy, scheduleWake,
+  formatParticipation, isConversationBusy, scheduleWake, conversationMode, consumeStopNote,
 } from './social-state.js';
+// 模式系统（2026-10-26）：[Mode] 行注入——她永远知道自己处于哪个模式
+import { modeLineForWake, stopNoteLine } from './companion-mode.js';
 // 2026-09-22：在途回合注入要附图和唤醒一样取图（同一份解析器），见 steerIntoRunningTurn 顶部注释
 import { getPromptMediaResolver } from './prompt-deliver.js';
 import { buildCrossChatBlock } from './crosschat.js';
@@ -625,7 +627,15 @@ export function buildWakePrompt(key, reason) {
    * 这三个函数没有自检开关且会自动生成班表/事件，不掐会每轮白耗 token 还可能说"在店里"这种假话。
    * 模块文件保留（59 文件引用网不硬拆），开关关闭 = 功能等效下线；要重开置 true。 */
   const companionOn = cfgRef?.social?.companionInjects === true;
-  const base = tokenLine + nowLine
+  // 2026-10-26 模式系统：[Mode] 行（仅私聊）——常规/陪伴两态都注入，问到模式答得出+给得出指令。
+  const modeLine = key.startsWith('private:') ? modeLineForWake(conversationMode(key)) : '';
+  // 2026-10-26 misaki@stop：挂起的"另行说明已经被停止"标记（一次性，消费即清）。
+  let stopLine = '';
+  if (key.startsWith('private:')) {
+    const snAt = consumeStopNote(key);
+    if (snAt) stopLine = stopNoteLine(snAt);
+  }
+  const base = tokenLine + nowLine + modeLine + stopLine
     + (companionOn ? shiftNowLine() + doingNowLine() + todayBlock(key, cfgRef?.ownerQQ) : '')
     + statusLine + wakeLine + voiceTurnHint(key) + memeTurnHint(key) + memoryLine + participationLine + (gInfoText ? gInfoText + '\n' : '') + (groupListText ? groupListText + '\n\n' : (gInfoText ? '\n' : ''));
   // 2026-09-12 规则搬家：原 protocolNote（2,886 字符的「回合协议」：➤ 哨兵含义、读/发/收尾步骤、
@@ -681,6 +691,12 @@ export function buildWakePrompt(key, reason) {
     const lastMinRc = stRc.lastAiReplyAt ? Math.max(0, Math.round((Date.now() - Number(stRc.lastAiReplyAt)) / 60000)) : null;
     const replyHintRc = lastMinRc != null ? ` (you replied ${lastMinRc} min ago)` : '';
     return `${baseWithProtocol}[Wake] ${key} reply check${replyHintRc}`;
+  }
+  if (reason === 'companionCare') {
+    // 2026-10-26 陪伴模式·主动关心：数据行带"对方安静多久"，开不开口仍由模型决定（preset [WAKE TYPES]）。
+    const stC = getSocialState(key);
+    const idleMinC = stC?.lastIncomingAt ? Math.max(0, Math.round((Date.now() - Number(stC.lastIncomingAt)) / 60000)) : null;
+    return `${baseWithProtocol}[Wake] ${key} companion care（陪伴模式·主动关心${idleMinC != null ? `，对方已安静 ${idleMinC} 分钟` : ''}）：凭记忆里的事或近况开口一句，或 qq_mark_read 不开口`;
   }
   if (reason === 'proactiveCheck') {
     // 2026-10-25：日记闪回属陪伴注入，随 social.companionInjects 一并关闭

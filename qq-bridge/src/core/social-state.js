@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import { normalizeSpeakerIds, hasExplicitEnd } from '../lib/sleep-guard.js';
 import { SOCIAL_STATE_FILE } from '../lib/paths.js';
 import { atomicWriteJson, readJsonSafe } from '../lib/json-fs.js';
-import { log } from '../lib/log.js';
+import { log, appendActivity } from '../lib/log.js';
 import { canonicalKey } from '../lib/keys.js';
 import { KNOWN_AGENT_TOKENS } from '../lib/text-safe.js';
 import { sanitizeForwardId } from '../forward.js';
@@ -14,6 +14,12 @@ import { state } from './config.js';
 import { isSessionAllowedInCurrentMode } from './mode.js';
 // 私聊「不抢话」的等待/插话决策（纯函数，见 typing-hold.js）
 import { typingHoldDecision, typingHoldText, STEER_IN_TURN_DEFER_MAX_MS } from './typing-hold.js';
+// 模式系统 & misaki@ 指令通道（纯决策，见 companion-mode.js；状态读写都在本模块）
+import {
+  DEFAULT_MODE, MODES, modeLabel, companionCfg, inCompanionQuietHours,
+  companionTypingDecisionCfg, companionToolRefusal,
+  COMPANION_ENTER_TEXT, COMPANION_EXIT_TEXT, COMPANION_ALREADY_TEXT, unknownCommandText,
+} from './companion-mode.js';
 import { isDirectedAtAi } from '../lib/social-timeline.js';
 import { looksLikeUnfinished } from '../wait.js';
 import { readRoleState } from '../lib/role-access.js';
@@ -354,7 +360,8 @@ const WAKE_PRIORITY = {
   anyMessage: 50,
   replyCheck: 40,
   timeout: 30,
-  proactiveCheck: 20
+  proactiveCheck: 20,
+  companionCare: 20 // 2026-10-26 陪伴模式主动关心：与常规主动机会同级
 };
 
 // 唤醒原因可能带子类型（如 keyword:小鲸鱼、speaker:昵称），取冒号前的基名计算优先级。
@@ -418,7 +425,13 @@ export function saveSocialState() {
         activeTopics: Array.isArray(st.activeTopics) ? st.activeTopics.slice(-50) : [],
         pendingThoughts: Array.isArray(st.pendingThoughts) ? st.pendingThoughts.slice(-50) : [],
         memberImpressions: st.memberImpressions && typeof st.memberImpressions === 'object' ? st.memberImpressions : {},
-        seenForwardIds: Array.from(seenForwardIds.get(key) || []).slice(-1000)
+        seenForwardIds: Array.from(seenForwardIds.get(key) || []).slice(-1000),
+        // 2026-10-26 模式系统：模式与陪伴计数器随会话落盘（重启不丢模式状态）
+        agentMode: stAgentMode(st),
+        companionMode: st.companionMode && typeof st.companionMode === 'object' ? { ...st.companionMode } : { proactiveDay: '', proactiveCount: 0, unansweredStreak: 0, awaitingReplySince: 0 },
+        stopNoteAt: Number(st.stopNoteAt) || 0,
+        // misaki@reset -1 锁定期（重启不丢；到点执行由 mux 注册的 executor 完成）
+        pendingReset: st.pendingReset && typeof st.pendingReset === 'object' ? { executeAt: Number(st.pendingReset.executeAt) || 0 } : null
       };
     }
     atomicWriteJson(SOCIAL_STATE_FILE, obj);
@@ -553,6 +566,13 @@ export function getSocialState(key) {
       lastActionAt: 0,
       agentToken: fixedTokenForKey(key),
       bootstrapSent: false,
+      // 2026-10-26 模式系统：regular=常规模式（默认）| companion=陪伴模式；陪伴计数器独立于常规 proactive 配额
+      agentMode: 'regular',
+      companionMode: { proactiveDay: '', proactiveCount: 0, unansweredStreak: 0, awaitingReplySince: 0 },
+      // misaki@stop 的"另行说明"挂起标记：下一轮唤醒注入 [Stopped] 行时消费（落盘防重启丢失）
+      stopNoteAt: 0,
+      // misaki@reset -1 锁定期：{ executeAt } 挂起期间收到任何回话即取消；到点且无回话才执行（落盘防重启丢失）
+      pendingReset: null,
       wakeTimes: [],
       sendTimes: [],
       stickerCollectTimes: [],
@@ -687,6 +707,16 @@ export function loadSocialState() {
           proactiveDay: String(val.proactiveDay ?? ''),
           proactiveCount: Number(val.proactiveCount) || 0,
           proactiveRolled: val.proactiveRolled === true,
+          // 2026-10-26 模式系统：读回来也要认这两个字段，否则重启后模式丢失
+          agentMode: val.agentMode === 'companion' ? 'companion' : 'regular',
+          companionMode: {
+            proactiveDay: String(val.companionMode?.proactiveDay ?? ''),
+            proactiveCount: Number(val.companionMode?.proactiveCount) || 0,
+            unansweredStreak: Number(val.companionMode?.unansweredStreak) || 0,
+            awaitingReplySince: Number(val.companionMode?.awaitingReplySince) || 0
+          },
+          stopNoteAt: Number(val.stopNoteAt) || 0,
+          pendingReset: (val.pendingReset && typeof val.pendingReset === 'object') ? { executeAt: Number(val.pendingReset.executeAt) || 0 } : null,
           memberImpressions: (() => {
             const rawImp = (val.memberImpressions && typeof val.memberImpressions === 'object') ? val.memberImpressions : {};
             const clean = {};
@@ -734,6 +764,8 @@ export function loadSocialState() {
   } catch (error) {
     log('读取 social 状态失败:', error?.message ?? error);
   }
+  // 2026-10-26 misaki@reset -1：锁定期挂起状态随状态文件恢复（executor 已在 initMuxCore 注册）
+  try { rearmPendingResets(); } catch (e) { log('[misaki-cmd] 锁定期恢复失败:', e?.message ?? e); }
 }
 
 // 防"永眠"：检查当前 WakeConfig 是否至少有一个可触发唤醒的途径；没有则重置为默认配置。
@@ -815,6 +847,167 @@ export function setupSleepTimer(key) {
   log(`[default] 设置有限潜水定时器 ${key}，剩余 ${Math.round(delay / 1000)}s`);
 }
 
+// ── 模式系统（2026-10-26）：常规模式（默认）/ 陪伴模式；misaki@ 指令切换 ──────────
+// st 层的模式读取（未知/异常值一律视为常规模式）
+function stAgentMode(st) {
+  return st && st.agentMode === 'companion' ? 'companion' : DEFAULT_MODE;
+}
+
+/** 会话当前模式 id（'regular' | 'companion'；只读，不为陌生 key 创建状态） */
+export function conversationMode(key) {
+  const st = social.conversations.get(canonicalKey(key));
+  return stAgentMode(st);
+}
+export function isCompanionActive(key) { return conversationMode(key) === 'companion'; }
+
+/**
+ * 陪伴模式工具闸口（console-server 各工具端点调用）：陪伴会话白名单外的工具返回拒绝话术。
+ * 只读（social.conversations.get），不为陌生 key 创建状态；非私聊/非陪伴 → null 放行。
+ */
+export function companionToolBlock(flag, key) {
+  try {
+    if (!key || !String(key).startsWith('private:')) return null;
+    const st = social.conversations.get(canonicalKey(key));
+    if (stAgentMode(st) !== 'companion') return null;
+    return companionToolRefusal(flag, cfgRef);
+  } catch { return null; }
+}
+
+/** 同上，但按 agent token 反查发起会话（globalOverview / schedule-list / crosschat 等无 key 端点用）。 */
+export function companionToolBlockByToken(flag, token) {
+  try {
+    const t = String(token ?? '').trim();
+    if (!t) return null;
+    for (const [ck, cst] of social.conversations.entries()) {
+      if (cst && cst.agentToken && t === cst.agentToken) return companionToolBlock(flag, ck);
+    }
+  } catch { /* 反查失败不拦截 */ }
+  return null;
+}
+
+/** 切换会话模式（misaki@ 指令调用）；进入陪伴时计数器清零，主动机会计时器按新模式参数重排。 */
+export function setConversationMode(key, modeId) {
+  const mode = MODES.some((m) => m.id === String(modeId)) ? String(modeId) : DEFAULT_MODE;
+  const st = getSocialState(key);
+  st.agentMode = mode;
+  if (mode === 'companion') {
+    st.companionMode = { proactiveDay: '', proactiveCount: 0, unansweredStreak: 0, awaitingReplySince: 0 };
+  }
+  if (st.proactiveTimer) { clearTimeout(st.proactiveTimer); st.proactiveTimer = null; }
+  saveSocialState();
+  if (!social.paused) { try { scheduleProactiveCheck(key); } catch { /* 重排失败不影响模式切换 */ } }
+  return mode;
+}
+
+/**
+ * misaki@ 指令的应用（mux.handleIncoming 调用）：改状态 + 返回要直发的固定文案（零 token）。
+ * 返回 null = 放行正常流程（passthrough / 已在常规模式时收到 off / 其它不可执行情形）。
+ */
+export function applyMisakiCommand(key, cmd) {
+  if (!cmd || typeof cmd !== 'object') return null;
+  if (cmd.kind === 'mode-on') {
+    if (conversationMode(key) === cmd.mode) return COMPANION_ALREADY_TEXT;
+    setConversationMode(key, cmd.mode);
+    appendActivity(`${key} 进入${modeLabel(cmd.mode)}（misaki@ 指令）`);
+    return COMPANION_ENTER_TEXT;
+  }
+  if (cmd.kind === 'mode-off') {
+    if (conversationMode(key) === DEFAULT_MODE) return null;
+    const from = modeLabel(conversationMode(key));
+    setConversationMode(key, DEFAULT_MODE);
+    appendActivity(`${key} 退出${from} → 常规模式（misaki@ 指令）`);
+    return COMPANION_EXIT_TEXT;
+  }
+  if (cmd.kind === 'unknown') return unknownCommandText(cmd.token);
+  return null;
+}
+
+/** misaki@stop 的"另行说明"挂起标记：桥回执"好，停了"后记下时间，下一轮唤醒注入 [Stopped] 行时消费。 */
+export function setStopNote(key) {
+  const st = getSocialState(key);
+  st.stopNoteAt = Date.now();
+  saveSocialState();
+}
+/** 读取并清除挂起的 [Stopped] 标记（一次性）；返回停止时刻的时间戳，无挂起返回 0。 */
+export function consumeStopNote(key) {
+  const st = social.conversations.get(canonicalKey(key));
+  if (!st || !Number(st.stopNoteAt)) return 0;
+  const at = Number(st.stopNoteAt);
+  st.stopNoteAt = 0;
+  return at;
+}
+
+// ── misaki@reset -1 锁定期（2026-10-26）：1 小时静默确认 ─────────────────────
+// 进入锁定期后，对方任何一条普通回话立即取消；一条都没有，到点自动执行清空。
+// 到点执行由注入的 executor（mux 在 initMuxCore 注册）完成；misaki@stop 不触碰这里（主人定规）。
+// 挂起状态随会话落盘，重启后由 loadSocialState 末尾的 rearmPendingResets 重新挂表。
+const resetExecuteTimers = new Map(); // key -> NodeJS.Timeout（内存即可，executeAt 已落盘）
+let resetExecutor = null;
+export function setResetExecutor(fn) { resetExecutor = fn; }
+
+export function hasPendingReset(key) {
+  const st = social.conversations.get(canonicalKey(key));
+  return !!(st && st.pendingReset && Number(st.pendingReset.executeAt) > 0);
+}
+
+function firePendingReset(key) {
+  resetExecuteTimers.delete(key);
+  const st = social.conversations.get(canonicalKey(key));
+  const at = st && st.pendingReset ? Number(st.pendingReset.executeAt) || 0 : 0;
+  if (!at) return; // 已被回话取消 / 状态已清
+  st.pendingReset = null;
+  saveSocialState();
+  log(`[misaki-cmd] ${key} 锁定期结束且期间无任何回话 → 执行认知清空`);
+  if (!resetExecutor) { log('[misaki-cmd] reset executor 未注册，跳过执行'); return; }
+  try { void Promise.resolve(resetExecutor(key)).catch((e) => log(`[misaki-cmd] ${key} 认知清空执行失败: ${e?.message ?? e}`)); }
+  catch (e) { log(`[misaki-cmd] ${key} 认知清空执行异常: ${e?.message ?? e}`); }
+}
+
+function armResetTimer(key, executeAt) {
+  const prev = resetExecuteTimers.get(key);
+  if (prev) clearTimeout(prev);
+  const t = setTimeout(() => firePendingReset(key), Math.max(0, executeAt - Date.now()));
+  t.unref?.();
+  resetExecuteTimers.set(key, t);
+}
+
+/** 进入/重新进入锁定期。返回执行时刻（ms）。 */
+export function armPendingReset(key, holdMs = 60 * 60 * 1000) {
+  const st = getSocialState(key);
+  const executeAt = Date.now() + Math.max(1000, Number(holdMs) || 60 * 60 * 1000);
+  st.pendingReset = { executeAt };
+  saveSocialState();
+  armResetTimer(key, executeAt);
+  return executeAt;
+}
+
+/** 锁定期内收到回话 → 取消。返回 true=确实取消了已挂起的清空。 */
+export function cancelPendingReset(key) {
+  const st = social.conversations.get(canonicalKey(key));
+  if (!st || !st.pendingReset) return false;
+  st.pendingReset = null;
+  const t = resetExecuteTimers.get(key);
+  if (t) { clearTimeout(t); resetExecuteTimers.delete(key); }
+  saveSocialState();
+  return true;
+}
+
+/** 启动恢复（loadSocialState 末尾调用）：把持久化的挂起清空重新挂表；已过期的视为静默期已满，立即执行。 */
+export function rearmPendingResets() {
+  let n = 0;
+  for (const key of social.conversations.keys()) {
+    const st = social.conversations.get(key);
+    if (!st?.pendingReset) continue;
+    const at = Number(st.pendingReset.executeAt) || 0;
+    if (!at) { st.pendingReset = null; continue; }
+    n += 1;
+    if (at <= Date.now()) firePendingReset(key);
+    else armResetTimer(key, at);
+  }
+  if (n) log(`[misaki-cmd] 已恢复 ${n} 个 misaki@reset -1 锁定期计时`);
+  return n;
+}
+
 // 主动机会检查（群/私聊独立参数，低概率开口）
 export function scheduleProactiveCheck(key) {
   if (cfgRef.social?.proactive?.enabled === false) return;
@@ -852,13 +1045,33 @@ export function scheduleProactiveCheck(key) {
   const p = cfgRef.social?.proactive ?? {};
   // 私聊用独立更主动的参数（privateCheckIntervalMinMs/MaxMs/privateProbability），群聊用常规参数。
   const isPrivate = String(key).startsWith('private:');
-  const min = Math.max(60 * 1000, Number(isPrivate ? p.privateCheckIntervalMinMs : p.checkIntervalMinMs) || (isPrivate ? 15 * 60 * 1000 : 30 * 60 * 1000));
-  const max = Math.max(min, Number(isPrivate ? p.privateCheckIntervalMaxMs : p.checkIntervalMaxMs) || (isPrivate ? 40 * 60 * 1000 : 90 * 60 * 1000));
+  // 2026-10-26 陪伴模式：检查间隔换用陪伴参数档（默认 40–90min，见 companion-mode.js）
+  const cmSched = isPrivate && stAgentMode(st) === 'companion';
+  const cpSched = cmSched ? companionCfg(cfgRef) : null;
+  const min = cmSched ? Math.max(60 * 1000, cpSched.checkIntervalMinMs) : Math.max(60 * 1000, Number(isPrivate ? p.privateCheckIntervalMinMs : p.checkIntervalMinMs) || (isPrivate ? 15 * 60 * 1000 : 30 * 60 * 1000));
+  const max = cmSched ? Math.max(min, cpSched.checkIntervalMaxMs) : Math.max(min, Number(isPrivate ? p.privateCheckIntervalMaxMs : p.checkIntervalMaxMs) || (isPrivate ? 40 * 60 * 1000 : 90 * 60 * 1000));
   const delay = Math.floor(min + Math.random() * (max - min));
   st.proactiveTimer = setTimeout(() => {
     st.proactiveTimer = null;
     ensureWakeable(st, { key });
-    const idleThreshold = Number(p.idleThresholdMs) || 15 * 60 * 1000;
+    // 2026-10-26 陪伴模式参数档：冷场阈值/话题门槛/配额/退避独立于常规模式
+    const cmOn = isPrivate && stAgentMode(st) === 'companion';
+    const cp = cmOn ? companionCfg(cfgRef) : null;
+    if (cmOn && inCompanionQuietHours(Date.now(), cfgRef)) {
+      scheduleProactiveCheck(key); // 静默时段（默认 23:30–07:30）：不评估不唤醒，到点重排下一轮
+      return;
+    }
+    if (cmOn) {
+      // 无回应退避结算：上次主动后对方超过 unansweredWindowMs 没回 → 记一次；
+      // 对方任何真消息会在 appendSocialMessage 里清零，这里只负责到期结算。
+      const cm = st.companionMode ?? (st.companionMode = {});
+      if (cm.awaitingReplySince && Date.now() - Number(cm.awaitingReplySince) > cp.unansweredWindowMs) {
+        cm.unansweredStreak = (Number(cm.unansweredStreak) || 0) + 1;
+        cm.awaitingReplySince = 0;
+        log(`[companion] ${key} 主动无回应第 ${cm.unansweredStreak} 次（阈值 ${cp.unansweredStreakLimit} 次后降档）`);
+      }
+    }
+    const idleThreshold = cmOn ? cp.idleThresholdMs : (Number(p.idleThresholdMs) || 15 * 60 * 1000);
     const idle = Date.now() - (st.lastIncomingAt || 0);
     const pendingThoughts = Array.isArray(st.pendingThoughts) ? st.pendingThoughts.filter((t) => t && (!t.expiresAt || Date.now() < Number(t.expiresAt))).length : 0;
     // 有话题才开口（默认开启 freshContextOnly）：未读/待办想法/近 2h 他人发言都没有就只重排下一轮，
@@ -868,7 +1081,8 @@ export function scheduleProactiveCheck(key) {
       || (Array.isArray(st.recentMessages) ? st.recentMessages : []).some((m) => m && !m.isSelf && Date.now() - Number(m.time || 0) < 2 * 60 * 60 * 1000);
     const gate = proactiveGate({
       probCfg: isPrivate ? p.privateProbability : p.probability,
-      freshOnly: cfgRef.social?.proactive?.freshContextOnly !== false,
+      // 陪伴模式允许"无话题开口"（凭记忆里的事主动关心），其余维持 freshContextOnly 判定
+      freshOnly: cmOn ? false : (cfgRef.social?.proactive?.freshContextOnly !== false),
       fresh,
       idleMs: idle,
       idleThresholdMs: idleThreshold,
@@ -880,7 +1094,18 @@ export function scheduleProactiveCheck(key) {
     //   计数 ≥2 → 硬拦（绝不超过 2 次）。
     //   只管"无来由的主动"，真实消息照常唤醒，不受配额影响。计数在模型真的开口后落账（social-flow.js recordSentMessages）。
     let quotaBlock = false;
-    if (gate.fire && isPrivate) {
+    if (gate.fire && isPrivate && cmOn) {
+      // 2026-10-26 陪伴模式独立配额（与常规 proactiveCount 互不挤占）+ 无回应退避降档
+      const today = new Date().toLocaleDateString('en-US', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' });
+      const cm = st.companionMode ?? (st.companionMode = {});
+      if (cm.proactiveDay !== today) { cm.proactiveDay = today; cm.proactiveCount = 0; }
+      const effMax = (Number(cm.unansweredStreak) || 0) >= cp.unansweredStreakLimit ? cp.backoffDailyMax : cp.dailyMax;
+      const usedCm = Number(cm.proactiveCount) || 0;
+      if (usedCm >= effMax) {
+        quotaBlock = true;
+        log(`[companion] 陪伴主动配额判定 ${key}: 今日已主动 ${usedCm}/${effMax} 次${(Number(cm.unansweredStreak) || 0) >= cp.unansweredStreakLimit ? '（无回应退避中）' : ''}，封口`);
+      }
+    } else if (gate.fire && isPrivate) {
       const today = new Date().toLocaleDateString('en-US', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' });
       if (st.proactiveDay !== today) {
         st.proactiveDay = today;
@@ -900,10 +1125,10 @@ export function scheduleProactiveCheck(key) {
     }
     if (gate.fire && quotaBlock === false && isPrivate) {
       // 会开口的这轮先预记账：模型被唤醒后"真的开口"才算数，纯判断(qq_mark_read)会在回调里退还。
-      st._proactivePending = true;
+      if (cmOn) st._companionPending = true; else st._proactivePending = true;
     }
     if (gate.fire && !quotaBlock) {
-      void dispatchWake(key, 'proactiveCheck').catch((error) => log(`[default] proactive 唤醒异常 ${key}:`, error?.message ?? error));
+      void dispatchWake(key, cmOn ? 'companionCare' : 'proactiveCheck').catch((error) => log(`[default] proactive 唤醒异常 ${key}:`, error?.message ?? error));
     } else {
       log(`[default] proactive 本轮不开口(${gate.why}) ${key}`);
     }
@@ -960,7 +1185,7 @@ export function scheduleWake(key, reason) {
   // 免打扰时段拦截内部低价值唤醒（reason 可能带 ':分组' 后缀，取冒号前基名）；
   // timeout/@/提问/私聊/拍一拍/点名等真实触发不拦（免打扰≠失联，被直接叫到仍回）。
   const baseReason = String(reason ?? '').split(':')[0];
-  if (inDndWindow() && /^(proactiveCheck|replyCheck|probability|anyMessage|keyword)$/.test(baseReason)) {
+  if (inDndWindow() && /^(proactiveCheck|replyCheck|probability|anyMessage|keyword|companionCare)$/.test(baseReason)) {
     log(`[default] 免打扰窗口，跳过内部唤醒 ${key}（${reason}）`);
     return;
   }
@@ -1042,7 +1267,9 @@ export function scheduleWake(key, reason) {
   //   · 命中"插话"（骰子命中 / 等太久到上限）→ 按正常节奏回，不抢话也不干等。
   // 补发轮跳过这一条：那批消息早在"会话忙"期间就等着了，再等他打完字只是二次延迟。
   if (!isReplayWake && key.startsWith('private:')) {
-    const decision = typingHoldDecision({ typingUntil: st.peerTypingUntil, since: st.peerTypingSince, cfg: cfgRef });
+    // 2026-10-26 陪伴模式：绝不插话（breakProbability=0）+ 更长等待（参数见 companion-mode.js）
+    const typingCfgArg = stAgentMode(st) === 'companion' ? companionTypingDecisionCfg(cfgRef) : cfgRef;
+    const decision = typingHoldDecision({ typingUntil: st.peerTypingUntil, since: st.peerTypingSince, cfg: typingCfgArg });
     if (decision.wait) {
       // 2026-09-16 晚 修「思考期间到的消息被塞进下一个唤醒」：会话正忙（有回合在跑）时，
       // 绝不许把唤醒窗口拉过这一轮：一旦拖到回合结束，投递就只能走"完整唤醒"= 下一个唤醒/下一轮。

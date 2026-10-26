@@ -211,7 +211,7 @@ function clearStaleTurnState(sessionId, key) {
 const SUBAGENT_GRACE_MS = 15 * 60 * 1000;
 const SUBAGENT_TOTAL_GRACE_MS = 20 * 60 * 1000;
 const subagentGraceUsed = new Set();
-function sessionUsedSubagent(sessionId) {
+export function sessionUsedSubagent(sessionId) {
   const names = toolCallNames.get(sessionId);
   if (!names) return false;
   for (const n of names.values()) if (n === 'subagent') return true;

@@ -119,6 +119,13 @@ let linearCfgReader = null;     // qq-send.initQqSendCore 注册：每次取当�
 /** 注册节拍配置读取器：返回 { enabled, perCharMs, minMs, capMs, jitterRatio, resetMs } 或 null。 */
 export function setSendLinearCfgReader(fn) { linearCfgReader = fn; }
 
+// 2026-10-26 陪伴模式独立打字节拍：social.companionMode.linearPerCharMs / linearMinMs /
+// linearCapMs / linearJitterRatio 平铺键（缺省回落全局 social.send 对应值）。主人定规：
+// 常规模式效率优先可以快，陪伴模式必须拟合真人——两种模式各有一套打字速度。
+let companionPaceProbe = null;      // key => boolean（该会话是否陪伴模式），qq-send.initQqSendCore 注册
+let companionPaceCfgReader = null;  // () => social.companionMode 对象
+export function setCompanionPaceHooks(probe, cfgReader) { companionPaceProbe = probe; companionPaceCfgReader = cfgReader; }
+
 function linearCfgNow() {
   let user = null;
   try { user = linearCfgReader ? linearCfgReader() : null; } catch {}
@@ -180,7 +187,20 @@ export function resetSendPace(key) {
  *  模型走的 qq_send_message 是一次调用一条气泡 → 用下面的 typingDelayMs，别用这个。 */
 export function nextSendPaceMs(key, textLen) {
   if (key == null || String(key) === '') return null;
-  const cfg = linearCfgNow();
+  let cfg = linearCfgNow();
+  // 陪伴会话：social.companionMode 的 linear* 平铺键覆盖全局节拍（只覆盖显式写出的键）
+  try {
+    if (companionPaceProbe && companionPaceCfgReader && companionPaceProbe(String(key))) {
+      const cm = companionPaceCfgReader();
+      if (cm && typeof cm === 'object') {
+        cfg = { ...cfg };
+        const alias = { linearPerCharMs: 'perCharMs', linearMinMs: 'minMs', linearCapMs: 'capMs', linearJitterRatio: 'jitterRatio' };
+        for (const [ck, out] of Object.entries(alias)) {
+          if (cm[ck] !== undefined) cfg[out] = cm[ck];
+        }
+      }
+    }
+  } catch { /* 探测失败按全局节拍走 */ }
   if (cfg.enabled === false) return null;
   const cap = Math.max(0, Number(cfg.capMs) || 0);
   const perChar = Math.max(0, Number(cfg.perCharMs) || 0);

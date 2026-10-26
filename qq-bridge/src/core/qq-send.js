@@ -8,8 +8,8 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { withTimeout, sleep } from '../lib/async.js';
 import { log } from '../lib/log.js';
-import { enqueueSend, currentSendChain, setSendLinearCfgReader, nextSendPaceMs, typingDelayMs, markSendDelivered, resetSendPace } from './send-chain.js';
-import { getSocialState } from './social-state.js';
+import { enqueueSend, currentSendChain, setSendLinearCfgReader, setCompanionPaceHooks, nextSendPaceMs, typingDelayMs, markSendDelivered, resetSendPace } from './send-chain.js';
+import { getSocialState, isCompanionActive } from './social-state.js';
 import { activeAiTurns } from './session-state.js';
 import { recordAiTurnOutbound } from './turn-guard.js';
 import { resolveArtifactFaceId } from '../lib/qq-face-parse.js';
@@ -30,14 +30,22 @@ let botRef = null;
 export function initQqSendCore(cfg) {
   cfgRef = cfg;
   setSendLinearCfgReader(() => (cfgRef?.social?.send ?? null));
+  // 陪伴模式独立打字节拍（2026-10-26）：陪伴会话用 social.companionMode.linear* 平铺键覆盖全局
+  // social.send 对应值（缺省回落全局）。主人定规：常规效率优先可快、陪伴必须拟合真人。
+  setCompanionPaceHooks(
+    (k) => { try { return isCompanionActive(k); } catch { return false; } },
+    () => (cfgRef?.social?.companionMode ?? null)
+  );
 }
 /** NapCat 网关就绪后注入 bot（NapCat client） */
 export function setQqSendBot(bot) {
   botRef = bot;
 }
 
-// 发送单条文本（按 QQ 分条），入发送链
-export function sendToQQ(key, msg) {
+// 发送单条文本（按 QQ 分条），入发送链。
+// opts.single = true：强制整条一个气泡（内部 \n 由 QQ 原生换行渲染，绝不按长度切分）——
+// misaki@ 固定语句（help/consumption）用：列表类回复必须保持一个气泡内的多行版式。
+export function sendToQQ(key, msg, opts = {}) {
   const rawText = String(msg ?? '');
   const swept = sweepMessageArtifacts(rawText);
   const stripped = cleanOutboundText(rawText);
@@ -46,7 +54,7 @@ export function sendToQQ(key, msg) {
   if (safeMsg === '' && swept.removed === 0 && rawText.trim() !== '') safeMsg = redactKnownTokensOnly(rawText);
   if (!safeMsg) return currentSendChain();
   const [kind, id] = key.split(':');
-  const parts = splitForQQ(safeMsg);
+  const parts = opts?.single === true ? [safeMsg] : splitForQQ(safeMsg);
   // 这次调用 = 一次新的连发批：清掉上几轮攒下的连续发送计数，批内第 1 条秒回、第 2 条起按字数等。
   // （本函数只服务于桥自己的通知/命令回执；模型走的是 sendMessages —— 那条路是"内置线性延迟"，见下。）
   resetSendPace(key);

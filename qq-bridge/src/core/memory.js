@@ -232,6 +232,33 @@ export function getProfile(uid) {
   }
 }
 
+/** misaki@reset -1（清空认知，2026-10-26）：把一个人在记忆库里的痕迹全部删除，还原到"没认识过"。
+ * 范围：profiles 该 uid 一行 + memory_entries 里按 uid / conv_key 命中的全部条目（各层级含 permanent）。
+ * 不可逆；只影响传入的这个人/这个会话，不动其他会话与全局资源。
+ * FTS 由删除触发器自动同步（见 ensureMemoryIndex 的 mem_fts 触发器），无需手工重建。 */
+export function forgetPersonCognition(uid, convKey = '') {
+  const db = initMemoryDb();
+  const u = String(uid ?? '').trim();
+  const ck = String(convKey ?? '').trim();
+  if (!db || !u) return { ok: false, error: '记忆库不可用或 uid 为空' };
+  const out = { ok: true, memoryDeleted: 0, profileDeleted: 0 };
+  try {
+    const del = db.prepare('DELETE FROM memory_entries WHERE uid = ? OR (? != \'\' AND conv_key = ?)').run(u, ck, ck);
+    out.memoryDeleted = Number(del.changes) || 0;
+  } catch (error) {
+    out.ok = false;
+    out.error = `记忆条目删除失败: ${error?.message ?? error}`;
+    log(`[memory] forgetPersonCognition ${u} 记忆条目删除失败: ${error?.message ?? error}`);
+  }
+  try {
+    const p = db.prepare('DELETE FROM profiles WHERE uid = ?').run(u);
+    out.profileDeleted = Number(p.changes) || 0;
+  } catch (error) {
+    log(`[memory] forgetPersonCognition ${u} 档案删除失败: ${error?.message ?? error}`);
+  }
+  return out;
+}
+
 /** 把观察到的昵称补进通讯录（只在当前为空时写，绝不覆盖已学到的/用户设过的名字）。
  *
  * 2026-09-23 修「群聊的人的 QQ 号昵称好像还无法识别」：

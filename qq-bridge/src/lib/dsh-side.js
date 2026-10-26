@@ -404,12 +404,30 @@ export function resolveToolCompressor({ log = () => {}, force = false } = {}) {
 
 function mcpBlock() {
   const node = process.execPath;
-  const servers = {
-    'mcp-napcat': path.join(REPO_ROOT, 'src', 'mcp-napcat-safe.js'),
-    'mcp-napcat-host': path.join(REPO_ROOT, 'src', 'mcp-host-server.js'),
-    'mcp-web-search-safe': path.join(REPO_ROOT, 'src', 'mcp-web-search-safe.js'),
-  };
-  // 压缩代理只挂在 napcat 这一路上（工具最多、体积最大）；另两个保持直连。
+  /* 2026-10-26 新增 mcp-filesystem / mcp-ppt（第一梯队，主人已批）：
+   * filesystem = 官方 @modelcontextprotocol/server-filesystem（npm 依赖，node_modules 就地解析），
+   *   白名单只开两个根：DSH 工作区（桥 send-file 认的那棵树）+ 桥的 agents 工作区——
+   *   修「子代理产物落在 state/agents 发不出去」的错位，她自己就能把文件搬进可发送区。
+   * ppt = office-powerpoint-mcp-server（python-pptx 封装；venv 在 /home/ubuntu/mcp-ppt-venv，
+   *   venv 里 mcp 钉 <2——2.x 把 FastMCP 改名 MCPServer，该包还用 v1 API）。产物路径模型传参，
+   *   预设引导写进 DSH 工作区即可直接发送。
+   * 条目按「脚本/命令不存在就跳过」过滤：开源仓/新机没有这些部署件时不拖累其余三个。 */
+  const fsRoots = [
+    sideCfg?.dsh?.workspaceRoot ?? '/home/ubuntu/qq-agent/dsh',
+    path.join(REPO_ROOT, 'state', 'agents'),
+  ];
+  const servers = [
+    { id: 'mcp-napcat', script: path.join(REPO_ROOT, 'src', 'mcp-napcat-safe.js'), toolCallTimeoutMs: 725000 },
+    { id: 'mcp-napcat-host', script: path.join(REPO_ROOT, 'src', 'mcp-host-server.js') },
+    { id: 'mcp-web-search-safe', script: path.join(REPO_ROOT, 'src', 'mcp-web-search-safe.js') },
+    { id: 'mcp-filesystem', script: path.join(REPO_ROOT, 'node_modules', '@modelcontextprotocol', 'server-filesystem', 'dist', 'index.js'), extraArgs: fsRoots },
+    { id: 'mcp-ppt', command: sideCfg?.dsh?.mcpPptPython ?? '/home/ubuntu/mcp-ppt-venv/bin/python', args: ['-m', 'ppt_mcp_server'], toolCallTimeoutMs: 725000 },
+  ].filter((e) => {
+    const target = e.script ?? e.command;
+    if (!target || !fs.existsSync(target)) { log(`[dsh-side] MCP ${e.id} 目标不存在，跳过注册：${target}`); return false; }
+    return true;
+  });
+  // 压缩代理只挂在 napcat 这一路上（工具最多、体积最大）；其余保持直连。
   const tc = sideCfg?.social?.toolCompressor ?? {};
   /* 2026-09-21：压缩代理默认恒开 —— 只有显式写 `enabled: false` 才关。
    * 语义从"必须显式打开"改成"除非显式关掉"：老配置里没有这个键 → 自动走代理（即"默认就用它"）。
@@ -420,7 +438,9 @@ function mcpBlock() {
   if (wantProxy && !probe.ok) log(`[dsh-side] 工具压缩代理已勾选但不可用，回退直连：${probe.reason}`);
 
   let out = '# === qq-bridge MCP BEGIN ===\n';
-  for (const [id, script] of Object.entries(servers)) {
+  for (const entry of servers) {
+    const id = entry.id;
+    const script = entry.script ?? '';
     out += '- insert:\n';
     out += `    - id: ${id}\n`;
     out += `      name: '@deepseek-ai/dsh-mcp-client'\n`;
@@ -441,11 +461,12 @@ function mcpBlock() {
       out += `          - ${yamlQuoteForPath(script)}\n`;
       log(`[dsh-side] napcat MCP 走压缩代理：档位=${level}${exclude.length ? ` 排除 ${exclude.length} 个` : ''}（工具表由代理发给模型）`);
     } else {
-      out += `        command: ${yamlQuoteForPath(node)}\n`;
+      out += `        command: ${yamlQuoteForPath(entry.command ?? node)}\n`;
       out += `        args:\n`;
-      out += `          - ${yamlQuoteForPath(script)}\n`;
+      const argv = [...(entry.args ?? (script ? [script] : [])), ...(entry.extraArgs ?? [])];
+      for (const a of argv) out += `          - ${yamlQuoteForPath(a)}\n`;
     }
-    if (id === 'mcp-napcat') out += '        toolCallTimeoutMs: 725000\n';
+    if (entry.toolCallTimeoutMs) out += `        toolCallTimeoutMs: ${entry.toolCallTimeoutMs}\n`;
   }
   out += '# === qq-bridge MCP END ===\n';
   return out;

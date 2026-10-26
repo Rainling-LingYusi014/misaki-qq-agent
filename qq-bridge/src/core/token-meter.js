@@ -1217,3 +1217,12 @@ export function checkTokenBudget(convKey, opts = {}) {
 export function setTokenBudgetCfg(budget) {
   meter.budgetCfg = budget && typeof budget === 'object' ? budget : null;
 }
+
+/** 今日（计费日，默认北京 08:00 换日）全局用量与换日键：misaki@consumption 显示用，
+ * 与 checkTokenBudget 的全局分支同口径（prompt+completion+cacheRead+cacheWrite）。 */
+export function todayBillingUsage() {
+  ensureInit();
+  const key = billingKey(Date.now());
+  const agg = meter.days.get(key);
+  return { todayKey: key, used: agg ? (agg.prompt + agg.completion + agg.cacheRead + agg.cacheWrite) : 0 };
+}

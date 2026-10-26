@@ -190,6 +190,7 @@ import {
   formatParticipation, suggestQuietMs, PEER_TYPING_HOLD_MAX_MS, scheduleWake,
   scheduleReplyCheck, buildWakeReminderPrompt,
   clearSocialTimers, clearAllSocialTimers, resetConversationKeepingLedger,
+  companionToolBlock, companionToolBlockByToken,
 } from './social-state.js';
 // 作息仪式（2026-10-13）：晚安熄灯计时 / 早安触发（触发方是 sleep-switch.sh 的 cron）
 import { initRitual, startGoodnight, clearGoodnight } from './ritual.js';
@@ -1852,7 +1853,7 @@ export function startConsoleServer() {
         if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('socialState')) { sendJson({ ok: false, error: '工具未启用：qq_social_state' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('socialState') || companionToolBlock('socialState', key))) { sendJson({ ok: false, error: companionToolBlock('socialState', key) || '工具未启用：qq_social_state' }, 403); return; }
         const st = getSocialState(key);
         sendJson({
           ok: true,
@@ -1869,7 +1870,7 @@ export function startConsoleServer() {
       if (req.method === 'GET' && url.pathname === '/api/social/global-overview') {
         // 全局互通：列出所有会话的动态一览（只读）。控制台 token 或受信任发起者（账号所有者/好友）的 agent token 可用。
         const agentTokenG = String(req.headers['x-agent-token'] ?? '').trim();
-        if (agentTokenG && !ToolEnabled('globalOverview')) { sendJson({ ok: false, error: '工具未启用：qq_global_overview' }, 403); return; }
+        if (agentTokenG && (!ToolEnabled('globalOverview') || companionToolBlockByToken('globalOverview', agentTokenG))) { sendJson({ ok: false, error: companionToolBlockByToken('globalOverview', agentTokenG) || '工具未启用：qq_global_overview' }, 403); return; }
         if (agentTokenG) {
           let trustedG = false;
           for (const [ck, cst] of social.conversations.entries()) {
@@ -1906,7 +1907,7 @@ export function startConsoleServer() {
         if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('getPrompt')) { sendJson({ ok: false, error: '工具未启用：qq_get_prompt' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('getPrompt') || companionToolBlock('getPrompt', key))) { sendJson({ ok: false, error: companionToolBlock('getPrompt', key) || '工具未启用：qq_get_prompt' }, 403); return; }
         const st = getSocialState(key);
         // 让 prompt 里的表情摘要尽量新鲜：按 TTL 同步一次 QQ 收藏表情（失败不阻塞）。
         if (cfgRef.social?.sticker?.enabled !== false) {
@@ -2011,7 +2012,7 @@ export function startConsoleServer() {
         if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('getUnread')) { sendJson({ ok: false, error: '工具未启用：qq_get_unread_messages' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('getUnread') || companionToolBlock('getUnread', key))) { sendJson({ ok: false, error: companionToolBlock('getUnread', key) || '工具未启用：qq_get_unread_messages' }, 403); return; }
         /* 2026-09-29【已读融进工具】`markRead=1`：读到的就是已读的 —— 读完这批就把它标记掉，
          * 模型不必再单独调一次 qq_mark_read。不带这个参数时行为与改动之前完全一致（纯只读）。
          * 不做成"无脑全清"的三条硬边界（这是本改动唯一有风险的地方，所以写在这里）：
@@ -2065,7 +2066,7 @@ export function startConsoleServer() {
         if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('getRecent')) { sendJson({ ok: false, error: '工具未启用：qq_get_recent_messages' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('getRecent') || companionToolBlock('getRecent', key))) { sendJson({ ok: false, error: companionToolBlock('getRecent', key) || '工具未启用：qq_get_recent_messages' }, 403); return; }
         /* 只看内存窗口（见上面那段说明）：offset 是在窗口内往前挪，窗口之外就是没有 ——
          * 要更长/更旧的内容走 qq_memory_search（/api/social/history-search，读 SQLite）。 */
         const st = getSocialState(key);
@@ -2150,7 +2151,7 @@ export function startConsoleServer() {
           sendJson({ ok: true, key, markedCount, advanced: true, watermark: maxSeen, dbUpdated: dbUpdatedSeen });
           return;
         }
-        if (req.headers['x-agent-token'] && !ToolEnabled('markRead')) { sendJson({ ok: false, error: '工具未启用：qq_mark_read' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('markRead') || companionToolBlock('markRead', key))) { sendJson({ ok: false, error: companionToolBlock('markRead', key) || '工具未启用：qq_mark_read' }, 403); return; }
         const st = getSocialState(key);
         // mark_read 是“本轮已看过、收尾”的常规动作，不设置任何潜水配置（只清已读 + 保留可唤醒条件），
         // 因此不受“沉睡前观察”闸门约束——否则无新内容可回、想安静收尾时会被拒，
@@ -2218,7 +2219,7 @@ export function startConsoleServer() {
         if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('setWakeConfig')) { sendJson({ ok: false, error: '工具未启用：qq_set_wake_config' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('setWakeConfig') || companionToolBlock('setWakeConfig', key))) { sendJson({ ok: false, error: companionToolBlock('setWakeConfig', key) || '工具未启用：qq_set_wake_config' }, 403); return; }
         const st = getSocialState(key);
         const input = body.config && typeof body.config === 'object' && !Array.isArray(body.config) ? body.config : {};
         const current = st.wakeConfig;
@@ -2504,7 +2505,7 @@ export function startConsoleServer() {
          * 这要么是有意跨会话转达，要么是模型抄错了 key——桥分不出来，所以要求显式声明。 */
         { const refuse = crossSessionRefusal(req.headers['x-agent-token'], key, body.crossSession); if (refuse) { sendJson({ ok: false, error: refuse }, 403); return; } }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('sendMessage')) { sendJson({ ok: false, error: '工具未启用：qq_send_message' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('sendMessage') || companionToolBlock('sendMessage', key))) { sendJson({ ok: false, error: companionToolBlock('sendMessage', key) || '工具未启用：qq_send_message' }, 403); return; }
         if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: 'default 模式发送必须携带 agent token' }, 403); return; }
         const keyMatch = /^(group|private):(\d+)$/.exec(key);
         if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
@@ -2710,7 +2711,7 @@ export function startConsoleServer() {
         if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: 'default 模式发送拍一拍必须携带 agent token' }, 403); return; }
         if (!agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (!SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (!ToolEnabled('sendPoke')) { sendJson({ ok: false, error: '工具未启用：qq_send_poke' }, 403); return; }
+        if ((req.headers['x-agent-token'] && companionToolBlock('sendPoke', key)) || !ToolEnabled('sendPoke')) { sendJson({ ok: false, error: (req.headers['x-agent-token'] && companionToolBlock('sendPoke', key)) || '工具未启用：qq_send_poke' }, 403); return; }
   
     if (social.paused) { sendJson({ ok: false, error: 'default AI 已暂停，不能发送拍一拍' }, 403); return; }
         const keyMatch = /^(group|private):(\d+)$/.exec(key);
@@ -2800,7 +2801,7 @@ export function startConsoleServer() {
         if (!key || !stickerId) { sendJson({ ok: false, error: 'key 和 stickerId 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('getStickerImage')) { sendJson({ ok: false, error: '工具未启用：qq_get_sticker_image' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('getStickerImage') || companionToolBlock('getStickerImage', key))) { sendJson({ ok: false, error: companionToolBlock('getStickerImage', key) || '工具未启用：qq_get_sticker_image' }, 403); return; }
         try {
           const entry = await getStickerImageData(stickerId);
           const fetched = await safeFetchBuffer(entry.url, MAX_MEDIA_BYTES);
@@ -2833,7 +2834,7 @@ export function startConsoleServer() {
         if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('getSelfImage')) { sendJson({ ok: false, error: '工具未启用：qq_get_self_image' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('getSelfImage') || companionToolBlock('getSelfImage', key))) { sendJson({ ok: false, error: companionToolBlock('getSelfImage', key) || '工具未启用：qq_get_self_image' }, 403); return; }
         const selfPath = path.join(ROOT, 'assets', 'deepseek娘.png');
         try {
           if (!fs.existsSync(selfPath)) { sendJson({ ok: false, error: '未找到 AI 形象图片 assets/deepseek娘.png' }, 404); return; }
@@ -2858,7 +2859,7 @@ export function startConsoleServer() {
         if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
         if (!agentTokenOk(key, agentTokenL)) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (!SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (!ToolEnabled('like')) { sendJson({ ok: false, error: '工具未启用：qq_like' }, 403); return; }
+        if ((req.headers['x-agent-token'] && companionToolBlock('like', key)) || !ToolEnabled('like')) { sendJson({ ok: false, error: (req.headers['x-agent-token'] && companionToolBlock('like', key)) || '工具未启用：qq_like' }, 403); return; }
         if (!targetUserId || !/^[1-9]\d*$/.test(targetUserId)) { sendJson({ ok: false, error: 'targetUserId 不能为空且必须是正整数' }, 400); return; }
         try {
           const result = await botRef.raw('send_like', { user_id: Number(targetUserId), times });
@@ -2881,7 +2882,7 @@ export function startConsoleServer() {
         // 任意本机进程可代 AI 向任意 group:/private: 会话发任意文本。
         if (!agentTokenP) { sendJson({ ok: false, error: 'default 模式发送必须携带 agent token' }, 403); return; }
         if (!agentTokenOk(targetKey, agentTokenP)) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
-        if (!ToolEnabled('proactiveSend')) { sendJson({ ok: false, error: '工具未启用：qq_proactive_send' }, 403); return; }
+        if (!ToolEnabled('proactiveSend') || companionToolBlock('proactiveSend', targetKey)) { sendJson({ ok: false, error: companionToolBlock('proactiveSend', targetKey) || '工具未启用：qq_proactive_send' }, 403); return; }
         const keyMatch = /^(group|private):(\d+)$/.exec(targetKey);
         if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
         if (!SessionAllowed(targetKey)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
@@ -2952,7 +2953,7 @@ export function startConsoleServer() {
         const agentTokenS = String(req.headers['x-agent-token'] ?? '').trim();
         if (agentTokenS && !agentTokenOk(targetKey, agentTokenS)) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (agentTokenS && !SessionAllowed(targetKey)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (agentTokenS && !ToolEnabled('scheduleMessage')) { sendJson({ ok: false, error: '工具未启用：qq_schedule_message' }, 403); return; }
+        if (agentTokenS && (!ToolEnabled('scheduleMessage') || companionToolBlock('scheduleMessage', targetKey))) { sendJson({ ok: false, error: companionToolBlock('scheduleMessage', targetKey) || '工具未启用：qq_schedule_message' }, 403); return; }
         const keyMatchS = /^(group|private):(\d+)$/.exec(targetKey);
         if (!keyMatchS) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
         // 时间解析：优先 at（ISO 字符串或毫秒时间戳），其次 delayMs（相对毫秒）。
@@ -2979,7 +2980,7 @@ export function startConsoleServer() {
       }
       if (req.method === 'GET' && url.pathname === '/api/social/schedule-list') {
         const agentTokenL = String(req.headers['x-agent-token'] ?? '').trim();
-        if (agentTokenL && !ToolEnabled('scheduleMessage')) { sendJson({ ok: false, error: '工具未启用：qq_schedule_message' }, 403); return; }
+        if (agentTokenL && (!ToolEnabled('scheduleMessage') || companionToolBlockByToken('scheduleMessage', agentTokenL))) { sendJson({ ok: false, error: companionToolBlockByToken('scheduleMessage', agentTokenL) || '工具未启用：qq_schedule_message' }, 403); return; }
         sendJson({ ok: true, tasks: scheduledTasks.map((t) => ({ id: t.id, targetKey: t.targetKey, message: String(t.message ?? '').slice(0, 80), at: t.at, repeatMs: t.repeatMs || 0 })) });
         return;
       }
@@ -2988,7 +2989,7 @@ export function startConsoleServer() {
         const id = String(body.id ?? '').trim();
         if (!id) { sendJson({ ok: false, error: '需要 id' }, 400); return; }
         const agentTokenC = String(req.headers['x-agent-token'] ?? '').trim();
-        if (agentTokenC && !ToolEnabled('scheduleMessage')) { sendJson({ ok: false, error: '工具未启用：qq_schedule_message' }, 403); return; }
+        if (agentTokenC && (!ToolEnabled('scheduleMessage') || companionToolBlockByToken('scheduleMessage', agentTokenC))) { sendJson({ ok: false, error: companionToolBlockByToken('scheduleMessage', agentTokenC) || '工具未启用：qq_schedule_message' }, 403); return; }
         const removed = cancelScheduledTask(id);
         sendJson({ ok: true, removed });
         return;
@@ -3000,7 +3001,7 @@ export function startConsoleServer() {
         const content = String(body.content ?? '').trim();
         const agentTokenX = String(req.headers['x-agent-token'] ?? '').trim();
         if (!agentTokenX || !agentTokenOk(toKey, agentTokenX)) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
-        if (!ToolEnabled('crosschat')) { sendJson({ ok: false, error: '工具未启用：qq_crosschat_*' }, 403); return; }
+        if (!ToolEnabled('crosschat') || companionToolBlockByToken('crosschat', req.headers['x-agent-token'])) { sendJson({ ok: false, error: companionToolBlockByToken('crosschat', req.headers['x-agent-token']) || '工具未启用：qq_crosschat_*' }, 403); return; }
         if (!toKey || !/^(group|private):\d+$/.test(toKey)) { sendJson({ ok: false, error: 'toKey 格式应为 group:群号 或 private:QQ号' }, 400); return; }
         if (!SessionAllowed(toKey)) { sendJson({ ok: false, error: '目标会话不在当前模式允许范围内' }, 403); return; }
         if (!content || content.length < 1) { sendJson({ ok: false, error: '留言内容不能为空' }, 400); return; }
@@ -3018,7 +3019,7 @@ export function startConsoleServer() {
         const keyX = String(url.searchParams.get('key') ?? '').trim();
         const agentTokenR = String(req.headers['x-agent-token'] ?? '').trim();
         if (!keyX || !agentTokenR || !agentTokenOk(keyX, agentTokenR)) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
-        if (!ToolEnabled('crosschat')) { sendJson({ ok: false, error: '工具未启用：qq_crosschat_*' }, 403); return; }
+        if (!ToolEnabled('crosschat') || companionToolBlockByToken('crosschat', req.headers['x-agent-token'])) { sendJson({ ok: false, error: companionToolBlockByToken('crosschat', req.headers['x-agent-token']) || '工具未启用：qq_crosschat_*' }, 403); return; }
         // 来源标签统一走 crosschat.js 导出的 describeCrossKey（单一事实源）：
         // 与 buildCrossChatBlock 注入给模型的文案必然一致，不会两处漂移。
         // 注意：ESM 具名导入一个未导出的绑定是链接期 SyntaxError（整个桥起不来），
@@ -3039,7 +3040,7 @@ export function startConsoleServer() {
         if (!agentTokenW) { sendJson({ ok: false, error: 'default 模式调用必须携带 agent token' }, 403); return; }
         if (!agentTokenOk(key, agentTokenW)) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (!SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (!ToolEnabled('withdrawMessage')) { sendJson({ ok: false, error: '工具未启用：qq_withdraw_message' }, 403); return; }
+        if ((req.headers['x-agent-token'] && companionToolBlock('withdrawMessage', key)) || !ToolEnabled('withdrawMessage')) { sendJson({ ok: false, error: (req.headers['x-agent-token'] && companionToolBlock('withdrawMessage', key)) || '工具未启用：qq_withdraw_message' }, 403); return; }
         // 只允许撤回本会话里自己（我:）发的消息，防止乱撤别人的话
         const stW = getSocialState(key);
         const ownMsg = Array.isArray(stW.recentMessages) ? stW.recentMessages.find((m) => m && m.isSelf && (String(m.messageId || '') === messageId || String(m.seq || '') === messageId)) : null;
@@ -3218,7 +3219,7 @@ export function startConsoleServer() {
         const agentTokenSN = String(req.headers['x-agent-token'] ?? '').trim();
         if (!agentTokenSN || !agentTokenOk(key, agentTokenSN)) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (!SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (!ToolEnabled('stickerNote')) { sendJson({ ok: false, error: '工具未启用：qq_sticker_note' }, 403); return; }
+        if ((req.headers['x-agent-token'] && companionToolBlock('stickerNote', key)) || !ToolEnabled('stickerNote')) { sendJson({ ok: false, error: (req.headers['x-agent-token'] && companionToolBlock('stickerNote', key)) || '工具未启用：qq_sticker_note' }, 403); return; }
         const note = body.note !== undefined && body.note !== null ? String(body.note).trim().slice(0, 200) : undefined;
         const tags = body.tags !== undefined && body.tags !== null ? (Array.isArray(body.tags) ? body.tags.map(String).map((s) => s.trim()).filter(Boolean).slice(0, 20) : []) : undefined;
         const usage = body.usage !== undefined && body.usage !== null ? String(body.usage).trim().slice(0, 200) : undefined;
@@ -3238,7 +3239,7 @@ export function startConsoleServer() {
         const agentTokenSR = String(req.headers['x-agent-token'] ?? '').trim();
         if (!agentTokenSR || !agentTokenOk(key, agentTokenSR)) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (!SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (!ToolEnabled('setStickerRemark')) { sendJson({ ok: false, error: '工具未启用：qq_set_sticker_remark' }, 403); return; }
+        if ((req.headers['x-agent-token'] && companionToolBlock('setStickerRemark', key)) || !ToolEnabled('setStickerRemark')) { sendJson({ ok: false, error: (req.headers['x-agent-token'] && companionToolBlock('setStickerRemark', key)) || '工具未启用：qq_set_sticker_remark' }, 403); return; }
         try {
           const entry = await setStickerRemark2(stickerId, String(body.remark ?? ''));
           log(`[sticker] 修改 QQ 收藏表情备注 ${key}: ${entry.id} -> ${entry.desc}`);
@@ -3267,7 +3268,7 @@ export function startConsoleServer() {
          * 表情/语音这些独立端点没装：它们的工具 schema 里也没有 crossSession 可传，装了就等于
          * "拒绝且无出口"（模型会照着提示重试到死）。要覆盖它们，先在工具层加上这个参数。 */
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('sendSticker')) { sendJson({ ok: false, error: '工具未启用：qq_send_sticker' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('sendSticker') || companionToolBlock('sendSticker', key))) { sendJson({ ok: false, error: companionToolBlock('sendSticker', key) || '工具未启用：qq_send_sticker' }, 403); return; }
         if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: 'default 模式发送必须携带 agent token' }, 403); return; }
         const keyMatch = /^(group|private):(\d+)$/.exec(key);
         if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
@@ -3366,7 +3367,7 @@ export function startConsoleServer() {
         if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('faceList')) { sendJson({ ok: false, error: '工具未启用：qq_face_list' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('faceList') || companionToolBlock('faceList', key))) { sendJson({ ok: false, error: companionToolBlock('faceList', key) || '工具未启用：qq_face_list' }, 403); return; }
         const table = formatFaceList();
         sendJson({ ok: true, total: table ? table.split('\n').length : 0, table, note: 'name=id，发 QQ 原生表情用 qq_send_qq_face 传 name 或 id' });
         return;
@@ -3381,7 +3382,7 @@ export function startConsoleServer() {
         if (!key || !faceRef) { sendJson({ ok: false, error: 'key 和 faceId/name 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('sendQqFace')) { sendJson({ ok: false, error: '工具未启用：qq_send_qq_face' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('sendQqFace') || companionToolBlock('sendQqFace', key))) { sendJson({ ok: false, error: companionToolBlock('sendQqFace', key) || '工具未启用：qq_send_qq_face' }, 403); return; }
         if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: 'default 模式发送必须携带 agent token' }, 403); return; }
         const keyMatch = /^(group|private):(\d+)$/.exec(key);
         if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
@@ -3472,7 +3473,7 @@ export function startConsoleServer() {
         if (!key || !type) { sendJson({ ok: false, error: 'key 和 type 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('sendRich')) { sendJson({ ok: false, error: '工具未启用：qq_send_rich' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('sendRich') || companionToolBlock('sendRich', key))) { sendJson({ ok: false, error: companionToolBlock('sendRich', key) || '工具未启用：qq_send_rich' }, 403); return; }
         if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: 'default 模式发送必须携带 agent token' }, 403); return; }
         const keyMatch = /^(group|private):(\d+)$/.exec(key);
         if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
@@ -3929,7 +3930,7 @@ export function startConsoleServer() {
         if (!key || !q) { sendJson({ ok: false, error: 'key 和 q 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('musicSearch')) { sendJson({ ok: false, error: '工具未启用：qq_music_search' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('musicSearch') || companionToolBlock('musicSearch', key))) { sendJson({ ok: false, error: companionToolBlock('musicSearch', key) || '工具未启用：qq_music_search' }, 403); return; }
         if (!['all', 'netease', 'qqmusic'].includes(platform)) { sendJson({ ok: false, error: 'platform 仅支持 all/netease/qqmusic' }, 400); return; }
         try {
           const data = await musicSearch(q, platform, limit);
@@ -3948,7 +3949,7 @@ export function startConsoleServer() {
         if (!key || !target) { sendJson({ ok: false, error: 'key 和 url 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('videoSearch')) { sendJson({ ok: false, error: '工具未启用：qq_video_parse' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('videoSearch') || companionToolBlock('videoSearch', key))) { sendJson({ ok: false, error: companionToolBlock('videoSearch', key) || '工具未启用：qq_video_parse' }, 403); return; }
         try {
           const info = await resolveVideo(target);
           sendJson({ ok: true, video: info });
@@ -3965,7 +3966,7 @@ export function startConsoleServer() {
         if (!key || !q) { sendJson({ ok: false, error: 'key 和 q 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('videoSearch')) { sendJson({ ok: false, error: '工具未启用：qq_video_search' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('videoSearch') || companionToolBlock('videoSearch', key))) { sendJson({ ok: false, error: companionToolBlock('videoSearch', key) || '工具未启用：qq_video_search' }, 403); return; }
         try {
           const data = await videoSearch(q, { limit });
           sendJson({ ok: true, ...data });
@@ -3984,7 +3985,7 @@ export function startConsoleServer() {
         if (!key || !title || !content) { sendJson({ ok: false, error: 'key、title、content 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('sendDocx')) { sendJson({ ok: false, error: '工具未启用：qq_send_docx' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('sendDocx') || companionToolBlock('sendDocx', key))) { sendJson({ ok: false, error: companionToolBlock('sendDocx', key) || '工具未启用：qq_send_docx' }, 403); return; }
         if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: 'default 模式发送必须携带 agent token' }, 403); return; }
         const keyMatch = /^(group|private):(\d+)$/.exec(key);
         if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
@@ -4102,7 +4103,7 @@ export function startConsoleServer() {
         if (!key || !filePath) { sendJson({ ok: false, error: 'key、path 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('sendFile')) { sendJson({ ok: false, error: '工具未启用：qq_send_file' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('sendFile') || companionToolBlock('sendFile', key))) { sendJson({ ok: false, error: companionToolBlock('sendFile', key) || '工具未启用：qq_send_file' }, 403); return; }
         if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: 'default 模式发送必须携带 agent token' }, 403); return; }
         const keyMatch = /^(group|private):(\d+)$/.exec(key);
         if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
@@ -4228,7 +4229,7 @@ export function startConsoleServer() {
         const toolName = kind === 'pptx' ? 'qq_send_pptx' : 'qq_send_xlsx';
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled(toolFlag)) { sendJson({ ok: false, error: `工具未启用：${toolName}` }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled(toolFlag) || companionToolBlock(toolFlag, key))) { sendJson({ ok: false, error: companionToolBlock(toolFlag, key) || `工具未启用：${toolName}` }, 403); return; }
         if (!req.headers['x-agent-token']) { sendJson({ ok: false, error: 'default 模式发送必须携带 agent token' }, 403); return; }
         const keyMatch = /^(group|private):(\d+)$/.exec(key);
         if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
@@ -4304,7 +4305,7 @@ export function startConsoleServer() {
         if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
         if (!tokenMR || !agentTokenOk(key, tokenMR)) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim' }, 403); return; }
         if (!SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (!ToolEnabled('memoryRemember')) { sendJson({ ok: false, error: '工具未启用：qq_memory_remember' }, 403); return; }
+        if ((req.headers['x-agent-token'] && companionToolBlock('memoryRemember', key)) || !ToolEnabled('memoryRemember')) { sendJson({ ok: false, error: (req.headers['x-agent-token'] && companionToolBlock('memoryRemember', key)) || '工具未启用：qq_memory_remember' }, 403); return; }
         const content = String(url.searchParams.get('content') ?? '').trim();
         if (!content) { sendJson({ ok: false, error: 'content 不能为空（一句话说清要永久记住的事）' }, 400); return; }
         const uidParam = String(url.searchParams.get('uid') ?? '').trim();
@@ -4342,7 +4343,7 @@ export function startConsoleServer() {
         if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
         if (!tokenMN || !agentTokenOk(key, tokenMN)) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim' }, 403); return; }
         if (!SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (!ToolEnabled('memorySearch')) { sendJson({ ok: false, error: '工具未启用：qq_memory_search' }, 403); return; }
+        if ((req.headers['x-agent-token'] && companionToolBlock('memorySearch', key)) || !ToolEnabled('memorySearch')) { sendJson({ ok: false, error: (req.headers['x-agent-token'] && companionToolBlock('memorySearch', key)) || '工具未启用：qq_memory_search' }, 403); return; }
         const uidParam = String(url.searchParams.get('uid') ?? '').trim();
         const uid = uidParam || (key.startsWith('private:') ? key.split(':')[1] : '');
         const r = listMemoryEntries({
@@ -4472,7 +4473,7 @@ export function startConsoleServer() {
         const offset = Math.max(0, Number(url.searchParams.get('offset')) || 0);
         if (key && req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (key && req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('memorySearch')) { sendJson({ ok: false, error: '工具未启用：qq_memory_search' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('memorySearch') || companionToolBlock('memorySearch', key))) { sendJson({ ok: false, error: companionToolBlock('memorySearch', key) || '工具未启用：qq_memory_search' }, 403); return; }
         if (!key && !query && !sender && !date && !direction) { sendJson({ ok: false, error: '至少提供一个检索条件（key/query/sender/date/direction）' }, 400); return; }
         const result = searchChatMessages({ convKey: key || undefined, query: query || undefined, sender: sender || undefined, date: date || undefined, direction: direction || undefined, limit, offset });
         if (!result.ok) { sendJson({ ok: false, error: result.error || '检索失败' }, 500); return; }
@@ -4518,7 +4519,7 @@ export function startConsoleServer() {
         if (body.confirm !== true) { sendJson({ ok: false, error: '删除操作需 confirm:true' }, 400); return; }
         if (key && req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (key && req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('historyDelete')) { sendJson({ ok: false, error: '工具未启用：qq_history_delete' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('historyDelete') || companionToolBlock('historyDelete', key))) { sendJson({ ok: false, error: companionToolBlock('historyDelete', key) || '工具未启用：qq_history_delete' }, 403); return; }
         const result = deleteChatMessages({ convKey: key || undefined, ids, query: query || undefined, sender: sender || undefined, date: date || undefined });
         if (!result.ok) { sendJson({ ok: false, error: result.error || '删除失败' }, 400); return; }
         sendJson({ ok: true, ...result });
@@ -4530,7 +4531,7 @@ export function startConsoleServer() {
         if (body.confirm !== true) { sendJson({ ok: false, error: '清空操作需 confirm:true' }, 400); return; }
         if (key && req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (key && req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('historyClear')) { sendJson({ ok: false, error: '工具未启用：qq_history_clear' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('historyClear') || companionToolBlock('historyClear', key))) { sendJson({ ok: false, error: companionToolBlock('historyClear', key) || '工具未启用：qq_history_clear' }, 403); return; }
         const result = clearChatHistory(key);
         if (!result.ok) { sendJson({ ok: false, error: result.error || '清空失败' }, 400); return; }
         sendJson({ ok: true, ...result });
@@ -4545,7 +4546,7 @@ export function startConsoleServer() {
         if (!key || !messageRef) { sendJson({ ok: false, error: 'key 和 messageId/seq 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('collectSticker')) { sendJson({ ok: false, error: '工具未启用：qq_collect_sticker' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('collectSticker') || companionToolBlock('collectSticker', key))) { sendJson({ ok: false, error: companionToolBlock('collectSticker', key) || '工具未启用：qq_collect_sticker' }, 403); return; }
         const keyMatch = /^(group|private):(\d+)$/.exec(key);
         if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
         const st = getSocialState(key);
@@ -4590,7 +4591,7 @@ export function startConsoleServer() {
         if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('listStickers')) { sendJson({ ok: false, error: '工具未启用：qq_list_stickers' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('listStickers') || companionToolBlock('listStickers', key))) { sendJson({ ok: false, error: companionToolBlock('listStickers', key) || '工具未启用：qq_list_stickers' }, 403); return; }
         // AI 强制刷新加最小间隔，避免反复调用 OneBot 表情接口造成限频/负载。
         if (req.headers['x-agent-token'] && force) {
           const now = Date.now();
@@ -4723,7 +4724,7 @@ export function startConsoleServer() {
         if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('waitMessages')) { sendJson({ ok: false, error: '工具未启用：qq_wait_for_messages' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('waitMessages') || companionToolBlock('waitMessages', key))) { sendJson({ ok: false, error: companionToolBlock('waitMessages', key) || '工具未启用：qq_wait_for_messages' }, 403); return; }
   
     // deepsleep：静默所有群聊（总开关）或「单群静默名单」里的群——群消息不交给模型，节省 token。
     // 2026-09-12 堵漏：原来这段整个包在 `if (kind === 'group')` 里 —— 这是对的（私聊照常），
@@ -4991,8 +4992,8 @@ export function startConsoleServer() {
           sendJson({ ok: false, error: 'tool 必须是 sendGroup/sendPrivate/reply' }, 400);
           return;
         }
-        if (!ToolEnabled(flag)) {
-          sendJson({ ok: false, error: `工具未启用：qq_${tool === 'sendGroup' ? 'send_group_message' : tool === 'sendPrivate' ? 'send_private_message' : 'reply'}` }, 403);
+        if (!ToolEnabled(flag) || companionToolBlock(flag, key)) {
+          sendJson({ ok: false, error: companionToolBlock(flag, key) || `工具未启用：qq_${tool === 'sendGroup' ? 'send_group_message' : tool === 'sendPrivate' ? 'send_private_message' : 'reply'}` }, 403);
           return;
         }
         sendJson({ ok: true, key, tool });
@@ -5031,7 +5032,7 @@ export function startConsoleServer() {
         if (!key || !rawMessage) { sendJson({ ok: false, error: 'key 和 message 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('feedback')) { sendJson({ ok: false, error: '工具未启用：qq_report_feedback' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('feedback') || companionToolBlock('feedback', key))) { sendJson({ ok: false, error: companionToolBlock('feedback', key) || '工具未启用：qq_report_feedback' }, 403); return; }
         // 反馈限频：防止持有会话 token 的调用方刷磁盘/日志。
         const fNow = Date.now();
         const fTimes = feedbackTimes.get(key) || [];
@@ -5060,7 +5061,7 @@ export function startConsoleServer() {
         if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('getMyRecent')) { sendJson({ ok: false, error: '工具未启用：qq_get_my_recent_messages' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('getMyRecent') || companionToolBlock('getMyRecent', key))) { sendJson({ ok: false, error: companionToolBlock('getMyRecent', key) || '工具未启用：qq_get_my_recent_messages' }, 403); return; }
         const st = getSocialState(key);
         const mem = Array.isArray(st.recentMessages) ? st.recentMessages : [];
         /* 同 /api/social/recent：只数内存窗口里"我"发的那几条（现场标记齐全、一定是最新的）。
@@ -5080,7 +5081,7 @@ export function startConsoleServer() {
         if (!key || !messageId) { sendJson({ ok: false, error: 'key 和 messageId 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('getMessageDetail')) { sendJson({ ok: false, error: '工具未启用：qq_get_message_detail' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('getMessageDetail') || companionToolBlock('getMessageDetail', key))) { sendJson({ ok: false, error: companionToolBlock('getMessageDetail', key) || '工具未启用：qq_get_message_detail' }, 403); return; }
         const keyMatch = /^(group|private):(\d+)$/.exec(key);
         if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
         const kind = keyMatch[1];
@@ -5134,7 +5135,7 @@ export function startConsoleServer() {
         if (!key || !messageId) { sendJson({ ok: false, error: 'key 和 messageId 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('getFileContent')) { sendJson({ ok: false, error: '工具未启用：qq_get_file_content' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('getFileContent') || companionToolBlock('getFileContent', key))) { sendJson({ ok: false, error: companionToolBlock('getFileContent', key) || '工具未启用：qq_get_file_content' }, 403); return; }
         const stFile = getSocialState(key);
         const foundFileMsg = (stFile.recentMessages || []).find((m) => m && (String(m.seq) === messageId || (m.messageId && String(m.messageId) === messageId)));
         if (!foundFileMsg) { sendJson({ ok: false, error: '消息不存在（可能是较早的消息，超出了最近记录范围）' }, 404); return; }
@@ -5171,8 +5172,8 @@ export function startConsoleServer() {
           sendJson({ ok: false, error: '当前模式不允许读取该会话' }, 403);
           return;
         }
-        if (!ToolEnabled('getForwardMsg')) {
-          sendJson({ ok: false, error: '工具未启用：qq_get_forward_msg' }, 403);
+        if ((req.headers['x-agent-token'] && companionToolBlock('getForwardMsg', key)) || !ToolEnabled('getForwardMsg')) {
+          sendJson({ ok: false, error: (req.headers['x-agent-token'] && companionToolBlock('getForwardMsg', key)) || '工具未启用：qq_get_forward_msg' }, 403);
           return;
         }
         // 安全边界：只允许读取本会话确实收到过的 forward id，防止 AI 任意探测/跨会话读取
@@ -5245,7 +5246,7 @@ export function startConsoleServer() {
         if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('getForwardMsg')) { sendJson({ ok: false, error: '工具未启用：qq_get_forward_msg' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('getForwardMsg') || companionToolBlock('getForwardMsg', key))) { sendJson({ ok: false, error: companionToolBlock('getForwardMsg', key) || '工具未启用：qq_get_forward_msg' }, 403); return; }
         if (!media.length) { sendJson({ ok: true, key, media: [], images: [] }); return; }
         try {
           const images = await fetchMediaData(media);
@@ -5323,7 +5324,7 @@ export function startConsoleServer() {
         if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('activityHours')) { sendJson({ ok: false, error: '工具未启用：qq_get_activity_hours' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('activityHours') || companionToolBlock('activityHours', key))) { sendJson({ ok: false, error: companionToolBlock('activityHours', key) || '工具未启用：qq_get_activity_hours' }, 403); return; }
         sendJson({ ok: true, key, windows: getActivityWindows(key), inWindow: inActivityWindow(key), nextWindowStart: nextActivityWindowStart(key) });
         return;
       }
@@ -5333,7 +5334,7 @@ export function startConsoleServer() {
         if (!key || !/^(group|private):\d+$/.test(key)) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('activityHours')) { sendJson({ ok: false, error: '工具未启用：qq_set_activity_hours' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('activityHours') || companionToolBlock('activityHours', key))) { sendJson({ ok: false, error: companionToolBlock('activityHours', key) || '工具未启用：qq_set_activity_hours' }, 403); return; }
         const windows = Array.isArray(body.windows) ? body.windows : [];
         const parsed = [];
         for (const w of windows) {
@@ -5410,7 +5411,7 @@ export function startConsoleServer() {
         if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('getActiveMembers')) { sendJson({ ok: false, error: '工具未启用：qq_get_active_members' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('getActiveMembers') || companionToolBlock('getActiveMembers', key))) { sendJson({ ok: false, error: companionToolBlock('getActiveMembers', key) || '工具未启用：qq_get_active_members' }, 403); return; }
         const st = getSocialState(key);
         const map = new Map();
         for (const m of st.recentMessages) {
@@ -5435,7 +5436,7 @@ export function startConsoleServer() {
         if (!key || !key.startsWith('group:')) { sendJson({ ok: false, error: 'key 必须是 group:群号' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('getGroupInfo')) { sendJson({ ok: false, error: '工具未启用：qq_get_group_owner / qq_get_group_members' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('getGroupInfo') || companionToolBlock('getGroupInfo', key))) { sendJson({ ok: false, error: companionToolBlock('getGroupInfo', key) || '工具未启用：qq_get_group_owner / qq_get_group_members' }, 403); return; }
         const g = groupId || key.split(':')[1];
         try {
           const list = await botRef.getGroupMemberList(Number(g));
@@ -5515,7 +5516,7 @@ export function startConsoleServer() {
         if (category === 'memberImpression' && !String(extra.target || '').trim()) { sendJson({ ok: false, error: 'memberImpression 需要 extra.target 指定群友名字' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_append' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('memory') || companionToolBlock('memory', key))) { sendJson({ ok: false, error: companionToolBlock('memory', key) || '工具未启用：qq_memory_append' }, 403); return; }
         const st = getSocialState(key);
         appendMemory(st, category, content, extra);
         sendJson({ ok: true, key, category, content, memory: formatMemory(st) });
@@ -5543,7 +5544,7 @@ export function startConsoleServer() {
         if (category !== 'memberImpression' && !oldContent) { sendJson({ ok: false, error: '该类别需要 oldContent 指定要编辑的记忆内容' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_*' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('memory') || companionToolBlock('memory', key))) { sendJson({ ok: false, error: companionToolBlock('memory', key) || '工具未启用：qq_memory_*' }, 403); return; }
         const st = getSocialState(key);
         if (category === 'activeTopic' && Array.isArray(st.activeTopics)) {
           const idx = st.activeTopics.findIndex((t) => String(t?.text ?? '') === oldContent);
@@ -5580,7 +5581,7 @@ export function startConsoleServer() {
         if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_query' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('memory') || companionToolBlock('memory', key))) { sendJson({ ok: false, error: companionToolBlock('memory', key) || '工具未启用：qq_memory_query' }, 403); return; }
         const st = getSocialState(key);
         const raw = {
           activeTopics: Array.isArray(st.activeTopics) ? st.activeTopics.slice(-20) : [],
@@ -5613,7 +5614,7 @@ export function startConsoleServer() {
         if (category !== 'memberImpression' && !content) { sendJson({ ok: false, error: '该类别需要 content 指定要删除的记忆内容' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_remove' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('memory') || companionToolBlock('memory', key))) { sendJson({ ok: false, error: companionToolBlock('memory', key) || '工具未启用：qq_memory_remove' }, 403); return; }
         const st = getSocialState(key);
         if (category === 'activeTopic' && Array.isArray(st.activeTopics)) {
           st.activeTopics = st.activeTopics.filter((t) => String(t?.text ?? '') !== content);
@@ -5634,7 +5635,7 @@ export function startConsoleServer() {
         if (category && !['activeTopic', 'pendingThought', 'memberImpression'].includes(category)) { sendJson({ ok: false, error: 'category 必须是 activeTopic / pendingThought / memberImpression' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('memory')) { sendJson({ ok: false, error: '工具未启用：qq_memory_clear' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('memory') || companionToolBlock('memory', key))) { sendJson({ ok: false, error: companionToolBlock('memory', key) || '工具未启用：qq_memory_clear' }, 403); return; }
         const st = getSocialState(key);
         if (!category || category === 'activeTopic') st.activeTopics = [];
         if (!category || category === 'pendingThought') st.pendingThoughts = [];
@@ -5650,7 +5651,7 @@ export function startConsoleServer() {
         if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('slangQuery')) { sendJson({ ok: false, error: '工具未启用：qq_slang_query' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('slangQuery') || companionToolBlock('slangQuery', key))) { sendJson({ ok: false, error: companionToolBlock('slangQuery', key) || '工具未启用：qq_slang_query' }, 403); return; }
         const list = confirmedSlangList().filter((e) => {
           if (!q) return true;
           return e.content.toLowerCase().includes(q)
@@ -5676,7 +5677,7 @@ export function startConsoleServer() {
         if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
         if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim; the same value also authorizes cross-session view/actions' }, 403); return; }
         if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-        if (req.headers['x-agent-token'] && !ToolEnabled('slangSubmit')) { sendJson({ ok: false, error: '工具未启用：qq_slang_submit' }, 403); return; }
+        if (req.headers['x-agent-token'] && (!ToolEnabled('slangSubmit') || companionToolBlock('slangSubmit', key))) { sendJson({ ok: false, error: companionToolBlock('slangSubmit', key) || '工具未启用：qq_slang_submit' }, 403); return; }
         if (cfgRef.slang?.enabled === false) { sendJson({ ok: false, error: '黑话学习已关闭（slang.enabled=false）' }, 403); return; }
         if (!content) { sendJson({ ok: false, error: 'content 不能为空' }, 400); return; }
         if (content.length > 50) { sendJson({ ok: false, error: '黑话词条过长（最多 50 字）' }, 400); return; }
@@ -5772,8 +5773,8 @@ export function startConsoleServer() {
           sendJson({ ok: false, error: '当前模式不允许读取该会话' }, 403);
           return;
         }
-        if (agentToken && !ToolEnabled('getImages')) {
-          sendJson({ ok: false, error: '工具未启用：qq_get_message_images' }, 403);
+        if (agentToken && (!ToolEnabled('getImages') || companionToolBlock('getImages', key))) {
+          sendJson({ ok: false, error: (agentToken && companionToolBlock('getImages', key)) || '工具未启用：qq_get_message_images' }, 403);
           return;
         }
         const found = findMessageMedia(key, messageId, { info: true });
@@ -6366,7 +6367,7 @@ export function startConsoleServer() {
           if (!token) { sendJson({ ok: false, error: '语音发送必须携带 agent token' }, 403); return; }
           if (!agentTokenOk(key, token)) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim' }, 403); return; }
           if (!SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (!ToolEnabled('sendVoice')) { sendJson({ ok: false, error: '工具未启用：qq_send_voice' }, 403); return; }
+          if ((req.headers['x-agent-token'] && companionToolBlock('sendVoice', key)) || !ToolEnabled('sendVoice')) { sendJson({ ok: false, error: (req.headers['x-agent-token'] && companionToolBlock('sendVoice', key)) || '工具未启用：qq_send_voice' }, 403); return; }
           const km = /^(group|private):(\d+)$/.exec(key);
           if (!km) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
           const kind = km[1];
@@ -6447,7 +6448,7 @@ export function startConsoleServer() {
           if (!token) { sendJson({ ok: false, error: '语音识别必须携带 agent token' }, 403); return; }
           if (!agentTokenOk(key, token)) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim' }, 403); return; }
           if (!SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
-          if (!ToolEnabled('transcribeVoice')) { sendJson({ ok: false, error: '工具未启用：qq_transcribe_voice' }, 403); return; }
+          if ((req.headers['x-agent-token'] && companionToolBlock('transcribeVoice', key)) || !ToolEnabled('transcribeVoice')) { sendJson({ ok: false, error: (req.headers['x-agent-token'] && companionToolBlock('transcribeVoice', key)) || '工具未启用：qq_transcribe_voice' }, 403); return; }
           if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
           try {
             const { buf } = await voiceMod.fetchVoiceFromMessage(body.messageId);

@@ -19,6 +19,13 @@ export function appendSocialMessage(key, sender, textContent, plainContent, quot
    * 失败绝不影响消息入库，所以整段吞异常。 */
   try { if (userId != null && sender) rememberContactName(userId, sender); } catch { /* 补名字失败不影响主流程 */ }
   const st = getSocialState(key);
+  // 2026-10-26 陪伴模式：对方真发来消息 → 无回应退避解除（awaitingReplySince / 未回应连击清零）
+  if (String(key).startsWith('private:') && st.agentMode === 'companion' && st.companionMode
+    && (Number(st.companionMode.awaitingReplySince) > 0 || Number(st.companionMode.unansweredStreak) > 0)) {
+    st.companionMode.awaitingReplySince = 0;
+    st.companionMode.unansweredStreak = 0;
+    log(`[companion] ${key} 对方回话了，无回应退避解除`);
+  }
   const recentLimit = Number(cfgRef.social?.context?.recentLimit) || 100;
   const unreadLimit = Number(cfgRef.social?.context?.unreadLimit) || 30;
   const safeMedia = Array.isArray(media) ? media.map((m) => ({
@@ -317,6 +324,17 @@ export function recordSentMessages(key, messages) {
     st.proactiveCount = (Number(st.proactiveCount) || 0) + 1;
     log(`[proactive] 私聊配额落账 ${key}: 今日第 ${st.proactiveCount} 次（上限见 social.proactive.privateDailyMax）`);
     st._proactivePending = false;
+  }
+  // 2026-10-26 陪伴模式·主动关心落账（镜像上面 proactive 的预记账→兑现）：真的开口才算一次；
+  // awaitingReplySince 是"无回应退避"的计时起点，对方回话（appendSocialMessage）即清零。
+  if (String(key).startsWith('private:') && st.lastWakeReason === 'companionCare' && st._companionPending === true) {
+    const today = new Date().toLocaleDateString('en-US', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' });
+    const cm = st.companionMode ?? (st.companionMode = {});
+    if (cm.proactiveDay !== today) { cm.proactiveDay = today; cm.proactiveCount = 0; }
+    cm.proactiveCount = (Number(cm.proactiveCount) || 0) + 1;
+    cm.awaitingReplySince = Date.now();
+    st._companionPending = false;
+    log(`[companion] 陪伴主动落账 ${key}: 今日第 ${cm.proactiveCount} 次`);
   }
   for (let i = 0; i < list.length; i++) {
     const item = list[i];
