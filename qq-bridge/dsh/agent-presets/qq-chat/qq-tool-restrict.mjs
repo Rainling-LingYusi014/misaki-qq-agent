@@ -62,6 +62,10 @@ const SAFE_EXACT = new Set([
   //   子代理继承宿主沙箱（workspace-write）与本 preset 的上下文约束。
   'subagent',
   'list_subagent_models',
+  // 【2026-10-26 方案X】沙箱化 bash（全局层挂 dsh-bash-sandbox，escalation 已 patch 禁）：
+  //   执行通道恢复——子代理继承全局工具层获得 bash；主会话可见但按 preset 1h 教学不直接用
+  //   （一切执行走 subagent）。安全边界 = landlock 读白名单（坑13 patch）+ workspace-write 写界。
+  'bash',
   // 【2026-09-28】宿主的 `web_search` **曾经**在这里放行过（那时 preset 的 `tool-web.search` 会被
   //   桥按 ModSearch 的装配结果改写）。同日去掉 ModSearch 后，`lib/dsh-side.js` 的 syncPresetToolWeb
   //   把 `tool-web` 的 `search` 钉成 false（宿主 `web_search` 根本不注册），这一条随之删掉 ——
