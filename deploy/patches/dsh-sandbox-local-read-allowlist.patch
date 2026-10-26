@@ -1,0 +1,27 @@
+--- /home/ubuntu/qq-agent/dsh/node_modules/@deepseek-ai/dsh-sandbox-local/lib/index.js.bak-pre-cred-hardening-20261026	2026-10-26 10:29:20.324945398 +0800
++++ /home/ubuntu/qq-agent/dsh/node_modules/@deepseek-ai/dsh-sandbox-local/lib/index.js	2026-10-26 11:12:14.272261395 +0800
+@@ -45,10 +45,20 @@
+ function landlockProfileArgs(policy) {
+ 	const readWrite = ["/dev/null"];
+ 	if (policy.mode === "workspace-write") readWrite.push("/tmp", policy.workspaceRoot);
+-	return grantArgs({
+-		readOnly: ["/"],
+-		readWrite
+-	});
++	// 2026-10-26 凭据硬化 patch（原版 readOnly: ["/"] = 子代理可读全盘，含 qq-bridge 的 config.json 与 state；
++	// 详见 qq-bridge deploy/安装与接入.md 坑13。升级 DSH 会覆盖本 patch，需重打）。
++	// 读也白名单化：仅运行时依赖（/usr + 散装 /etc 安全文件 + /etc/fonts）。
++	// 刻意排除：/etc 整体（systemd unit 含 cloudflared token）、/proc（同用户进程 environ 互相可读，
++	// bridge env 含 API key）、/home 非 workspace 部分、/var、/root、/opt。
++	const readOnly = [
++		"/usr", "/bin", "/sbin", "/lib", "/lib64",
++		"/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d", "/etc/nsswitch.conf",
++		"/etc/hosts", "/etc/resolv.conf", "/etc/hostname", "/etc/ssl", "/etc/pki",
++		"/etc/protocols", "/etc/services", "/etc/localtime", "/etc/timezone",
++		"/etc/passwd", "/etc/group", "/etc/alternatives", "/etc/python3", "/etc/fonts",
++		"/home/ubuntu/.local/bin/yt-dlp", // yt-dlp 独立二进制（config ytdl.bin 同源）
++	];
++	return grantArgs({ readOnly, readWrite });
+ }
+ /** Quote one path as an SBPL string literal. */
+ function sbplString(path) {

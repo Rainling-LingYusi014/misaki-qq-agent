@@ -1,0 +1,11 @@
+--- /home/ubuntu/qq-agent/dsh/node_modules/@deepseek-ai/dsh-sandbox/lib/index.js.bak-pre-cred-hardening-20261026	2026-10-26 10:52:59.495817406 +0800
++++ /home/ubuntu/qq-agent/dsh/node_modules/@deepseek-ai/dsh-sandbox/lib/index.js	2026-10-26 10:52:59.497817419 +0800
+@@ -39,7 +39,7 @@
+ * mode sits below it (a `danger-full-access` default would advertise nothing
+ * while a narrower-switched session stays confined with no lever).
+ */
+-const ESCALATION_TARGETS = ["workspace-write", "danger-full-access"];
++const ESCALATION_TARGETS = []; // 2026-10-26 凭据硬化：escalation 一刀切禁——QQ桥的 approval 发回当前会话(朋友可自批提权到 danger-full-access)；deny 后 denied 命令无升级提示、升级参数过不了 schema。升级 DSH 需重打，见 deploy 坑13
+ /**
+ * Validate the escalation argument pairing a tool schema cannot express:
+ * `sandbox_permissions` and `justification` travel together — an approval
