@@ -4117,15 +4117,26 @@ export function startConsoleServer() {
         const MAX_SEND_FILE_BYTES = 500 * 1024 * 1024;
         let absPath = '';
         try {
-          const rootResolved = path.resolve(workspaceRoot);
-          absPath = path.resolve(rootResolved, filePath);
-          if (absPath !== rootResolved && !absPath.startsWith(rootResolved + path.sep)) {
-            sendJson({ ok: false, error: `路径越界：只允许发送工作区（${rootResolved}）内的文件` }, 403); return;
+          // 2026-10-26 双根：workspaceRoot 之外加放 state/agents（桥会话的 sessionCwd 默认值）。
+          // 缘由：方案X 后子代理的沙箱写边界 = session cwd（默认 state/agents），而 workspaceRoot 是
+          // 另一个目录 → 「子代理能写的发不出」（lofi 实测踩坑）。config 的 sessionCwd 显式指向
+          // workspaceRoot 后两界合一（新会话），此根保留为旧会话过渡兼容。
+          // path 两种形态都收：绝对路径（须落在某根内）或相对路径（相对该根解析）。
+          const legacyAgentsRoot = path.resolve(STATE_DIR, 'agents');
+          const allowedRoots = [...new Set([path.resolve(workspaceRoot), legacyAgentsRoot])];
+          let matchedRoot = null;
+          absPath = '';
+          for (const r of allowedRoots) {
+            const cand = path.isAbsolute(filePath) ? path.resolve(filePath) : path.resolve(r, filePath);
+            if (cand === r || cand.startsWith(r + path.sep)) { matchedRoot = r; absPath = cand; break; }
           }
-          const realRoot = fs.realpathSync(rootResolved);
-          const real = fs.realpathSync(absPath); // 符号链接在此现形：link 出工作区即拒
+          if (!matchedRoot) {
+            sendJson({ ok: false, error: `路径越界：只允许发送白名单目录（${allowedRoots.join(' 或 ')}）内的文件` }, 403); return;
+          }
+          const realRoot = fs.realpathSync(matchedRoot);
+          const real = fs.realpathSync(absPath); // 符号链接在此现形：link 出白名单即拒
           if (real !== realRoot && !real.startsWith(realRoot + path.sep)) {
-            sendJson({ ok: false, error: '路径越界（符号链接）：只允许工作区内的真实文件' }, 403); return;
+            sendJson({ ok: false, error: '路径越界（符号链接）：只允许白名单目录内的真实文件' }, 403); return;
           }
           absPath = real;
           const stat = fs.statSync(absPath);

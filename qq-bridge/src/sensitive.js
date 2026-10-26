@@ -8,9 +8,13 @@
 //   且后面跟着至少 1 个非空白内容。不再把 /app/、/root/ 一律当敏感：桥接从服务器迁移后
 //   模型向用户汇报时可能提到 /app/napcat、/root/.dsh 等“项目自身部署形态”路径（说明性问题，
 //   非真实本机凭据）；而 /root/.ssh、/root/.aws 这类密钥目录仍会被 credential 形态覆盖。
+//   2026-10-26 同理放行 /home/ubuntu/ 的项目自身三目录（qq-agent / .dsh / .local）：云端部署后
+//   这些就是「项目自身部署形态」路径——lofi 交付实测里她解释「沙箱写边界 vs 发文件白名单」
+//   时提到 /home/ubuntu/qq-agent/... 被拦成半截话，用户视角即「交付不了还说不清」。
+//   /home/ubuntu/ 下的 .ssh/.aws 等仍命中（不在白名单），凭据形态 CRED_RE 独立兜底不受影响。
 // - 凭据要求是“键 + 赋值符(:/=：) + 至少 6 位 ASCII 形态值”；纯中文举例不命中。
 
-const PATH_RE = /(?<![A-Za-z0-9])[A-Za-z]:[\\/](?!\s)[^\s"'<>|，。；、]{2,}|\\\\[^\\s]+\\\\.*?(?<![,\s])|(?<![A-Za-z0-9])(?:\/home\/|\/Users\/|\/etc\/|\/var\/|\/tmp\/|\/opt\/)[^\s"'<>|，。；、]{1,}/;
+const PATH_RE = /(?<![A-Za-z0-9])[A-Za-z]:[\\/](?!\s)[^\s"'<>|，。；、]{2,}|\\\\[^\\s]+\\\\.*?(?<![,\s])|(?<![A-Za-z0-9])(?:\/home\/(?!ubuntu\/(?:qq-agent\/|\.dsh\/|\.local\/))|\/Users\/|\/etc\/|\/var\/|\/tmp\/|\/opt\/)[^\s"'<>|，。；、]{1,}/;
 // 密钥文件形态（不限盘符）：.ssh/、.aws/、.gnupg/、id_rsa/dsa/ecdsa/ed25519、*.pem、credentials、.netrc
 const SECRET_PATH_RE = /(?:\/|\\|^)(?:\.ssh\/|\.aws\/|\.gnupg\/|id_rsa|id_dsa|id_ecdsa|id_ed25519|[\w.-]+\.pem|credentials|\.netrc)(?=[/\\\s"'<>|，。；、]|$)/i;
 const CRED_RE = /(?:token|密码|密钥|口令|password|passwd|secret|api[_-]?key|access[_-]?key|authorization|bearer|credential|私钥)(?:\s*)(?:[:=：])(?:\s*)[A-Za-z0-9_\-./+@]{6,}/i;

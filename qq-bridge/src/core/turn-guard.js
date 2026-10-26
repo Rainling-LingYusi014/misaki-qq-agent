@@ -78,6 +78,7 @@ export function quarantineSession(key, sessionId) {
   toolCallNames.delete(sessionId);
   pendingSendToolCalls.delete(sessionId);
   sendToolSucceededSessions.delete(sessionId);
+  subagentGraceUsed.delete(sessionId);
   if (sessionId && reverse.get(sessionId) === key) reverse.delete(sessionId);
   if (sessionId && state.sessions[key] === sessionId) {
     delete state.sessions[key];
@@ -198,10 +199,23 @@ function clearStaleTurnState(sessionId, key) {
   toolCallNames.delete(sessionId);
   pendingSendToolCalls.delete(sessionId);
   sendToolSucceededSessions.delete(sessionId);
+  subagentGraceUsed.delete(sessionId);
   if (key) {
     activeAiTurns.delete(key);
     pendingTurnOutbound.delete(key);
   }
+}
+
+/* 2026-10-26 方案X：subagent 长任务宽限（见 armTurnWatchdog 内注释）。subagentGraceUsed =
+ * 本回合已用过宽限的 sessionId 集合（一次性；回合收尾时随 clearStaleTurnState 清除）。 */
+const SUBAGENT_GRACE_MS = 15 * 60 * 1000;
+const SUBAGENT_TOTAL_GRACE_MS = 20 * 60 * 1000;
+const subagentGraceUsed = new Set();
+function sessionUsedSubagent(sessionId) {
+  const names = toolCallNames.get(sessionId);
+  if (!names) return false;
+  for (const n of names.values()) if (n === 'subagent') return true;
+  return false;
 }
 
 export function armTurnWatchdog(sessionId, timeoutMs = TURN_TIMEOUT_MS) {
@@ -218,6 +232,16 @@ export function armTurnWatchdog(sessionId, timeoutMs = TURN_TIMEOUT_MS) {
       if (!bridgeWaitingForTurn(wedgedKey)) {
         log(`[default] 回合标记过期清理：${sessionId} 静默超过 ${silentSec}s 但桥未在等该回合（多为 DSH 重连重放的陈旧 turn），仅清理本地状态、不隔离会话`);
         clearStaleTurnState(sessionId, wedgedKey);
+        return;
+      }
+      // 2026-10-26 方案X：本回合派过 subagent（子代理在沙箱里跑 ffmpeg/yt-dlp 等长活）→
+      // 派发之后到结果回来之间主会话零事件，180s 必然误判（lofi 实测 12:36 唤醒 12:39 隔离）。
+      // 给一次性宽限：静默阈值放宽到 15 分钟（subagentGraceUsed 防无限续期；正常子代理
+      // 几十秒~几分钟返回，15 分钟足够，真卡死的 subagent 15 分钟后仍会照常隔离）。
+      if (!subagentGraceUsed.has(sessionId) && sessionUsedSubagent(sessionId)) {
+        subagentGraceUsed.add(sessionId);
+        armTurnWatchdog(sessionId, SUBAGENT_GRACE_MS);
+        log(`[default] 回合静默 ${silentSec}s 但本回合派过 subagent（长任务在跑），静默阈值放宽至 ${SUBAGENT_GRACE_MS / 1000}s（一次性宽限）`);
         return;
       }
       TurnStartAt.delete(sessionId);
@@ -245,6 +269,13 @@ export function armTurnTotalTimer(sessionId) {
         clearStaleTurnState(sessionId, wedgedKey);
         return;
       }
+      // 2026-10-26 方案X：subagent 长任务回合的总时长同样放宽一次（360s 对 ffmpeg/yt-dlp 不够）。
+      if (!subagentGraceUsed.has(sessionId) && sessionUsedSubagent(sessionId)) {
+        subagentGraceUsed.add(sessionId);
+        armTurnTotalTimer2(sessionId, SUBAGENT_TOTAL_GRACE_MS);
+        log(`[default] 回合总时长 ${TURN_TOTAL_TIMEOUT_MS / 1000}s 但本回合派过 subagent（长任务在跑），总时长放宽至 ${SUBAGENT_TOTAL_GRACE_MS / 1000}s（一次性宽限）`);
+        return;
+      }
       TurnStartAt.delete(sessionId);
       collectors.delete(sessionId);
       log(`[default] 回合总时长超限：${sessionId} 超过 ${TURN_TOTAL_TIMEOUT_MS / 1000}s 仍未结束（疑似模型无限重复输出），强制隔离`);
@@ -255,6 +286,31 @@ export function armTurnTotalTimer(sessionId) {
       }
     }
   }, TURN_TOTAL_TIMEOUT_MS));
+  turnTotalTimers.get(sessionId)?.unref?.();
+}
+
+/** 带自定义时长的总时长计时器（subagent 宽限专用；结构同 armTurnTotalTimer 但不再二次宽限）。 */
+function armTurnTotalTimer2(sessionId, timeoutMs) {
+  const old = turnTotalTimers.get(sessionId);
+  if (old) clearTimeout(old);
+  turnTotalTimers.set(sessionId, setTimeout(() => {
+    turnTotalTimers.delete(sessionId);
+    if (TurnStartAt.has(sessionId) || collectors.has(sessionId)) {
+      const wedgedKey = reverse.get(sessionId);
+      if (!bridgeWaitingForTurn(wedgedKey)) {
+        clearStaleTurnState(sessionId, wedgedKey);
+        return;
+      }
+      TurnStartAt.delete(sessionId);
+      collectors.delete(sessionId);
+      log(`[default] 回合总时长超限：${sessionId} subagent 宽限（${timeoutMs / 1000}s）内仍未结束，强制隔离`);
+      quarantineSession(wedgedKey, sessionId);
+      const stT = getSocialState(wedgedKey);
+      if (stT && Array.isArray(stT.unread) && stT.unread.length > 0) {
+        scheduleWake(wedgedKey, 'timeoutRecovery');
+      }
+    }
+  }, timeoutMs));
   turnTotalTimers.get(sessionId)?.unref?.();
 }
 
