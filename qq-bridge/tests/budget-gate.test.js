@@ -62,3 +62,35 @@ test('预算闸门：owner 会话豁免（2026-10-26 主人免上限）', () => 
   const friend = checkTokenBudget('private:111');
   assert.equal(friend.ok, false);
 });
+
+test('预算闸门：非主人全局池剔除 owner 用量（2026-10-28 开放好友）', () => {
+  const dir = tmpStateDir();
+  // meter 是进程级单例，同文件前序测试会在 convDaySums 里留下别的会话键——
+  // 所以这里只用【增量断言】（owner 前后池读数不变），不断言精确值。
+  initTokenMeter({ stateDir: dir, convKeyResolver: (sid) => (String(sid) === 'owner-s1' ? 'private:777' : 'private:555') });
+  setTokenBudgetCfg({ dailyNonOwnerGlobal: 1e12, ownerQQ: 777 });
+  meterTokenFrame({ sessionId: 'friend-s1', type: 'usage', usage: { prompt_tokens: 40, completion_tokens: 20 } });
+  const base = checkTokenBudget('private:555');
+  assert.equal(base.scope, 'non-owner-global');
+  assert.ok(base.used >= 60, '好友用量应计入非主人池（>=60），实际 ' + base.used);
+  const base0 = base.used;
+  // owner 随后烧 5000 → 池读数必须纹丝不动（owner 豁免的不止拦截，还有非主人池的计入）
+  meterTokenFrame({ sessionId: 'owner-s1', type: 'usage', usage: { prompt_tokens: 4000, completion_tokens: 1000 } });
+  const after = checkTokenBudget('private:555');
+  assert.equal(after.used, base0, 'owner 用量不得污染非主人全局池');
+  // 好友再烧 50，把限额压到 (used-1) → 拦；owner 侧依旧豁免
+  meterTokenFrame({ sessionId: 'friend-s2', type: 'usage', usage: { prompt_tokens: 30, completion_tokens: 20 } });
+  setTokenBudgetCfg({ dailyNonOwnerGlobal: after.used + 49, ownerQQ: 777 });
+  assert.equal(checkTokenBudget('private:555').ok, false);
+  assert.equal(checkTokenBudget('private:777').ownerExempt, true);
+});
+
+test('预算闸门：非主人池 + 每会话并存时报告更紧的（2026-10-28）', () => {
+  const dir = tmpStateDir();
+  initTokenMeter({ stateDir: dir, convKeyResolver: () => 'private:222' });
+  setTokenBudgetCfg({ dailyNonOwnerGlobal: 1e12, dailyPerConv: 100, ownerQQ: 777 });
+  meterTokenFrame({ sessionId: 'f1', type: 'usage', usage: { prompt_tokens: 60, completion_tokens: 60 } });
+  const r = checkTokenBudget('private:222');
+  assert.equal(r.ok, false);
+  assert.equal(r.scope, 'conv'); // 120/100(conv) > 池占比（池限额放大到不构成约束）
+});

@@ -1175,6 +1175,7 @@ export function startTokenReconcile(intervalMs = 5 * 60 * 1000) {
  * 配置（config.json social.budget，均可选，缺省=不限额）：
  *   social.budget.dailyGlobal  全局日预算（计费输入+输出 token 数）
  *   social.budget.dailyPerConv 每会话日预算
+ *   social.budget.dailyNonOwnerGlobal 非主人全局日预算（2026-10-28 开放好友：合计剔除 owner 会话）
  * 口径与 getTokenReport 一致：billingKey（默认 UTC 日 / 北京 08:00 换日）。
  * 注意：计费输入 = 未命中prompt + cacheRead + cacheWrite（与 days 聚合的口径一致，
  * 见 addReal 注释），输出 = completion。
@@ -1191,26 +1192,38 @@ export function checkTokenBudget(convKey, opts = {}) {
   }
   const gLimit = Math.max(0, Number(budget.dailyGlobal) || 0);
   const cLimit = Math.max(0, Number(budget.dailyPerConv) || 0);
-  if (!gLimit && !cLimit) return { ok: true, used: 0, limit: 0, scope: null };
+  /* 2026-10-28 开放好友（主人定规"好友这边每天 ≤2 块钱"）：非主人全局池。
+   * 与 dailyGlobal 的区别：合计时把 owner 会话的用量**剔除**——days 全局聚合含主人
+   * （主人只豁免拦截、不豁免计量），直接当池子会被主人自己的消耗污染。 */
+  const noLimit = Math.max(0, Number(budget.dailyNonOwnerGlobal) || 0);
+  if (!gLimit && !cLimit && !noLimit) return { ok: true, used: 0, limit: 0, scope: null };
   const nowTs = opts.nowMs != null ? Number(opts.nowMs) : Date.now();
   const todayKey = billingKey(nowTs);
   const bill = (v) => v ? (v.prompt + v.completion + v.cacheRead + v.cacheWrite) : 0;
-  let used = 0, limit = 0, scope = null;
+  /* 多级都配时：任一超限都拦；报告"占比最紧的那个"。与原两级判据同语义，统一成比较式。 */
+  const cands = [];
   if (gLimit) {
     const agg = meter.days.get(todayKey);
     // days 聚合存的是 prompt/completion/cacheRead/cacheWrite 分项（addReal），与 bill 口径一致
-    used = agg ? (agg.prompt + agg.completion + agg.cacheRead + agg.cacheWrite) : 0;
-    limit = gLimit; scope = 'global';
+    cands.push({ used: agg ? (agg.prompt + agg.completion + agg.cacheRead + agg.cacheWrite) : 0, limit: gLimit, scope: 'global' });
+  }
+  if (noLimit) {
+    let noUsed = 0;
+    const ownerEntry = budget.ownerQQ ? `private:${String(budget.ownerQQ)}｜${todayKey}` : null;
+    for (const [k, v] of meter.convDaySums) {
+      if (!k.endsWith(`｜${todayKey}`) || (ownerEntry && k === ownerEntry)) continue;
+      noUsed += bill(v);
+    }
+    cands.push({ used: noUsed, limit: noLimit, scope: 'non-owner-global' });
   }
   if (cLimit && convKey) {
     const v = meter.convDaySums.get(`${String(convKey)}｜${todayKey}`);
-    const cUsed = bill(v);
-    if (!gLimit || cUsed > used || used <= gLimit) {
-      // 两级都配时：任一超限都拦；报告"更紧的那个"
-      if (!gLimit || cUsed / cLimit >= used / gLimit) { used = cUsed; limit = cLimit; scope = 'conv'; }
-    }
+    cands.push({ used: bill(v), limit: cLimit, scope: 'conv' });
   }
-  return { ok: used < limit, used, limit, scope };
+  let binding = null;
+  for (const c of cands) if (!binding || (c.used / c.limit) > (binding.used / binding.limit)) binding = c;
+  if (!binding) return { ok: true, used: 0, limit: 0, scope: null };
+  return { ok: binding.used < binding.limit, used: Math.round(binding.used), limit: binding.limit, scope: binding.scope };
 }
 
 /** 注入预算配置（bridge main 启动时从 cfg.social.budget 调用；热加载路径可重复调用） */
@@ -1218,8 +1231,15 @@ export function setTokenBudgetCfg(budget) {
   meter.budgetCfg = budget && typeof budget === 'object' ? budget : null;
 }
 
-/** 今日（计费日，默认北京 08:00 换日）全局用量与换日键：misaki@consumption 显示用，
- * 与 checkTokenBudget 的全局分支同口径（prompt+completion+cacheRead+cacheWrite）。 */
+/** 当前生效的计费日偏移（分钟）：480=北京 08:00 换日，0=北京自然日。
+ * 2026-10-27 主人定规：部署配置 dayOffsetMinutes=0（tokens 额度与生图统一每日北京 00:00 重置）；
+ * 管理端页脚等展示面用它动态渲染换日时刻，避免配置改了文案说谎。 */
+export function currentDayOffsetMin() {
+  return meter.dayOffsetMin;
+}
+
+/** 今日（计费日，由 config dayOffsetMinutes 定换日时刻；本部署=北京自然日 00:00）全局用量与换日键：
+ * misaki@credits 显示用，与 checkTokenBudget 的全局分支同口径（prompt+completion+cacheRead+cacheWrite）。 */
 export function todayBillingUsage() {
   ensureInit();
   const key = billingKey(Date.now());

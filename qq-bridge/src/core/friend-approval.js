@@ -51,7 +51,8 @@ function notice(type, info) {
   }
 }
 
-/** 同 user_id 去重：重复申请保留最新 flag，旧条目与 timer 一并作废。 */
+/** 同 user_id 去重：重复申请保留最新 flag，旧条目与 timer 一并作废。
+ *  手动模式（entry.manual=true）不挂 timer——审批动作在 owner 的 QQ 里，桥只记账。 */
 function upsertRequest(entry) {
   const idx = pendingRequests.findIndex((r) => r && r.userId === entry.userId);
   if (idx >= 0) {
@@ -62,10 +63,11 @@ function upsertRequest(entry) {
   }
   pendingRequests.push(entry);
   saveFriendRequests();
-  armTimer(entry);
+  if (!entry.manual) armTimer(entry);
 }
 
 function armTimer(entry) {
+  if (entry.manual) return; /* 手动模式：桥绝不代批（重启恢复路径也走这里，一并防住） */
   const t = setTimeout(() => {
     timers.delete(entry.userId);
     void approveEntry(entry);
@@ -139,7 +141,15 @@ export async function handleFriendRequest(event) {
     notice('instant', { uid, comment });
     return;
   }
-  // ③ 其余：随机延迟审批
+  // ③ 其余：延迟审批（默认）或手动审批（2026-10-28 主人定规"审批由我亲自来搞"：
+  //     autoApprove=false → 桥不代批，只通报 owner 等她在 QQ 里亲自处理 + 手动加白名单）
+  if (!fc.autoApprove) {
+    const nickname = await fetchNicknameBestEffort(uid);
+    upsertRequest({ userId: uid, flag, comment, nickname, at: 0, tries: 0, createdAt: Date.now(), manual: true });
+    log(`[friend] 好友申请进入手动审批 ${uid}（${nickname || '昵称未知'}）——桥不代批，等 owner 处理`);
+    notice('manual', { uid, nickname, comment });
+    return;
+  }
   const delayMs = pickApprovalDelayMs(fc.minDelayMs, fc.maxDelayMs);
   const at = Date.now() + delayMs;
   const nickname = await fetchNicknameBestEffort(uid);
@@ -158,7 +168,7 @@ export function loadFriendRequests() {
   for (let i = pendingRequests.length - 1; i >= 0; i -= 1) {
     const r = pendingRequests[i];
     if (!r || !r.flag || r.userId == null) { pendingRequests.splice(i, 1); repaired += 1; continue; }
-    if (Number(r.at) <= now) { r.at = now + 5000 + Math.floor(Math.random() * 25000); r.tries = 0; repaired += 1; }
+    if (!r.manual && Number(r.at) <= now) { r.at = now + 5000 + Math.floor(Math.random() * 25000); r.tries = 0; repaired += 1; }
   }
   for (const r of pendingRequests) armTimer(r);
   saveFriendRequests();

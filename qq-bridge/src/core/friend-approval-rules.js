@@ -7,7 +7,10 @@ export const FRIEND_APPROVAL_DEFAULTS = Object.freeze({
   enabled: true,       // false = 回退旧的"秒过"逻辑（bridge.js legacyAutoApprove）
   minDelayMs: 600000,  // 10 分钟：最短晾多久
   maxDelayMs: 21600000, // 6 小时：最长晾多久（QQ 好友申请 flag 平台侧有效期以天计，6h 安全）
-  notifyOwner: true    // false = 只写日志，不注入伪消息、不唤醒 owner 会话
+  notifyOwner: true,   // false = 只写日志，不注入伪消息、不唤醒 owner 会话
+  // 2026-10-28 开放好友（主人定规"审批由我亲自来搞"）：false = 手动模式——非黑/白名单的申请
+  // 不再定时自动通过，只通报 owner 等她在 QQ 里亲自批。黑名单秒拒、白名单秒过不受影响。
+  autoApprove: true
 });
 
 const clampInt = (v, lo, hi) => {
@@ -27,6 +30,7 @@ export function friendApprovalCfg(rawSocial) {
   const out = {
     enabled: raw.enabled === false ? false : FRIEND_APPROVAL_DEFAULTS.enabled,
     notifyOwner: raw.notifyOwner === false ? false : FRIEND_APPROVAL_DEFAULTS.notifyOwner,
+    autoApprove: raw.autoApprove === false ? false : FRIEND_APPROVAL_DEFAULTS.autoApprove,
     minDelayMs: FRIEND_APPROVAL_DEFAULTS.minDelayMs,
     maxDelayMs: FRIEND_APPROVAL_DEFAULTS.maxDelayMs
   };
@@ -99,6 +103,9 @@ export function buildFriendNoticeText(type, { uid = '', nickname = '', comment =
   switch (type) {
     case 'received':
       text = `[好友申请] 有人加你好友：${nameOf(nickname, uid)}。${commentOf(comment)}我打算过一会儿再处理，先看看情况（预计 ${fmtHHmm(at)} 前后处理）`;
+      break;
+    case 'manual':
+      text = `[好友申请] 有人加你好友：${nameOf(nickname, uid)}。${commentOf(comment)}这条交给你亲自处理——你在 QQ 里通过后，记得把 ta 的 QQ 号加进私聊白名单，不然 ta 的消息进不来。`;
       break;
     case 'instant':
       text = `[好友申请] ${nameOf(nickname, uid)} 加你好友，是我认识的人，直接通过了。${commentOf(comment)}`;
