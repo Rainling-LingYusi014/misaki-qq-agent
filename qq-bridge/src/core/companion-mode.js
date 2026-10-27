@@ -42,31 +42,36 @@ const PASSTHROUGH_DEFAULT = ['ling014.com'];
 export const ACTIONS = [
   { token: 'help', kind: 'action-help', label: '查看指令列表与用法' },
   { token: 'stop', kind: 'action-stop', label: '停止当前任务' },
-  { token: 'reset', kind: 'action-reset', label: '清空所有过往认知' },
   { token: 'credits', kind: 'action-credits', label: '查询今日额度用量' },
+  { token: 'reset', kind: 'action-reset', label: '清空所有过往认知' },
   // 2026-10-28（审查 P1-3 修复）：声音复刻的用户侧授权闸——用户本人发过这条才算授权，
   // 模型传的 consent=true 只是转述。执行在 mux.js（记账落 state/voice-consent.json）。
   { token: '确认授权', kind: 'action-voice-consent', label: '开通声音复刻授权（建音色前发一次）' },
 ];
 
-/** misaki@help：指令一览（注册表自动生成，加新模式/动作自动出现）+ 用法规范（只讲规范，不举例）。
- * 2026-10-27 主人定版版式：help 置顶；模式指令行按 currentModeId 标（当前）；无（默认）标记。
- * currentModeId 省略时（纯函数直调/测试）不标（当前）。 */
+/** misaki@help：指令一览（注册表自动生成，加新模式/动作自动出现）+ 用法规范。
+ * 2026-10-28 主人定版版式：竖线分隔；确认授权是引导性动作不进 help（模型按需告知）；
+ * 用法固定四行；模式指令行按 currentModeId 标（当前），省略时不标。 */
 export function helpText(currentModeId = null) {
-  const lines = ['目前的全部指令：'];
+  const lines = ['当前全部指令：'];
   const help = ACTIONS.find((a) => a.kind === 'action-help');
-  if (help) lines.push(`misaki@${help.token} —— ${help.label}`);
+  if (help) lines.push(`misaki@${help.token} | ${help.label}`);
   for (const m of MODES) {
     if (!m.cmd) continue;
     const cur = currentModeId && m.id === String(currentModeId) ? '（当前）' : '';
-    const beta = m.beta ? '（内测中，暂不开放）' : '';
-    lines.push(`misaki@${m.cmd} —— 切换到${m.label}${beta}${cur}`);
+    const beta = m.beta ? '（内测中暂不开放）' : '';
+    lines.push(`misaki@${m.cmd} | 切换到${m.label}${beta}${cur}`);
   }
   for (const a of ACTIONS) {
-    if (a.kind === 'action-help') continue;
-    lines.push(`misaki@${a.token} —— ${a.label}`);
+    if (a.kind === 'action-help' || a.kind === 'action-voice-consent') continue;
+    lines.push(`misaki@${a.token} | ${a.label}`);
   }
-  lines.push('用法：指令以 misaki@ 开头、独占一条完整消息（后面不能再跟别的内容）；忽略大小写，连续空格视为一个；结尾多打的标点会自动忽略；指令在句中提到时不算指令，按普通聊天处理；指令只在私聊生效，任何模式下都可用；打错会收到提醒，可发 misaki@help 查询全部指令；reset 不可逆，且必须一字不差（结尾带标点不会触发），发之前想清楚。');
+  lines.push('');
+  lines.push('用法：');
+  lines.push('所有指令必须单独一条气泡发出，且以 misaki@ 开头；');
+  lines.push('指令只在私聊生效，任何模式下都可用；');
+  lines.push('打错会收到提醒，可通过 misaki@help 查询全部指令；');
+  lines.push('reset指令为清空玲結美咲对你的全部认知，该指令不可逆，请谨慎使用。');
   return lines.join('\n');
 }
 
@@ -108,6 +113,9 @@ export function parseMisakiCommand(rawText, cfgRef = null) {
   }
   // 结尾标点容错：先按原文精确匹配（reset 只走这条路），再把尾部标点剥掉匹配普通指令。
   const bodyStripped = body.replace(/[.,!?;:~、。，！？；：…～]+$/u, '');
+  /* 2026-10-28 主人定规：非单独一条气泡 = 被提及——misaki@ 后还跟了别的内容（剥掉结尾标点后
+   * 仍含空白或内部分隔符）时，不当指令也不报打错，按普通聊天放行（模型自然看到这句提及）。 */
+  if (!bodyStripped || /[\s,，.。!！?？;；:：、…～"'（）()【】\[\]]/.test(bodyStripped)) return null;
   for (const m of MODES) {
     if (!m.cmd) continue;
     if (body === m.cmd || bodyStripped === m.cmd) return { kind: 'mode-switch', mode: m.id };
