@@ -153,6 +153,14 @@ console.log('== ⑤ 采样率降级 ==');
   ok('授权指令结尾标点容错', cmd2?.kind === 'action-voice-consent');
   const cmd3 = parseMisakiCommand('misaki@credits', null);
   ok('既有指令不受影响', cmd3?.kind === 'action-credits');
+  /* 2026-10-28 二改：confirm 进 help 列表且在 reset 上方（主人指示） */
+  const { helpText } = await import('../src/core/companion-mode.js');
+  const help = helpText(null);
+  const iConfirm = help.indexOf('misaki@confirm | ');
+  const iReset = help.indexOf('misaki@reset | ');
+  ok('help 列出 confirm', iConfirm > 0, help);
+  ok('confirm 排在 reset 上方', iConfirm > 0 && iReset > iConfirm, help);
+  ok('help 仍置顶 help 行', help.indexOf('misaki@help | ') > -1 && help.indexOf('misaki@help | ') < help.indexOf('misaki@confirm | '));
   try { fsMod.rmSync(tmp, { force: true }); } catch { /* ignore */ }
 }
 

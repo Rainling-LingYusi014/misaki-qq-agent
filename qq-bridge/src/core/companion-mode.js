@@ -43,15 +43,16 @@ export const ACTIONS = [
   { token: 'help', kind: 'action-help', label: '查看指令列表与用法' },
   { token: 'stop', kind: 'action-stop', label: '停止当前任务' },
   { token: 'credits', kind: 'action-credits', label: '查询今日额度用量' },
-  { token: 'reset', kind: 'action-reset', label: '清空所有过往认知' },
   // 2026-10-28（审查 P1-3 修复）：声音复刻的用户侧授权闸——用户本人发过这条才算授权，
   // 模型传的 consent=true 只是转述。执行在 mux.js（记账落 state/voice-consent.json）。
+  // 2026-10-28 二改：主人指示 confirm 进 help 列表且排在 reset 上方（数组顺序即显示顺序）。
   { token: 'confirm', kind: 'action-voice-consent', label: '开通声音复刻授权（建音色前发一次）' },
+  { token: 'reset', kind: 'action-reset', label: '清空所有过往认知' },
 ];
 
 /** misaki@help：指令一览（注册表自动生成，加新模式/动作自动出现）+ 用法规范。
- * 2026-10-28 主人定版版式：竖线分隔；确认授权是引导性动作不进 help（模型按需告知）；
- * 用法固定四行；模式指令行按 currentModeId 标（当前），省略时不标。 */
+ * 2026-10-28 主人定版版式：竖线分隔；用法固定四行；模式指令行按 currentModeId 标（当前），省略时不标。
+ * 2026-10-28 二改：confirm（声音复刻授权）进列表，排在 reset 上方（主人指示）。 */
 export function helpText(currentModeId = null) {
   const lines = ['当前全部指令：'];
   const help = ACTIONS.find((a) => a.kind === 'action-help');
@@ -63,7 +64,7 @@ export function helpText(currentModeId = null) {
     lines.push(`misaki@${m.cmd} | 切换到${m.label}${beta}${cur}`);
   }
   for (const a of ACTIONS) {
-    if (a.kind === 'action-help' || a.kind === 'action-voice-consent') continue;
+    if (a.kind === 'action-help') continue; /* help 已置顶，不重复 */
     lines.push(`misaki@${a.token} | ${a.label}`);
   }
   lines.push('');
