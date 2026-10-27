@@ -124,6 +124,10 @@ export function parseMisakiCommand(rawText, cfgRef = null) {
     if (a.kind === 'action-reset') { if (body === a.token) return { kind: a.kind, action: a.token }; continue; }
     if (body === a.token || bodyStripped === a.token) return { kind: a.kind, action: a.token };
   }
+  /* 2026-10-28 补充（主人实测 misaki@help是做什么的）：已知指令后直接粘着别的内容（无分隔符）
+   * 同样是"问指令本身"的被提及情形 → 放行普通聊天；只有完全不认识的单词才按打错提醒。 */
+  const knownTokens = [...MODES.filter((m) => m.cmd).map((m) => m.cmd), ...ACTIONS.map((a) => a.token)];
+  if (knownTokens.some((tk) => bodyStripped.startsWith(tk))) return null;
   return { kind: 'unknown', token: body.slice(0, 40) };
 }
 
