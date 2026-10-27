@@ -202,7 +202,8 @@
       "textTool": true,
       "pdfTool": true,
       "qrcode": true,
-      "help": true
+      "help": true,
+      "biliDashboard": true
     },
     "wake": {
       "defaultMode": "active",

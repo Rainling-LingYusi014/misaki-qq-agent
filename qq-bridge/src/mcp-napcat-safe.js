@@ -19,6 +19,7 @@ import { SENSITIVE_RE } from './sensitive.js';
 import { napcatImageFileArg } from './lib/napcat-file.js';
 import { BILI_AUTH_FILE, BILI_CIRCUIT_FILE, biliJson, checkIsLogin, circuitOpen, circuitState, wbiSign } from './lib/bili-api.js';
 import { loadActions, saveActions, followUser, searchBiliUsers, sendVideoCard } from './lib/bili-social.js';
+import { dashboardSummary } from './lib/bili-dashboard.js';
 // 2026-09-18：联网找图：图片搜索引擎（Bing/百度）+ SSRF 安全下载。
 // 两者都是纯函数模块，直接 import；下载复用 safe-fetch（禁内网、限字节、校验真是图片）。
 import { searchImages } from './lib/image-search.js';
@@ -784,6 +785,7 @@ const TOOL_CONFIG_SWITCHES = {
   qq_pdf_tool: 'pdfTool',
   qq_qrcode: 'qrcode',
   qq_help: 'help',
+  bili_dashboard: 'biliDashboard',
 };
 
 function registerTool(name, ...rest) {
@@ -4291,6 +4293,38 @@ if (cfg.social?.tools?.biliSearch !== false) {
         return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] };
       } catch (error) {
         return { content: [{ type: 'text', text: `bili_search 失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  /* 2026-10-28 bili_dashboard（主人拍板的「数据面板」）：创作中心只读——自己稿件的
+   * 播放/点赞/投币/收藏/分享/评论/弹幕 + 粉丝数 + 审核状态（M4 挂账的审核跟踪也在这里闭环）。
+   * 只读 GET 不花钱（不限次数），桥侧频控只防刷；协议在 lib/bili-dashboard.js。 */
+  const biliDashHits = [];
+  registerTool(
+    'bili_dashboard',
+    'Read-ONLY creator-center dashboard for YOUR OWN Bilibili account (the account this bridge runs): per-video view / like / coin / favorite / share / comment / danmaku counts for your recent uploads, total fan count, and the audit status of each video (审核中 / 被打回 / 已公开). Use it when the user asks about your channel data (播放量/粉丝数/数据面板/审核过了没) - always answer from these REAL numbers, never invent or round them up; the "sum" covers only the newest page (fetch count is in the result), say so honestly. Present in YOUR OWN words (one short paragraph); never paste raw JSON. Read-only, free, no quota - but do not spam it (rate-limited).',
+    {
+      pageSize: z.number().int().min(1).max(50).optional().describe('How many most-recent videos to pull (default 20, max 50)')
+    },
+    async ({ pageSize }) => {
+      const nowMs = Date.now();
+      while (biliDashHits.length && nowMs - biliDashHits[0] > 60 * 1000) biliDashHits.shift();
+      if (biliDashHits.length >= 3) return { content: [{ type: 'text', text: '数据面板查得有点频繁，等一分钟再试。' }], isError: true };
+      if (circuitOpen(BILI_CIRCUIT_FILE)) {
+        const c = circuitState(BILI_CIRCUIT_FILE);
+        return { content: [{ type: 'text', text: `B站接口临时受限（${c.scope || 'bili'}），暂时查不了面板，稍后再试。` }], isError: true };
+      }
+      biliDashHits.push(nowMs);
+      try {
+        const out = await dashboardSummary({ pageSize: Math.max(1, Math.min(50, Number(pageSize) || 20)) });
+        if (!out.ok) return { content: [{ type: 'text', text: `数据面板读取失败：${out.why ?? '未知错误'}` }], isError: true };
+        return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] };
+      } catch (error) {
+        const m = String(error?.message ?? error);
+        if (m.includes('登录失效')) return { content: [{ type: 'text', text: `B站登录已过期：请管理员重新续期（${m}）` }], isError: true };
+        if (m.includes('风控码')) return { content: [{ type: 'text', text: 'B站接口暂时受限（风控），稍后再试。' }], isError: true };
+        return { content: [{ type: 'text', text: `bili_dashboard 失败：${m}` }], isError: true };
       }
     }
   );

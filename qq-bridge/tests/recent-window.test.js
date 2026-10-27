@@ -42,6 +42,7 @@ fs.writeFileSync(path.join(sandbox, 'package.json'), JSON.stringify({ name: 'qbh
 const cfg = {
   ownerQQ: '1736784911',
   consolePort: port,
+  consoleToken: '0f1e2d3c4b5a69788796a5b4c3d2e1f0', /* 2026-10-28：外层 consoleToken 闸已是 fail-closed，测试必须带头 */
   napcat: { httpUrl: 'http://127.0.0.1:1', accessToken: '' },
   dsh: { baseUrl: 'http://127.0.0.1:1' },
   allow: {}, deny: {}, allowAllWhenEmpty: true,
@@ -90,7 +91,9 @@ st.recentMessages = [
 
 const server = consoleMod.startConsoleServer();
 const get = async (p, tok) => {
-  const res = await fetch(`http://127.0.0.1:${port}${p}`, tok ? { headers: { 'x-agent-token': tok } } : undefined);
+  const res = await fetch(`http://127.0.0.1:${port}${p}`, {
+    headers: { 'x-console-token': cfg.consoleToken, ...(tok ? { 'x-agent-token': tok } : {}) },
+  });
   const raw = await res.text();
   let body = null; try { body = JSON.parse(raw); } catch { body = raw; }
   return { status: res.status, body, raw };

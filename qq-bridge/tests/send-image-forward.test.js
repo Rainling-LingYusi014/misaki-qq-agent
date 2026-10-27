@@ -84,7 +84,8 @@ ok('纯文字引用的格式一字不变', quotedText.includes('[引用 某某�
 
 console.log('== ④ qq_send_image 的参数声明的确是这四条来源 + 跨会话标志 ==');
 const mcpSrc = fs.readFileSync(path.join(process.cwd(), 'src', 'mcp-napcat-safe.js'), 'utf8');
-const block = mcpSrc.slice(mcpSrc.indexOf("registerTool(\n    'qq_send_image'"), mcpSrc.indexOf("registerTool(\n    'qq_send_pixiv'"));
+/* 2026-10-28：锚工具名而不是 registerTool( 调用行——注册块的缩进会随外层条件包裹漂移，名字不会 */
+const block = mcpSrc.slice(mcpSrc.indexOf("'qq_send_image',"), mcpSrc.indexOf("'qq_send_pixiv',"));
 ok('schema 声明 file', /\bfile: z\.string\(\)/.test(block));
 ok('schema 声明 messageId', /\bmessageId: z\.union\(\[z\.number\(\), z\.string\(\)\]\)/.test(block));
 ok('schema 声明 imageIndex', /\bimageIndex: z\.number\(\)/.test(block));
