@@ -22,7 +22,9 @@ export const MODES = [
   // id 保持原值（'regular' 等），存量 conversationMode 状态无需迁移。
   { id: 'regular', label: '常规模式', cmd: 'standard', default: true },
   { id: 'companion', label: '陪伴模式', cmd: 'companion' },
-  { id: 'interactive', label: '交互模式', cmd: 'interactive' },
+  // 2026-10-28 主人拍板：交互模式还在内测，暂不开放——beta=true 时切换指令一律回内测提示、不切状态
+  // （方案见《交互模式设计方案_20261027.md》，开放时把 beta 去掉即可）。
+  { id: 'interactive', label: '交互模式', cmd: 'interactive', beta: true },
 ];
 export function modeLabel(modeId) {
   const m = MODES.find((x) => x.id === String(modeId));
@@ -57,7 +59,8 @@ export function helpText(currentModeId = null) {
   for (const m of MODES) {
     if (!m.cmd) continue;
     const cur = currentModeId && m.id === String(currentModeId) ? '（当前）' : '';
-    lines.push(`misaki@${m.cmd} —— 切换到${m.label}${cur}`);
+    const beta = m.beta ? '（内测中，暂不开放）' : '';
+    lines.push(`misaki@${m.cmd} —— 切换到${m.label}${beta}${cur}`);
   }
   for (const a of ACTIONS) {
     if (a.kind === 'action-help') continue;
@@ -197,6 +200,10 @@ export function enterModeText(modeId) {
 }
 export function alreadyInModeText(modeId) {
   return `当前已处于${modeLabel(modeId)}。`;
+}
+/** 2026-10-28 主人拍板：beta 模式（interactive）的切换一律回这句，不切状态。 */
+export function modeBetaText(modeId) {
+  return `${modeLabel(modeId)}还在内测中，暂时不开放～先用着常规模式和陪伴模式吧。`;
 }
 // misaki@stop：桥层即时回执；「已经被停止」的另行说明由下一条 [Stopped] 唤醒注入完成（见 stopNoteLine）。
 export const STOP_ACK_TEXT = '好，停了。';

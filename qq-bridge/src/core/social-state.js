@@ -18,7 +18,7 @@ import { typingHoldDecision, typingHoldText, STEER_IN_TURN_DEFER_MAX_MS } from '
 import {
   DEFAULT_MODE, MODES, modeLabel, companionCfg, inCompanionQuietHours,
   companionTypingDecisionCfg, companionToolRefusal,
-  enterModeText, alreadyInModeText, unknownCommandText,
+  enterModeText, alreadyInModeText, unknownCommandText, modeBetaText,
 } from './companion-mode.js';
 import { isDirectedAtAi } from '../lib/social-timeline.js';
 import { looksLikeUnfinished } from '../wait.js';
@@ -921,6 +921,9 @@ export function setConversationMode(key, modeId) {
 export function applyMisakiCommand(key, cmd) {
   if (!cmd || typeof cmd !== 'object') return null;
   if (cmd.kind === 'mode-switch') {
+    /* 2026-10-28 主人拍板：beta 模式（interactive）内测中——切换指令一律回内测提示，不切状态。 */
+    const targetMode = MODES.find((m) => m.id === cmd.mode);
+    if (targetMode?.beta) return modeBetaText(cmd.mode);
     if (conversationMode(key) === cmd.mode) return alreadyInModeText(cmd.mode);
     const from = modeLabel(conversationMode(key));
     setConversationMode(key, cmd.mode);
