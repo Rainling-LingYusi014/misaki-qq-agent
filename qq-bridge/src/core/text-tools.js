@@ -162,10 +162,13 @@ function sortKeysDeep(v) {
 const fresh = () => ({ count: 0 });
 function textCfg(cfg) {
   const c = cfg?.text ?? {};
+  const jobs = Number(c.userDailyJobs);
+  const gjobs = Number(c.globalDailyJobs);
   return {
     enabled: c.enabled !== false,
-    userDailyJobs: Math.max(1, Number(c.userDailyJobs) || 50),
-    globalDailyJobs: Math.max(0, Number(c.globalDailyJobs) || 500),
+    /* 2026-10-28 额度定稿：文本/JSON 是本地免费算力 → 不限次数。0 = 不限（缺省也是 0）。 */
+    userDailyJobs: Number.isFinite(jobs) ? Math.max(0, jobs) : 0,
+    globalDailyJobs: Number.isFinite(gjobs) ? Math.max(0, gjobs) : 0,
     maxInputChars: Math.max(1000, Number(c.maxInputChars) || 1000000),
   };
 }
@@ -186,7 +189,7 @@ function checkQuota(cfg, uid, isOwner) {
   if (!c.enabled) throw new Error('文本工具未启用（config.json 的 text.enabled）');
   const { u, per } = loadUsage(uid);
   if (isOwner) return { u, c, per };
-  if (per.count >= c.userDailyJobs) throw new Error(`今天 ${c.userDailyJobs} 次文本处理已经用完，明天 0 点（北京时）恢复`);
+  if (c.userDailyJobs > 0 && per.count >= c.userDailyJobs) throw new Error(`今天 ${c.userDailyJobs} 次文本处理已经用完，明天 0 点（北京时）恢复`);
   if (c.globalDailyJobs > 0 && u.global.count >= c.globalDailyJobs) throw new Error('今天全站文本处理次数已满，请明天再试');
   return { u, c, per };
 }
@@ -227,6 +230,7 @@ export async function runTextTool({ cfg, op, text, uid, isOwner, options } = {})
     outPath = path.join(OUT_DIR, fileName);
   }
   fs.writeFileSync(outPath, result, 'utf8');
-  log(`[text] ${theOp} 完成：${fileName} ${(result.length / 1000).toFixed(1)}k 字符 uid=${requester} owner=${isOwner === true} 剩余=${isOwner ? '不限' : Math.max(0, (textCfg(cfg).userDailyJobs) - per.count)}`);
+  const jobsCap = textCfg(cfg).userDailyJobs;
+  log(`[text] ${theOp} 完成：${fileName} ${(result.length / 1000).toFixed(1)}k 字符 uid=${requester} owner=${isOwner === true} 剩余=${isOwner || jobsCap === 0 ? '不限' : Math.max(0, jobsCap - per.count)}`);
   return { ok: true, inline: false, op: theOp, filePath: outPath, fileName, chars: result.length, ms: Date.now() - started };
 }

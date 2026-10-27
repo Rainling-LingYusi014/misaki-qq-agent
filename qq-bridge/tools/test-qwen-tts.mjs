@@ -132,4 +132,28 @@ console.log('== ⑤ 采样率降级 ==');
   ok('44100 被拒后降级 24000', r.sampleRate === 24000 && n === 2, `rate=${r.sampleRate} n=${n}`);
 }
 
+// ── 用户侧授权状态（2026-10-28，审查 P1-3 修复）────────────────────────────
+{
+  const { hasVoiceConsent, markVoiceConsent } = await import('../src/core/tts-delivery.js');
+  const { parseMisakiCommand } = await import('../src/core/companion-mode.js');
+  const os = await import('node:os');
+  const pathMod = await import('node:path');
+  const fsMod = await import('node:fs');
+  const tmp = pathMod.join(os.tmpdir(), `voice-consent-test-${process.pid}.json`);
+  try { fsMod.rmSync(tmp, { force: true }); } catch { /* ignore */ }
+  ok('未授权时 hasVoiceConsent=false', hasVoiceConsent('10002', tmp) === false);
+  markVoiceConsent('10002', 'private:10002', tmp);
+  ok('markVoiceConsent 后 hasVoiceConsent=true', hasVoiceConsent('10002', tmp) === true);
+  ok('其他 uid 仍为未授权', hasVoiceConsent('10003', tmp) === false);
+  markVoiceConsent('10002', 'private:10002', tmp);
+  ok('重复授权幂等', hasVoiceConsent('10002', tmp) === true);
+  const cmd = parseMisakiCommand('misaki@确认授权', null);
+  ok('misaki@确认授权 解析为授权动作', cmd?.kind === 'action-voice-consent', JSON.stringify(cmd));
+  const cmd2 = parseMisakiCommand('misaki@确认授权。', null);
+  ok('授权指令结尾标点容错', cmd2?.kind === 'action-voice-consent');
+  const cmd3 = parseMisakiCommand('misaki@credits', null);
+  ok('既有指令不受影响', cmd3?.kind === 'action-credits');
+  try { fsMod.rmSync(tmp, { force: true }); } catch { /* ignore */ }
+}
+
 console.log(`\n${pass} passed${process.exitCode ? '，有失败' : ''}`);

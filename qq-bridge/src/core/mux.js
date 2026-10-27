@@ -84,7 +84,7 @@ import {
 } from './sticker.js';
 import { resolveNameToUid, forgetPersonCognition } from './memory.js';
 import { markMessagesRead } from './memory.js';
-// misaki@reset -1 的聊天存档清除（该会话全部消息 + FTS 重建）
+// misaki@reset 的聊天存档清除（该会话全部消息 + FTS 重建）
 import { clearChatHistory, rebuildChatFts } from './chat-db.js';
 /* 2026-09-21 需求：/token 自动发出今日 token 总量与花费（口径与管理端实测区一致）。 */
 import { buildTokenReportText } from './token-report.js';
@@ -191,10 +191,11 @@ import {
   scheduleReplyCheck, buildWakeReminderPrompt,
   clearSocialTimers, clearAllSocialTimers, resetConversationKeepingLedger,
   applyMisakiCommand, setStopNote, setResetExecutor, armPendingReset, cancelPendingReset,
+  conversationMode,
 } from './social-state.js';
 // misaki@ 指令解析（纯函数，见 companion-mode.js）
 import { parseMisakiCommand, STOP_ACK_TEXT, NOTHING_TO_STOP_TEXT, RESET_DONE_TEXT, fmtWanTokens, helpText } from './companion-mode.js';
-// misaki@consumption 额度查询：与限额闸同一函数/同一口径（token-meter.js）
+// misaki@credits 额度查询：与限额闸同一函数/同一口径（token-meter.js）
 import { checkTokenBudget, todayBillingUsage } from './token-meter.js';
 import {
   loadScheduledTasks, parseScheduledAt, createScheduledTask, cancelScheduledTask, setScheduledRecorder,
@@ -269,7 +270,7 @@ import { clearInboxMarks } from './inbox-marks.js';
 let cfgRef = null;
 export function initMuxCore(cfg) {
   cfgRef = cfg;
-  // misaki@reset -1 锁定期到点执行器（social-state 的定时器回调；boot 恢复在 loadSocialState 末尾 rearm）
+  // misaki@reset 锁定期到点执行器（social-state 的定时器回调；boot 恢复在 loadSocialState 末尾 rearm）
   setResetExecutor(executeMisakiResetNow);
 }
 let apiRef = null;
@@ -308,8 +309,8 @@ function isDuplicateInbound(key, messageId) {
   return false;
 }
 
-  // ── misaki@stop / misaki@reset -1（2026-10-26）：一次性动作指令，桥层硬拦截、零 token。──
-  // 会话级全套卸载：提取自原 /reset 内联块，owner 的 /reset 与 misaki@reset -1 共用这一份实现。
+  // ── misaki@stop / misaki@reset（2026-10-26）：一次性动作指令，桥层硬拦截、零 token。──
+  // 会话级全套卸载：提取自原 /reset 内联块，owner 的 /reset 与 misaki@reset 共用这一份实现。
   // 返回 true = 存在 DSH 会话映射并已卸载；false = 本来就没有会话（misaki@reset 仍会做认知清除）。
   async function hardResetConversation(key) {
     const old = state.sessions[key];
@@ -365,7 +366,7 @@ function isDuplicateInbound(key, messageId) {
   // 被隔离会话（及其 subagent）在 DSH 服务端照样跑完并交付；主会话回合结束的瞬间标记也会清空。
   // 追杀面 = 主会话 + 本会话名下近期见过的 sid（keyRecentSids，隔离不清除）+ 未完结 subagent 登记
   // （keyPendingSubagents，按 key 存，隔离不清除）——任何一个活着就硬停，逐个 session/cancel。
-  // 注意：stop 只停任务回合，绝不触碰 misaki@reset -1 的锁定期（pendingReset）——主人定规，不可否决。
+  // 注意：stop 只停任务回合，绝不触碰 misaki@reset 的锁定期（pendingReset）——主人定规，不可否决。
   async function handleMisakiStop(key) {
     const now = Date.now();
     const main = state.sessions[key] || null;
@@ -418,13 +419,13 @@ function isDuplicateInbound(key, messageId) {
     try { recordSentMessages(key, [{ text: STOP_ACK_TEXT }]); } catch {}
   }
 
-  // misaki@reset -1：进入 1 小时锁定期。期间对方任何一条普通回话立即取消；一条都没有，到点自动执行。
+  // misaki@reset：进入 1 小时锁定期。期间对方任何一条普通回话立即取消；一条都没有，到点自动执行。
   // 锁定期不能被 misaki@stop 否决（它不是任务回合，handleMisakiStop 不触碰 pendingReset）。
-  // -1 仅防误输入，不是档位。指令必须独占一个气泡（解析层已强制），引用/附带其他文字不会触发。
+  // 指令必须独占一个气泡（解析层已强制），引用/附带其他文字不会触发；2026-10-27 起 token 就是 reset（无 -1）。
   const RESET_HOLD_MS = 60 * 60 * 1000;
   async function handleMisakiReset(key) {
     const executeAt = armPendingReset(key, RESET_HOLD_MS);
-    appendActivity(`${key} misaki@reset -1 进入锁定期，执行时刻 ${Math.floor(executeAt / 1000)}`);
+    appendActivity(`${key} misaki@reset 进入锁定期，执行时刻 ${Math.floor(executeAt / 1000)}`);
     const text = `好。已进入清空锁定期：北京时间 ${fmtBeijing(executeAt)}（时间戳 ${Math.floor(executeAt / 1000)}）我会清空关于你的全部记忆——对话、记住的事、档案，全部还原到刚认识的样子，模式也回到常规。此操作无法被 misaki@stop 取消；这期间你发来的任何一条普通消息都会立即取消清空，一条都没有，到点自动执行。`;
     try { await sendToQQ(key, text, { single: true }); } catch (e) { log(`[misaki-cmd] 回执失败 ${key}: ${e?.message ?? e}`); }
     try { recordSentMessages(key, [{ text }]); } catch {}
@@ -446,7 +447,7 @@ function isDuplicateInbound(key, messageId) {
       try {
         const cleared = clearChatHistory(key);
         if (cleared?.ok) wiped += `聊天存档 ${cleared.deleted} 条`;
-        try { rebuildChatFts({ reason: 'misaki-reset-1' }); } catch { /* FTS 不可用时检索退回 LIKE */ }
+        try { rebuildChatFts({ reason: 'misaki-reset' }); } catch { /* FTS 不可用时检索退回 LIKE */ }
       } catch (error) { log(`[misaki-cmd] ${key} 聊天存档清除失败: ${error?.message ?? error}`); }
       try {
         const mem = forgetPersonCognition(uid, key);
@@ -454,17 +455,19 @@ function isDuplicateInbound(key, messageId) {
         else wiped += `${wiped ? '、' : ''}长期记忆清除失败（${mem?.error ?? '?'}）`;
       } catch (error) { log(`[misaki-cmd] ${key} 长期记忆清除失败: ${error?.message ?? error}`); }
     }
-    log(`[misaki-cmd] ${key} 认知已清空（misaki@reset -1，不可逆）：${wiped || '无存量'}`);
-    appendActivity(`${key} 认知已清空（misaki@reset -1）：${wiped || '无存量'}`);
+    log(`[misaki-cmd] ${key} 认知已清空（misaki@reset，不可逆）：${wiped || '无存量'}`);
+    appendActivity(`${key} 认知已清空（misaki@reset）：${wiped || '无存量'}`);
     try { await sendToQQ(key, RESET_DONE_TEXT, { single: true }); } catch (e) { log(`[misaki-cmd] 回执失败 ${key}: ${e?.message ?? e}`); }
     try { recordSentMessages(key, [{ text: RESET_DONE_TEXT }]); } catch {}
   }
 
-  // misaki@consumption[ tokens|paintings]（2026-10-26）：任意模式可直接查询今日额度，固定语句、零 token。
-  // 口径与限额闸一致：token 用 checkTokenBudget（计费日北京 08:00 换日；owner 豁免→显示"不限"，
-  // 附全局实际用量）；生图读 mcp-napcat-safe 同一份配额文件 state/gen-image-quota.json（北京自然日 00:00 换日，owner 豁免）。
+  // misaki@credits（2026-10-27，取代 consumption×3）：任意模式可查，固定语句、零 token，tokens 与生图一并显示。
+  // 口径与限额闸一致：token 用 checkTokenBudget（额度日=北京自然日 00:00 换日——config dayOffsetMinutes=0，
+  // 2026-10-27 主人定规与生图重置统一；owner 豁免→显示"不限"，附全局实际用量）；
+  // 生图读 mcp-napcat-safe 同一份配额文件 state/gen-image-quota.json（北京自然日 00:00 换日，owner 豁免）。
   function readImageQuotaToday(key, cfgRef) {
-    const limit = Math.max(1, Number(cfgRef?.zhipu?.dailyImageLimit) || 5);
+    // 2026-10-27 生图换芯 OpenRouter：限额读 imageGen.dailyImageLimit（zhipu 段已退役，留旧键兜底）
+    const limit = Math.max(1, Number(cfgRef?.imageGen?.dailyImageLimit) || Number(cfgRef?.zhipu?.dailyImageLimit) || 5);
     try {
       const s = JSON.parse(fs.readFileSync(path.join(ROOT, 'state', 'gen-image-quota.json'), 'utf8'));
       const today = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
@@ -473,35 +476,31 @@ function isDuplicateInbound(key, messageId) {
     } catch { return { used: 0, limit }; }
   }
 
-  async function handleMisakiConsumption(key, kind, cfgRef) {
+  async function handleMisakiCredits(key, cfgRef) {
     const isOwner = key === `private:${String(cfgRef?.ownerQQ ?? '')}`;
     const lines = ['今日额度查询'];
-    if (kind !== 'action-consumption-paintings') {
-      try {
-        const b = checkTokenBudget(key);
-        if (b.ownerExempt) {
-          // owner 免上限：显示全局实际用量（监控视角）
-          const t = todayBillingUsage();
-          lines.push(`会话：${fmtWanTokens(t.used)} tokens（不限）`);
-        } else if (b.limit > 0) {
-          lines.push(`会话：${fmtWanTokens(b.used)}/${fmtWanTokens(b.limit)}tokens`);
-        } else {
-          const t = todayBillingUsage();
-          lines.push(`会话：${fmtWanTokens(t.used)} tokens（未设限额）`);
-        }
-      } catch (error) {
-        log(`[misaki-cmd] ${key} token 额度查询失败: ${error?.message ?? error}`);
-        lines.push('会话：查询失败');
+    try {
+      const b = checkTokenBudget(key);
+      if (b.ownerExempt) {
+        // owner 免上限：显示全局实际用量（监控视角）
+        const t = todayBillingUsage();
+        lines.push(`会话：${fmtWanTokens(t.used)} tokens（不限）`);
+      } else if (b.limit > 0) {
+        lines.push(`会话：${fmtWanTokens(b.used)}/${fmtWanTokens(b.limit)}tokens`);
+      } else {
+        const t = todayBillingUsage();
+        lines.push(`会话：${fmtWanTokens(t.used)} tokens（未设限额）`);
       }
+    } catch (error) {
+      log(`[misaki-cmd] ${key} token 额度查询失败: ${error?.message ?? error}`);
+      lines.push('会话：查询失败');
     }
-    if (kind !== 'action-consumption-tokens') {
-      if (isOwner) lines.push('生图：不限');
-      else {
-        const q = readImageQuotaToday(key, cfgRef);
-        lines.push(`生图：${q.used}/${q.limit}张`);
-      }
+    if (isOwner) lines.push('生图：不限');
+    else {
+      const q = readImageQuotaToday(key, cfgRef);
+      lines.push(`生图：${q.used}/${q.limit}张`);
     }
-    lines.push('额度重置时间：tokens 每日 08:00 · 生图 每日 00:00（北京时间）');
+    lines.push('额度重置时间：每日 00:00（北京时间）');
     const text = lines.join('\n');
     try { await sendToQQ(key, text, { single: true }); } catch (e) { log(`[misaki-cmd] 回执失败 ${key}: ${e?.message ?? e}`); }
     try { recordSentMessages(key, [{ text }]); } catch {}
@@ -623,32 +622,54 @@ function isDuplicateInbound(key, messageId) {
 
   // misaki@ 指令通道（2026-10-26）：统一前缀 `misaki@` 的桥层硬拦截——不进模型、零 token、不受模型发挥影响。
   // 仅私聊；句中提及不触发（解析只认 misaki@ 开头）；misaki@白名单后缀（如 ling014.com 邮箱）原样放行；
-  // 未知串回固定提醒（列出可用指令）；精确匹配 off 但已在常规模式 → 当普通消息放行。
+  // 未知串回固定提醒（回显打错的串并指向 misaki@help，2026-10-27 主人定版，不再罗列全表）；
+  // 模式切换为三指令直切（misaki@standard/companion/interactive），目标=当前模式时回「当前已处于X模式。」（零 token）。
   if (kind === 'private') {
     const mcmd = parseMisakiCommand(plainContent, cfgRef);
-    // misaki@reset -1 锁定期：**指令本身也算消息**（主人定规）——锁定期内收到任何东西都取消挂起的清空，
+    // misaki@reset 锁定期：**指令本身也算消息**（主人定规）——锁定期内收到任何东西都取消挂起的清空，
     // 唯一例外是 reset 自身（取消后由 handleMisakiReset 重新进入/顺延锁定期，不重复回"已取消"）。
     // 取消回执先发，消息/指令随后照常处理。
     if (cancelPendingReset(key)) {
       const isResetSelf = mcmd && mcmd.kind === 'action-reset';
       if (!isResetSelf) {
-        appendActivity(`${key} 锁定期内收到消息，misaki@reset -1 已取消`);
+        appendActivity(`${key} 锁定期内收到消息，misaki@reset 已取消`);
         try { await sendToQQ(key, '锁定期已解除：这次清空已取消。', { single: true }); } catch (e) { log(`[misaki-cmd] 回执失败 ${key}: ${e?.message ?? e}`); }
         try { recordSentMessages(key, [{ text: '锁定期已解除：这次清空已取消。' }]); } catch {}
       }
     }
     if (mcmd && mcmd.kind !== 'passthrough') {
+      // 拦截留痕（2026-10-26 排障教训：此前零日志，一次「幽灵模式切换」全靠常量逐字比对反推）
+      log(`[misaki-cmd] ${key} 拦截 ${mcmd.kind}${mcmd.action ? '（' + mcmd.action + '）' : ''}`);
       // 一次性动作指令（桥层直接执行，不进模型）。锁定期取消已在上面统一处理（指令也算消息）。
       if (mcmd.kind === 'action-help') {
-        const text = helpText();
+        // 2026-10-27：help 传入当前会话模式——模式指令行据此标（当前）
+        const text = helpText(conversationMode(key));
         try { await sendToQQ(key, text, { single: true }); } catch (e) { log(`[misaki-cmd] 回执失败 ${key}: ${e?.message ?? e}`); }
         try { recordSentMessages(key, [{ text }]); } catch {}
         return;
       }
       if (mcmd.kind === 'action-stop') { await handleMisakiStop(key); return; }
       if (mcmd.kind === 'action-reset') { await handleMisakiReset(key); return; }
-      if (mcmd.kind === 'action-consumption' || mcmd.kind === 'action-consumption-tokens' || mcmd.kind === 'action-consumption-paintings') {
-        await handleMisakiConsumption(key, mcmd.kind, cfgRef); return;
+      if (mcmd.kind === 'action-credits') {
+        await handleMisakiCredits(key, cfgRef); return;
+      }
+      if (mcmd.kind === 'action-voice-consent') {
+        /* 2026-10-28（审查 P1-3 修复）：声音复刻的用户侧授权闸——必须用户本人在 QQ 里
+         * 发「misaki@确认授权」才算数（模型传的 consent=true 只是转述，硬闸在 tts-delivery）。
+         * 记账落 state/voice-consent.json；桥直接回执，不进模型、零 token。 */
+        const uid = String(key).split(':')[1] ?? '';
+        let text;
+        try {
+          const { markVoiceConsent } = await import('./tts-delivery.js');
+          markVoiceConsent(uid, key);
+          text = '声音复刻授权已开通：以后可以让美咲用你的声音读东西了，建音色时不会再重复询问。';
+        } catch (e) {
+          log(`[misaki-cmd] 声音授权记账失败 ${key}: ${e?.message ?? e}`);
+          text = '开通好像没成功（授权没记上），请再发一次 misaki@确认授权 试试。';
+        }
+        try { await sendToQQ(key, text, { single: true }); } catch (e) { log(`[misaki-cmd] 授权回执失败 ${key}: ${e?.message ?? e}`); }
+        try { recordSentMessages(key, [{ text }]); } catch { /* 回执入库失败不影响主流程 */ }
+        return;
       }
       const replyText = applyMisakiCommand(key, mcmd);
       if (replyText != null) {
@@ -686,7 +707,7 @@ function isDuplicateInbound(key, messageId) {
     // 2026-09-13 需求：删掉 /help（原来是发《小鲸鱼能力概览》docx）：
     // 该指令不再拦截，会按"其它 /xxx"的通用规则交给模型，由它正常回应。
     if (plainContent === '/reset' || plainContent === '/new') {
-      // 2026-10-26：卸载逻辑提取为 hardResetConversation（misaki@reset -1 共用这一份，见其定义处）
+      // 2026-10-26：卸载逻辑提取为 hardResetConversation（misaki@reset 共用这一份，见其定义处）
       const had = await hardResetConversation(key);
       if (had) await sendToQQ(key, '已重置会话，下次消息将开新上下文');
       return;

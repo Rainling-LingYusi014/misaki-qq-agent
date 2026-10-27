@@ -384,8 +384,10 @@ function convertCfg(cfg) {
   const c = cfg?.convert ?? {};
   return {
     enabled: c.enabled !== false,
-    userDailyJobs: Math.max(1, num(c.userDailyJobs, 10)),
-    globalDailyJobs: Math.max(0, num(c.globalDailyJobs, 100)),
+    /* 2026-10-28 额度定稿：媒体操作（转换/图片/PDF/二维码）是本地免费算力 → 不限次数。
+     * 0 = 不限（缺省也是 0）；配了正数才限。 */
+    userDailyJobs: Math.max(0, num(c.userDailyJobs, 0)),
+    globalDailyJobs: Math.max(0, num(c.globalDailyJobs, 0)),
     maxInputBytes: Math.max(1, num(c.maxInputBytes, 50 * 1024 * 1024)),
     maxOutputBytes: Math.max(1, num(c.maxOutputBytes, 150 * 1024 * 1024)),
     timeoutMs: Math.max(10000, num(c.timeoutMs, 180000)),
@@ -399,7 +401,7 @@ function checkQuota(cfg, uid, isOwner) {
   if (!c.enabled) throw new Error('文件转换未启用（config.json 的 convert.enabled）');
   const { u, per } = loadUsage(uid);
   if (isOwner) return { u, c, per };
-  if (per.count >= c.userDailyJobs) throw new Error(`今天 ${c.userDailyJobs} 次转换已经用完，明天 0 点（北京时）恢复`);
+  if (c.userDailyJobs > 0 && per.count >= c.userDailyJobs) throw new Error(`今天 ${c.userDailyJobs} 次转换已经用完，明天 0 点（北京时）恢复`);
   if (c.globalDailyJobs > 0 && u.global.count >= c.globalDailyJobs) throw new Error('今天全站转换次数已满，请明天再试');
   return { u, c, per };
 }

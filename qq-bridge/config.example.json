@@ -109,10 +109,10 @@
     "autoResearch": true
   },
   "convert": {
-    "_note": "通用文件格式转换（2026-10-27）：只私聊；主人不限额，普通用户 10 次/天，全局 100 次/天；输入 50MB、输出 150MB；Office 宏禁用且不保留。能力取决于服务器装了 ffmpeg / LibreOffice / pandoc / poppler / img2pdf。视频压缩（crf/level/maxHeight/mute）、视频转 GIF（start/duration/fps/width）、多图合成 PDF 走同一份额度。",
+    "_note": "通用文件格式转换（2026-10-28 额度定稿）：只私聊；本地免费算力 → 不限次数（userDailyJobs/globalDailyJobs = 0 即不限，配正数才限，主人历来不限）；输入 50MB、输出 150MB；Office 宏禁用且不保留。能力取决于服务器装了 ffmpeg / LibreOffice / pandoc / poppler / img2pdf。视频压缩（crf/level/maxHeight/mute）、视频转 GIF（start/duration/fps/width）、多图合成 PDF 同链路。",
     "enabled": true,
-    "userDailyJobs": 10,
-    "globalDailyJobs": 100,
+    "userDailyJobs": 0,
+    "globalDailyJobs": 0,
     "maxInputBytes": 52428800,
     "maxOutputBytes": 157286400,
     "timeoutMs": 180000,
@@ -120,10 +120,10 @@
     "retentionDays": 3
   },
   "text": {
-    "_note": "文本/JSON 工具（2026-10-27 晚）：JSON 格式化/校验、base64/url、哈希、行去重排序、替换等纯字符操作；与转换同一私聊规则，额度独立。结果 ≤5000 字符内联返回，超过落成 .txt 文件发回。",
+    "_note": "文本/JSON 工具（2026-10-28 额度定稿）：JSON 格式化/校验、base64/url、哈希、行去重排序、替换等纯字符操作；本地免费算力 → 不限次数（0 = 不限，配正数才限）。结果 ≤5000 字符内联返回，超过落成 .txt 文件发回。",
     "enabled": true,
-    "userDailyJobs": 50,
-    "globalDailyJobs": 500,
+    "userDailyJobs": 0,
+    "globalDailyJobs": 0,
     "maxInputChars": 1000000
   },
   "voice": {
@@ -140,15 +140,15 @@
       "format": "wav"
     },
     "delivery": {
-      "_note": "主人不限额；普通用户每天 10 条 / 2000 字 / 3 次建音色 / 3 个音色档案，按北京日 0 点刷新；普通用户总池每天 20000 字 / 100 条 / 30 次建音色，防止多人叠加。单次 3000 字，分块 450 字，产物保留 7 天。",
+      "_note": "2026-10-28 额度定稿（全站池 = 单用户 600%）：主人不限额；普通用户每天 10 条 / 2000 字 / 5 次建音色 / 3 个音色档案，按北京日 0 点刷新；普通用户总池每天 12000 字 / 60 条 / 30 次建音色。单次 3000 字，分块 450 字，产物保留 7 天。授权：建音色前用户须本人发过一次 misaki@确认授权（模型传的 consent 只是转述）。",
       "maxChars": 3000,
       "ownerDailyChars": 0,
       "userDailyJobs": 10,
       "userDailyChars": 2000,
-      "userEnrollPerDay": 3,
+      "userEnrollPerDay": 5,
       "userMaxVoices": 3,
-      "globalDailyJobs": 100,
-      "globalDailyChars": 20000,
+      "globalDailyJobs": 60,
+      "globalDailyChars": 12000,
       "globalEnrollPerDay": 30,
       "chunkChars": 450,
       "defaultFormat": "mp3",

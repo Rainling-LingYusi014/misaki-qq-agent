@@ -87,10 +87,11 @@ function deliveryCfg(cfg) {
     ownerDailyChars: Math.max(0, num(d.ownerDailyChars, 0)),
     userDailyJobs: Math.max(1, Math.min(1000, num(d.userDailyJobs, 10))),
     userDailyChars: Math.max(0, num(d.userDailyChars, num(d.dailyChars, DEFAULT_USER_DAILY_CHARS))),
-    userEnrollPerDay: Math.max(0, Math.min(100, num(d.userEnrollPerDay, 3))),
-    userMaxVoices: Math.max(1, Math.min(50, num(d.userMaxVoices, DEFAULT_USER_MAX_VOICES))),
-    globalDailyJobs: Math.max(0, num(d.globalDailyJobs, 100)),
-    globalDailyChars: Math.max(0, num(d.globalDailyChars, 20000)),
+    userEnrollPerDay: Math.max(0, Math.min(100, num(d.userEnrollPerDay, 5))),
+    userMaxVoices: Math.max(1, num(d.userMaxVoices, 3)),
+    /* 2026-10-28 额度定稿：全站池 = 单用户 600%（60 条 / 12000 字 / 30 次建音色）。 */
+    globalDailyJobs: Math.max(0, num(d.globalDailyJobs, 60)),
+    globalDailyChars: Math.max(0, num(d.globalDailyChars, 12000)),
     globalEnrollPerDay: Math.max(0, num(d.globalEnrollPerDay, 30)),
     defaultFormat: normalizeOutputFormat(d.defaultFormat, 'mp3'),
     bitrate: String(d.bitrate || '192k'),
@@ -219,6 +220,24 @@ function refundEnrollUsage({ uid, isOwner }) {
 }
 /* 交付失败回补（控制台 /api/voice/qwen/render 上传两次失败时调）。 */
 export { refundRenderUsage, refundEnrollUsage };
+
+/* ── 声音复刻用户侧授权（2026-10-28，审查 P1-3 修复）──────────────────────
+ * consent=true 只是模型的转述（软闸，仍要求传）；真闸门是用户本人在 QQ 里
+ * 发过一次「misaki@确认授权」（桥层指令，mux.js 拦截记账，零 token）。
+ * 状态落 state/voice-consent.json；file 参数可注入（测试用）。 */
+const CONSENT_FILE = path.join(STATE_DIR, 'voice-consent.json');
+export function hasVoiceConsent(uid, file = CONSENT_FILE) {
+  const d = readJsonSafe(file, {});
+  return !!(d.uids && d.uids[String(uid ?? '').trim()]);
+}
+export function markVoiceConsent(uid, key = '', file = CONSENT_FILE) {
+  const q = String(uid ?? '').trim();
+  if (!q) throw new Error('缺少 uid，无法记授权');
+  const d = readJsonSafe(file, {});
+  d.uids = (d.uids && typeof d.uids === 'object') ? d.uids : {};
+  if (!d.uids[q]) d.uids[q] = { at: new Date().toISOString(), key: String(key ?? '') };
+  atomicWriteJson(file, d);
+}
 
 /* ── 音色档案（按 ownerUid 隔离） ── */
 function loadProfiles(cfg) {
@@ -517,7 +536,12 @@ export async function enrollFromSamples({ cfg, files, name, targetModel, uid, is
   if (!ffmpegAvailable()) throw new Error('服务器缺少 ffmpeg/ffprobe，无法处理样本');
   if (!Array.isArray(files) || !files.length) throw new Error('没有样本文件');
   if (files.length > MAX_SAMPLES) throw new Error(`最多 ${MAX_SAMPLES} 个样本`);
+  /* 双闸（2026-10-28）：consent=true 是模型转述的软闸（仍必须传）；
+   * 硬闸是用户侧授权——用户本人发过「misaki@确认授权」（见上方 CONSENT 段）。 */
   if (consent !== true) throw new Error('建音色需要明确确认：这是你本人的声音，或你已获得本人授权（consent=true）');
+  if (!hasVoiceConsent(uid)) {
+    throw new Error('这位用户还没开通声音复刻授权：请让用户本人发送「misaki@确认授权」（桥会直接回执开通，不耗对话），开通后再重试建音色。不要替用户传 consent=true 绕过。');
+  }
   const requester = String(uid ?? '').trim();
   if (!requester) throw new Error('缺少请求者 uid');
 
