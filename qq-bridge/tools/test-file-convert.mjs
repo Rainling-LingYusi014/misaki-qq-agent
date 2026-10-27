@@ -1,6 +1,6 @@
 // 文件转换能力表 + 执行计划的离线回归（不调用任何外部工具）
 //   node tools/test-file-convert.mjs
-import { buildCapabilities, planFor, validateConvertOptions, validatePdfOptions } from '../src/core/file-convert.js';
+import { buildCapabilities, planFor, validateConvertOptions, validatePdfOptions, sumZipListing } from '../src/core/file-convert.js';
 
 let pass = 0;
 const ok = (name, cond, extra = '') => {
@@ -122,6 +122,16 @@ console.log('== ④ 选项校验 ==');
   msg = '';
   try { validatePdfOptions({ margin: 500 }); } catch (e) { msg = e.message; }
   ok('边距超界拒绝', /0~144/.test(msg), msg);
+}
+
+{
+  /* 2026-10-28 审查 P1-1 回归：zip 清单求和要吃下 unzip 6.x（YYYY-MM-DD）与 5.x（MM-DD-YY）
+   * 两种日期格式——旧正则两种都匹配 0 行，防线从上线起就没工作过。 */
+  const listing6 = 'Archive:  a.docx\n  Length      Date    Time    Name\n---------  ---------- -----   ----\n      1030  2026-10-27 23:41   word/document.xml\n       200  2026-10-27 23:41   [Content_Types].xml\n---------                     -------\n      1230                     2 files';
+  ok('zip 清单求和（unzip 6.x YYYY-MM-DD）', sumZipListing(listing6) === 1230, String(sumZipListing(listing6)));
+  const listing5 = '     1030  10-27-26 23:41   word/document.xml\n      200  10-27-26 23:41   b.xml';
+  ok('zip 清单求和（unzip 5.x MM-DD-YY）', sumZipListing(listing5) === 1230, String(sumZipListing(listing5)));
+  ok('空/垃圾输入不误加', sumZipListing('') === 0 && sumZipListing('no listing here') === 0);
 }
 
 console.log(`\n${pass} passed${process.exitCode ? '，有失败' : ''}`);

@@ -32,3 +32,21 @@ export function atomicWriteText(file, text) {
   fs.writeFileSync(tmp, text, { encoding: 'utf8', mode: 0o600 });
   fs.renameSync(tmp, file);
 }
+
+/** 清扫崩溃残留的原子写临时文件（2026-10-28 审查 P3-10）：atomicWrite* 写 <file>.<pid>.<rand>.tmp
+ * 再 rename，进程中途崩溃会留残片。只删 1 小时前的 *.tmp（刚写的绝不动），逐个容错。 */
+export function sweepStaleTmpFiles(dir) {
+  try {
+    const cutoff = Date.now() - 3600 * 1000;
+    let n = 0;
+    for (const f of fs.readdirSync(String(dir))) {
+      if (!f.endsWith('.tmp')) continue;
+      const p = path.join(String(dir), f);
+      try {
+        const st = fs.statSync(p);
+        if (st.isFile() && st.mtimeMs < cutoff) { fs.rmSync(p, { force: true }); n += 1; }
+      } catch { /* 单个失败跳过 */ }
+    }
+    return n;
+  } catch { return 0; }
+}

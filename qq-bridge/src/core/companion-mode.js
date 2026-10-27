@@ -34,9 +34,10 @@ export function modeLabel(modeId) {
 // ── misaki@ 指令解析 ────────────────────────────────────────────────────────
 export const MISAKI_CMD_PREFIX = 'misaki@';
 // 白名单后缀：misaki@ 后紧跟这些串时按普通聊天放行（不进指令通道、不提醒）。
-// misaki@ 后缀是美咲自己的域名邮箱（域名见 PASSTHROUGH_DEFAULT，真值不写进注释——开源仓同步不带走），
-// 聊天中被提及不能报「指令不认识」。
-const PASSTHROUGH_DEFAULT = ['ling014.com'];
+// 白名单后缀：misaki@ 后紧跟这些串时按普通聊天放行（不进指令通道、不提醒）。
+// 2026-10-28 审查 P2-4：真值不进代码——默认空数组，部署者经 config 的
+// social.misakiCommands.passthroughSuffixes 下发自己的域名后缀（聊天中被提及不能报「指令不认得」）。
+const PASSTHROUGH_DEFAULT = [];
 // 一次性动作指令（非模式）。token 必须整条精确匹配；reset 只认原文（带标点不触发），独占气泡防误触。
 // 2026-10-27 主人定版：consumption×3 合并为单条 credits；reset -1 简化为 reset（防误输入位取消），简介同步精简。
 export const ACTIONS = [
@@ -45,8 +46,10 @@ export const ACTIONS = [
   { token: 'credits', kind: 'action-credits', label: '查询今日额度用量' },
   // 2026-10-28（审查 P1-3 修复）：声音复刻的用户侧授权闸——用户本人发过这条才算授权，
   // 模型传的 consent=true 只是转述。执行在 mux.js（记账落 state/voice-consent.json）。
-  // 2026-10-28 二改：主人指示 confirm 进 help 列表且排在 reset 上方（数组顺序即显示顺序）。
+  // 2026-10-28 二改：confirm 进 help 列表且排在 reset 上方（数组顺序即显示顺序）。
   { token: 'confirm', kind: 'action-voice-consent', label: '开通声音复刻授权（建音色前发一次）' },
+  // 2026-10-28 主人拍板 #9：授权可撤销——撤的是「以后建新音色」的资格，已建音色不连带删。
+  { token: 'unconfirm', kind: 'action-voice-revoke', label: '撤销声音复刻授权' },
   { token: 'reset', kind: 'action-reset', label: '清空所有过往认知' },
 ];
 
@@ -107,7 +110,7 @@ export function parseMisakiCommand(rawText, cfgRef = null) {
     ? cfg.passthroughSuffixes.map((s) => String(s).toLowerCase())
     : PASSTHROUGH_DEFAULT;
   for (const suf of passthrough) {
-    // `ling014.com` / `ling014.com 是你的邮箱吗` 都算提及；边界断言避免 `ling014.comXxx` 误放行
+    // `自己域名.com` / `自己域名.com 是你的邮箱吗` 都算提及；边界断言避免 `后缀Xxx` 误放行
     if (body === suf || new RegExp(`^${escapeRe(suf)}(?![a-z0-9._-])`).test(body)) {
       return { kind: 'passthrough', suffix: suf };
     }

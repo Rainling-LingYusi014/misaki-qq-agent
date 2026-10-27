@@ -1,5 +1,5 @@
 /* ══════════════════════════════════════════════════════════════════════════
- * PDF 工具（2026-10-27 晚，ling014 工作站第二批）：合并 / 拆分 / 加水印
+ * PDF 工具（2026-10-27 晚，工作站第二批）：合并 / 拆分 / 加水印
  *
  * 依赖 Python 的 pypdf（合并/拆分/贴水印）+ reportlab（生成水印 stamp 层）。
  * 没装就能力表明确说不可用，不假装。加密 PDF 一律拒绝并给一句人话。
@@ -381,10 +381,11 @@ export async function pdfMerge({ cfg, files, uid, isOwner } = {}) {
   const total = list.reduce((s, f) => s + f.buf.length, 0);
   if (total > c.maxOutputBytes) throw new Error(`文件总量 ${(total / 1048576).toFixed(0)}MB，超过 ${(c.maxOutputBytes / 1048576).toFixed(0)}MB 上限`);
   reserveMediaQuota({ cfg, uid: requester, isOwner: isOwner === true });
-  ensureDir(OUT_DIR);
-  const tmp = ensureDir(path.join(TMP_DIR, `pdfm-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`));
   const started = Date.now();
   try {
+    /* 2026-10-28 审查 P2-2：建目录挪进 try——reserve 后抛出走 catch 的 refund。 */
+    ensureDir(OUT_DIR);
+    const tmp = ensureDir(path.join(TMP_DIR, `pdfm-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`));
     const paths = list.map((f, i) => {
       const p = path.join(tmp, `in-${String(i + 1).padStart(2, '0')}.pdf`);
       fs.writeFileSync(p, f.buf);
@@ -427,10 +428,11 @@ export async function pdfSplit({ cfg, name, buf, uid, isOwner, options } = {}) {
   const c = convertCfg(cfg);
   if (buf.length > c.maxInputBytes) throw new Error(`PDF ${(buf.length / 1048576).toFixed(1)}MB，超过 ${(c.maxInputBytes / 1048576).toFixed(0)}MB 上限`);
   reserveMediaQuota({ cfg, uid: requester, isOwner: isOwner === true });
-  ensureDir(OUT_DIR);
-  const tmp = ensureDir(path.join(TMP_DIR, `pdfs-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`));
   const started = Date.now();
   try {
+    /* 2026-10-28 审查 P2-2：建目录挪进 try——reserve 后抛出走 catch 的 refund。 */
+    ensureDir(OUT_DIR);
+    const tmp = ensureDir(path.join(TMP_DIR, `pdfs-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`));
     const src = path.join(tmp, 'input.pdf');
     fs.writeFileSync(src, buf);
     const base = path.basename(String(name || 'pdf'), path.extname(String(name || '')));
@@ -475,10 +477,11 @@ export async function pdfWatermark({ cfg, name, buf, watermarkBuf, watermarkName
   const c = convertCfg(cfg);
   if (buf.length > c.maxInputBytes) throw new Error(`PDF ${(buf.length / 1048576).toFixed(1)}MB，超过 ${(c.maxInputBytes / 1048576).toFixed(0)}MB 上限`);
   reserveMediaQuota({ cfg, uid: requester, isOwner: isOwner === true });
-  ensureDir(OUT_DIR);
-  const tmp = ensureDir(path.join(TMP_DIR, `pdfw-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`));
   const started = Date.now();
   try {
+    /* 2026-10-28 审查 P2-2：建目录挪进 try——reserve 后抛出走 catch 的 refund。 */
+    ensureDir(OUT_DIR);
+    const tmp = ensureDir(path.join(TMP_DIR, `pdfw-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`));
     const src = path.join(tmp, 'input.pdf');
     fs.writeFileSync(src, buf);
     if (watermarkBuf?.length) {

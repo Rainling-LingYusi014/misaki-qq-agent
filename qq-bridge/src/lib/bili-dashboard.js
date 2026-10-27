@@ -66,9 +66,11 @@ export async function listMyArchives({ pn = 1, ps = 20, status = 'all', authFile
   });
   if (j.code !== 0) return { ok: false, why: `archives code=${j.code} ${j.message ?? ''}` };
   const d = j.data ?? {};
+  /* 2026-10-28 审查 P2-3 修正：archives 放前——迁移期同一 bvid 两表并存时，
+   * archives 侧才是带播放统计的那份（arc_audits 的 stat 常为空），去重必须保它。 */
   const merged = [
-    ...(Array.isArray(d.arc_audits) ? d.arc_audits : []).map((x) => x?.Archive).filter(Boolean),
     ...(Array.isArray(d.archives) ? d.archives : []),
+    ...(Array.isArray(d.arc_audits) ? d.arc_audits : []).map((x) => x?.Archive).filter(Boolean),
   ];
   const seen = new Set();
   const rows = merged.filter((r) => {

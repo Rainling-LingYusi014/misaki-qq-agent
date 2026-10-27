@@ -326,17 +326,23 @@ export function planFor(from, to, t = probeTools(), opts = {}) {
 /* ── 安全：zip 解压总量 / 宏安全配置 ──
  * 2026-10-27（审查 P1-2）：fail-closed——没装 unzip、或清单读不出来，都拒绝处理 Office 文件，
  * 不再静默跳过 zip-bomb 防线。 */
+/* 清单求和抽成纯函数供回归测试（2026-10-28 审查 P1-1 修复配套）。
+ * 日期段同时兼容 unzip 6.x 的 YYYY-MM-DD 与 5.x 的 MM-DD-YY——旧写法 \d{2}[-:]\d{2}
+ * 两种格式都匹配 0 行（防线从上线起就没工作过），审查实测锤死后修正。 */
+export function sumZipListing(text) {
+  let total = 0;
+  for (const line of String(text || '').split(/\r?\n/)) {
+    const m = /^\s*(\d+)\s+\d{2,4}[-:]\d{2}[-:]\d{2}\s+/.exec(line);
+    if (m) total += Number(m[1]);
+  }
+  return total;
+}
 function zipUncompressedBytes(file) {
   const t = probeTools();
   if (!t.unzip) throw new Error('服务器缺少 unzip，无法核查 Office 文件解压后的总量（zip 炸弹防线）；请先安装 unzip');
   const r = spawnSync('unzip', ['-l', file], { encoding: 'utf8', timeout: 15000, maxBuffer: 8 * 1024 * 1024 });
   if (r.status !== 0) throw new Error('无法读取 Office 包内的文件清单（unzip -l 失败），为防 zip 炸弹拒绝处理');
-  let total = 0;
-  for (const line of String(r.stdout || '').split(/\r?\n/)) {
-    const m = /^\s*(\d+)\s+\d{2}[-:]\d{2}\s+/.exec(line);
-    if (m) total += Number(m[1]);
-  }
-  return total;
+  return sumZipListing(r.stdout);
 }
 
 function macroSafeProfile(dir) {
@@ -412,11 +418,10 @@ function checkQuota(cfg, uid, isOwner) {
  * 进程在长活中途崩溃会白扣一次，可接受。 */
 function reserveQuota(cfg, uid, isOwner) {
   const { u, c, per } = checkQuota(cfg, uid, isOwner); /* 满了在这里抛 */
-  const pre = { user: per.count, global: u.global.count };
   u.users[String(uid)].count += 1;
   if (!isOwner) u.global.count += 1;
   atomicWriteJson(USAGE_FILE, u);
-  return { c, pre };
+  return { c, per };
 }
 function refundQuota(uid, isOwner) {
   const key = String(uid ?? '').trim();
@@ -504,14 +509,14 @@ export async function convertFile({ cfg, name, buf, target, uid, isOwner, option
   const vopts = validateConvertOptions(options ?? {});
   const plan = planFor(from, to, t, vopts);
   reserveQuota(cfg, requester, isOwner === true);
-
-  ensureDir(OUT_DIR);
-  const jobId = `conv-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
-  const tmp = ensureDir(path.join(TMP_DIR, jobId));
-  const input = path.join(tmp, `input.${from}`);
-  fs.writeFileSync(input, buf);
   const started = Date.now();
   try {
+    /* 2026-10-28 审查 P2-2：落盘/建目录挪进 try——reserve 后抛出走 catch 的 refund。 */
+    ensureDir(OUT_DIR);
+    const jobId = `conv-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+    const tmp = ensureDir(path.join(TMP_DIR, jobId));
+    const input = path.join(tmp, `input.${from}`);
+    fs.writeFileSync(input, buf);
     if (ZIP_OFFICE.has(from)) {
       const bytes = zipUncompressedBytes(input);
       if (bytes > 300 * 1024 * 1024) {
@@ -626,7 +631,7 @@ export function cleanupConvertOutputs() {
   cleanup(convertCfg({}));
 }
 
-/* ── 多图合成 PDF（2026-10-27 晚，ling014 工作站对齐）─────────────────────────
+/* ── 多图合成 PDF（2026-10-27 晚，工作站对齐）─────────────────────────
  * 单张图→pdf 走 convertFile 正常链路；这里只处理"多条 messageIds 合一个 PDF"。
  * img2pdf 优先（页面可设 A4/Letter + 边距）；没装就退 Pillow（页面=图片尺寸，
  * 白底压平透明通道），在结果里如实标注用了哪条引擎。 */
@@ -656,12 +661,12 @@ export async function convertImagesToPdf({ cfg, images, uid, isOwner, options } 
   const t = probeTools();
   if (!t.img2pdf && !t.pillow) throw new Error('图片合成 PDF 需要 img2pdf 或 Python Pillow（两者都没装）');
   reserveQuota(cfg, requester, isOwner === true);
-
-  ensureDir(OUT_DIR);
-  const jobId = `pdf-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
-  const tmp = ensureDir(path.join(TMP_DIR, jobId));
   const started = Date.now();
   try {
+    /* 2026-10-28 审查 P2-2：建目录挪进 try——reserve 后抛出走 catch 的 refund。 */
+    ensureDir(OUT_DIR);
+    const jobId = `pdf-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+    const tmp = ensureDir(path.join(TMP_DIR, jobId));
     const names = [];
     list.forEach((f, i) => {
       const ext = (path.extname(String(f.name || '')) || '.png').toLowerCase().replace(/[^.a-z0-9]/g, '') || '.png';

@@ -134,7 +134,7 @@ console.log('== ⑤ 采样率降级 ==');
 
 // ── 用户侧授权状态（2026-10-28，审查 P1-3 修复）────────────────────────────
 {
-  const { hasVoiceConsent, markVoiceConsent } = await import('../src/core/tts-delivery.js');
+  const { hasVoiceConsent, markVoiceConsent, revokeVoiceConsent } = await import('../src/core/tts-delivery.js');
   const { parseMisakiCommand } = await import('../src/core/companion-mode.js');
   const os = await import('node:os');
   const pathMod = await import('node:path');
@@ -147,6 +147,17 @@ console.log('== ⑤ 采样率降级 ==');
   ok('其他 uid 仍为未授权', hasVoiceConsent('10003', tmp) === false);
   markVoiceConsent('10002', 'private:10002', tmp);
   ok('重复授权幂等', hasVoiceConsent('10002', tmp) === true);
+  /* 2026-10-28 主人拍板 #9：授权可撤销（幂等；不影响他人） */
+  ok('撤销未授权的人也成功（幂等）', revokeVoiceConsent('10003', tmp) === false);
+  ok('撤销已授权的人真删', revokeVoiceConsent('10002', tmp) === true);
+  ok('撤销后 hasVoiceConsent=false', hasVoiceConsent('10002', tmp) === false);
+  markVoiceConsent('10004', 'private:10004', tmp);
+  revokeVoiceConsent('10002', tmp);
+  ok('撤销不影响他人授权', hasVoiceConsent('10004', tmp) === true);
+  const cmdR = parseMisakiCommand('misaki@unconfirm', null);
+  ok('misaki@unconfirm 解析为撤销动作', cmdR?.kind === 'action-voice-revoke', JSON.stringify(cmdR));
+  const cmdR2 = parseMisakiCommand('misaki@unconfirm！', null);
+  ok('撤销指令结尾标点容错', cmdR2?.kind === 'action-voice-revoke');
   const cmd = parseMisakiCommand('misaki@confirm', null);
   ok('misaki@confirm 解析为授权动作', cmd?.kind === 'action-voice-consent', JSON.stringify(cmd));
   const cmd2 = parseMisakiCommand('misaki@confirm。', null);
@@ -161,6 +172,8 @@ console.log('== ⑤ 采样率降级 ==');
   ok('help 列出 confirm', iConfirm > 0, help);
   ok('confirm 排在 reset 上方', iConfirm > 0 && iReset > iConfirm, help);
   ok('help 仍置顶 help 行', help.indexOf('misaki@help | ') > -1 && help.indexOf('misaki@help | ') < help.indexOf('misaki@confirm | '));
+  const iUnconfirm = help.indexOf('misaki@unconfirm | ');
+  ok('help 列出 unconfirm（confirm 与 reset 之间）', iUnconfirm > iConfirm && iUnconfirm < iReset, help);
   try { fsMod.rmSync(tmp, { force: true }); } catch { /* ignore */ }
 }
 

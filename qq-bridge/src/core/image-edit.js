@@ -5,7 +5,7 @@
  * 难维护；Pillow 的 ImageDraw 一行一个形状，且能同时做 targetKB 迭代压缩。
  * 所以本模块要求 python3 + Pillow（python3-pil）。没装就如实说不可用，不假装。
  *
- * 2026-10-27 晚补（ling014 工作站对齐）：
+ * 2026-10-27 晚补（工作站对齐）：
  *   · watermark：文字/图片水印，9 宫格定位或平铺；文字水印要中文字体，
  *     找不到 CJK 字体时如实报错（提示装 fonts-wqy-zenhei），不输出方框糊弄。
  *   · gif：2~60 张图合成动图；fps 优先于 delay；宽度过大/帧数过多时如实报错。
@@ -477,20 +477,20 @@ export async function editImage({ cfg, name, buf, watermarkBuf, watermarkName, u
   }
   applyWatermarkFont(opts);
   reserveMediaQuota({ cfg, uid: requester, isOwner: isOwner === true });
-
-  ensureDir(OUT_DIR);
-  const jobId = `img-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
-  const tmp = ensureDir(path.join(TMP_DIR, jobId));
-  const src = path.join(tmp, `input${path.extname(String(name || '')) || '.png'}`);
-  const dst = path.join(tmp, `output.${opts.format}`);
-  fs.writeFileSync(src, buf);
-  if (watermarkBuf?.length) {
-    opts.watermark = opts.watermark || {};
-    opts.watermark.wmPath = path.join(tmp, `wm${path.extname(String(watermarkName || '')) || '.png'}`);
-    fs.writeFileSync(opts.watermark.wmPath, watermarkBuf);
-  }
   const started = Date.now();
   try {
+    /* 2026-10-28 审查 P2-2：落盘/建目录挪进 try——reserve 后抛出走 catch 的 refund。 */
+    ensureDir(OUT_DIR);
+    const jobId = `img-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+    const tmp = ensureDir(path.join(TMP_DIR, jobId));
+    const src = path.join(tmp, `input${path.extname(String(name || '')) || '.png'}`);
+    const dst = path.join(tmp, `output.${opts.format}`);
+    fs.writeFileSync(src, buf);
+    if (watermarkBuf?.length) {
+      opts.watermark = opts.watermark || {};
+      opts.watermark.wmPath = path.join(tmp, `wm${path.extname(String(watermarkName || '')) || '.png'}`);
+      fs.writeFileSync(opts.watermark.wmPath, watermarkBuf);
+    }
     const r = runPillowEdit(t, src, dst, opts);
     let info = {};
     try { info = JSON.parse(String(r.stdout || '{}').trim().split(/\r?\n/).pop() || '{}'); } catch { /* ignore */ }
@@ -526,21 +526,21 @@ export async function makeGif({ cfg, images, uid, isOwner, options } = {}) {
   const total = frames.reduce((s, f) => s + f.buf.length, 0);
   if (total > 200 * 1024 * 1024) throw new Error(`帧图片总量 ${(total / 1048576).toFixed(0)}MB，超过 200MB 上限，请先压缩`);
   reserveMediaQuota({ cfg, uid: requester, isOwner: isOwner === true });
-
-  ensureDir(OUT_DIR);
-  const jobId = `gif-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
-  const tmp = ensureDir(path.join(TMP_DIR, jobId));
-  const dst = path.join(tmp, 'output.gif');
-  const names = [];
-  frames.forEach((f, i) => {
-    const ext = (path.extname(String(f.name || '')) || '.png').toLowerCase().replace(/[^.a-z0-9]/g, '') || '.png';
-    const n = `frame-${String(i + 1).padStart(3, '0')}${ext}`;
-    fs.writeFileSync(path.join(tmp, n), f.buf);
-    names.push(n);
-  });
-  const payload = { frames: names, width: opts.width, delayMs: opts.fps > 0 ? Math.round(1000 / opts.fps) : opts.delay, loop: opts.loop };
   const started = Date.now();
   try {
+    /* 2026-10-28 审查 P2-2：落盘/建目录挪进 try——reserve 后抛出走 catch 的 refund。 */
+    ensureDir(OUT_DIR);
+    const jobId = `gif-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+    const tmp = ensureDir(path.join(TMP_DIR, jobId));
+    const dst = path.join(tmp, 'output.gif');
+    const names = [];
+    frames.forEach((f, i) => {
+      const ext = (path.extname(String(f.name || '')) || '.png').toLowerCase().replace(/[^.a-z0-9]/g, '') || '.png';
+      const n = `frame-${String(i + 1).padStart(3, '0')}${ext}`;
+      fs.writeFileSync(path.join(tmp, n), f.buf);
+      names.push(n);
+    });
+    const payload = { frames: names, width: opts.width, delayMs: opts.fps > 0 ? Math.round(1000 / opts.fps) : opts.delay, loop: opts.loop };
     const r = spawnSync(t.pyCmd, ['-c', PILLOW_GIF_SCRIPT, tmp, dst, JSON.stringify(payload)], {
       encoding: 'utf8',
       timeout: 300000,
@@ -583,7 +583,7 @@ with zipfile.ZipFile(dst, "w", zipfile.ZIP_DEFLATED) as z:
 print(json.dumps({"entries": len(o["files"]), "bytes": os.path.getsize(dst)}))
 `;
 
-/** 批量图片处理（ling014 工作站第三批）：2~12 张图用同一组参数逐张处理，
+/** 批量图片处理（工作站第三批）：2~12 张图用同一组参数逐张处理，
  *  打包成 ZIP 一次发回。额度算 1 次（一次批量操作）。 */
 export async function batchEditImages({ cfg, images, watermarkBuf, watermarkName, uid, isOwner, options } = {}) {
   const t = probeTools();

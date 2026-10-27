@@ -1,5 +1,5 @@
 /* ══════════════════════════════════════════════════════════════════════════
- * 文本 / JSON 工具（2026-10-27 晚，ling014 工作站对齐）
+ * 文本 / JSON 工具（2026-10-27 晚，工作站对齐）
  *
  * 工作站上的"JSON 格式化""文本处理"是一堆纯字符操作，不需要 ffmpeg/Pillow，
  * 全部在 Node 里同步完成；唯一的状态是自己的小额度文件（state/text-usage.json）。
@@ -194,6 +194,20 @@ function checkQuota(cfg, uid, isOwner) {
   return { u, c, per };
 }
 
+/** 回补一次文本额度（2026-10-28 审查 P3-8：落盘/交付失败不再白扣）。 */
+export function refundTextQuota(uid, isOwner) {
+  const key = String(uid ?? '').trim();
+  if (!key) return;
+  try {
+    const { u } = loadUsage(key);
+    if (u.users[key]) u.users[key].count = Math.max(0, (Number(u.users[key].count) || 0) - 1);
+    if (!isOwner) u.global.count = Math.max(0, (Number(u.global.count) || 0) - 1);
+    atomicWriteJson(USAGE_FILE, u);
+  } catch (e) {
+    log(`[text] 额度回补失败 ${key}: ${e?.message ?? e}`);
+  }
+}
+
 /**
  * 文本工具入口：取输入 → 跑操作 → 短的内联回，长的落盘。
  * 返回 { inline: true, result } 或 { inline: false, filePath, fileName, ... }。
@@ -221,15 +235,24 @@ export async function runTextTool({ cfg, op, text, uid, isOwner, options } = {})
   if (result.length <= TEXT_INLINE_LIMIT) {
     return { ok: true, inline: true, op: theOp, chars: result.length, result, ms: Date.now() - started };
   }
-  const stamp = new Date(Date.now() + BJ).toISOString().slice(0, 16).replace(/[-:T]/g, '');
-  fs.mkdirSync(OUT_DIR, { recursive: true });
-  let fileName = `${theOp}-${stamp}.txt`;
-  let outPath = path.join(OUT_DIR, fileName);
-  for (let n = 2; fs.existsSync(outPath) && n < 100; n += 1) {
-    fileName = `${theOp}-${stamp}-${n}.txt`;
+  /* 2026-10-28 审查 P3-8：落盘段包 try——计数后写盘失败（磁盘满/权限）回补再抛，
+   * 与媒体工具同语义（text 配了正数额度时有感；默认 0=不限时无感）。 */
+  let fileName = '';
+  let outPath = '';
+  try {
+    const stamp = new Date(Date.now() + BJ).toISOString().slice(0, 16).replace(/[-:T]/g, '');
+    fs.mkdirSync(OUT_DIR, { recursive: true });
+    fileName = `${theOp}-${stamp}.txt`;
     outPath = path.join(OUT_DIR, fileName);
+    for (let n = 2; fs.existsSync(outPath) && n < 100; n += 1) {
+      fileName = `${theOp}-${stamp}-${n}.txt`;
+      outPath = path.join(OUT_DIR, fileName);
+    }
+    fs.writeFileSync(outPath, result, 'utf8');
+  } catch (e) {
+    refundTextQuota(requester, isOwner === true);
+    throw e;
   }
-  fs.writeFileSync(outPath, result, 'utf8');
   const jobsCap = textCfg(cfg).userDailyJobs;
   log(`[text] ${theOp} 完成：${fileName} ${(result.length / 1000).toFixed(1)}k 字符 uid=${requester} owner=${isOwner === true} 剩余=${isOwner || jobsCap === 0 ? '不限' : Math.max(0, jobsCap - per.count)}`);
   return { ok: true, inline: false, op: theOp, filePath: outPath, fileName, chars: result.length, ms: Date.now() - started };

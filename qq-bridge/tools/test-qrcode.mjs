@@ -43,7 +43,7 @@ console.log('== ③ 本机真跑（有引擎才跑）==');
     console.log('  SKIP 本机没有 qrencode / python qrcode / segno，部署后服务器上会真跑');
   } else {
     const cfg = { convert: { enabled: true } };
-    const r = await generateQrCode({ cfg, text: 'https://ling014.com', uid: 'test-owner', isOwner: true, options: { level: 'H', scale: 8 } });
+    const r = await generateQrCode({ cfg, text: 'https://example.com/qr', uid: 'test-owner', isOwner: true, options: { level: 'H', scale: 8 } });
     try {
       ok('二维码 PNG 产出', r.fileName.endsWith('.png') && r.bytes > 100, JSON.stringify(r));
       const py = t.pyCmd || 'python3';

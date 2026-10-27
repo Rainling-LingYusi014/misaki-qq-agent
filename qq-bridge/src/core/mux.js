@@ -621,7 +621,7 @@ function isDuplicateInbound(key, messageId) {
   }
 
   // misaki@ 指令通道（2026-10-26）：统一前缀 `misaki@` 的桥层硬拦截——不进模型、零 token、不受模型发挥影响。
-  // 仅私聊；句中提及不触发（解析只认 misaki@ 开头）；misaki@白名单后缀（如 ling014.com 邮箱）原样放行；
+  // 仅私聊；句中提及不触发（解析只认 misaki@ 开头）；misaki@白名单后缀（如部署者自己的域名邮箱，见 social.misakiCommands.passthroughSuffixes）原样放行；
   // 未知串回固定提醒（回显打错的串并指向 misaki@help，2026-10-27 主人定版，不再罗列全表）；
   // 模式切换为三指令直切（misaki@standard/companion/interactive），目标=当前模式时回「当前已处于X模式。」（零 token）。
   if (kind === 'private') {
@@ -668,6 +668,25 @@ function isDuplicateInbound(key, messageId) {
           text = '开通好像没成功（授权没记上），请再发一次 misaki@confirm 试试。';
         }
         try { await sendToQQ(key, text, { single: true }); } catch (e) { log(`[misaki-cmd] 授权回执失败 ${key}: ${e?.message ?? e}`); }
+        try { recordSentMessages(key, [{ text }]); } catch { /* 回执入库失败不影响主流程 */ }
+        return;
+      }
+      if (mcmd.kind === 'action-voice-revoke') {
+        /* 2026-10-28 主人拍板 #9：misaki@unconfirm 撤销声音复刻授权——同样必须本人发，
+         * 桥直接回执零 token。撤的是以后建新音色的资格；已建音色不连带删（删音色走 tts 工具）。 */
+        const uid = String(key).split(':')[1] ?? '';
+        let text;
+        try {
+          const { revokeVoiceConsent } = await import('./tts-delivery.js');
+          const removed = revokeVoiceConsent(uid);
+          text = removed
+            ? '声音复刻授权已撤销：以后再想建音色，需要重新发 misaki@confirm 开通。已建成的音色不受影响。'
+            : '你本来就没有开通声音复刻授权，不用撤销。';
+        } catch (e) {
+          log(`[misaki-cmd] 声音授权撤销失败 ${key}: ${e?.message ?? e}`);
+          text = '撤销好像没成功（记账没删掉），请再发一次 misaki@unconfirm 试试。';
+        }
+        try { await sendToQQ(key, text, { single: true }); } catch (e) { log(`[misaki-cmd] 撤销回执失败 ${key}: ${e?.message ?? e}`); }
         try { recordSentMessages(key, [{ text }]); } catch { /* 回执入库失败不影响主流程 */ }
         return;
       }

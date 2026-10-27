@@ -52,7 +52,7 @@ import {
   SOCIAL_STATE_FILE, STICKER_FILE, FEEDBACK_FILE, TOOL_LOG_FILE, ACTIVITY_LOG, BRIDGE_LOG,
   CROSSCHAT_FILE, LOCK_FILE,
 } from './lib/paths.js';
-import { readJsonSafe, atomicWriteJson, atomicWriteText } from './lib/json-fs.js';
+import { readJsonSafe, atomicWriteJson, atomicWriteText, sweepStaleTmpFiles } from './lib/json-fs.js';
 import { randInt } from './lib/rand.js';
 import { BJ_WEEK, bjMinutes, bjMinToText, beijingTs, beijingDateKey, parseClockMin, fmtBeijing } from './lib/time.js';
 import { isCjkChar, splitByCjkSpaces, isCjkLikeChar, convertExampleSpacesToComma } from './lib/cjk-split.js';
@@ -791,6 +791,8 @@ async function main() {
   try { loadScheduledTasks(); } catch (error) { log(`[scheduled] 恢复定时任务失败: ${error?.message ?? error}`); }
   // 恢复待审批好友申请（拟人化延迟审批；过期条目加抖动后立即补审）
   try { loadFriendRequests(); } catch (error) { log(`[friend] 恢复待审批申请失败: ${error?.message ?? error}`); }
+  // 2026-10-28 审查 P3-10：启动清扫崩溃残留的原子写临时文件（只删 1 小时前的 *.tmp）
+  try { const swept = sweepStaleTmpFiles(STATE_DIR); if (swept) log(`[state] 启动清扫：删掉 ${swept} 个崩溃残留的 .tmp 临时文件`); } catch { /* 清扫失败不影响启动 */ }
   try { loadDocxQuota(); } catch (error) { log(`[docx] 恢复每日额度失败: ${error?.message ?? error}`); }
   try { loadActivityWindows(); } catch (error) { log(`[activity] 恢复活跃时段失败: ${error?.message ?? error}`); }
   startActivityTick();

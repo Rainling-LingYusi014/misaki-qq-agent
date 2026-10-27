@@ -6836,7 +6836,7 @@ export function startConsoleServer() {
         return;
       }
 
-      /* ── 文本 / JSON 工具（2026-10-27 晚，ling014 工作站对齐）─────────────────
+      /* ── 文本 / JSON 工具（2026-10-27 晚，工作站对齐）─────────────────
        *   POST /api/text {key, op?, text?, messageId?, options?}
        * op 缺省或未知 → 回能力表。结果 ≤5000 字符内联返回（模型自己转述给用户），
        * 更长就落成 .txt 文件发回。私聊 + token 同一条规则；额度独立在 text 段。 */
@@ -6873,8 +6873,13 @@ export function startConsoleServer() {
             }
             const r = await txtMod.runTextTool({ cfg: cfgRef, op: tbody.op, text, uid, isOwner, options: tbody.options });
             if (r.inline === false) {
-              /* 文本额度不回补：操作瞬时完成、额度独立且廉价，交付失败让模型重发即可。 */
-              await deliverWorkstationFile({ key, filePath: r.filePath, fileName: r.fileName, label: '文本结果', uid });
+              /* 2026-10-28 审查 P3-8：文本交付失败也回补（与媒体工具同语义；text 配正数额度时有感）。 */
+              try {
+                await deliverWorkstationFile({ key, filePath: r.filePath, fileName: r.fileName, label: '文本结果', uid });
+              } catch (e) {
+                try { txtMod.refundTextQuota(uid, isOwner === true); } catch { /* ignore */ }
+                throw e;
+              }
               const { filePath, ...pub } = r;
               sendJson({ ...pub, sent: true, sentTo: key });
             } else {

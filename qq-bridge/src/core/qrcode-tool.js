@@ -1,5 +1,5 @@
 /* ══════════════════════════════════════════════════════════════════════════
- * 二维码生成（2026-10-27 晚，ling014 工作站第三批）
+ * 二维码生成（2026-10-27 晚，工作站第三批）
  *
  * 文本/链接 → QR PNG 文件发回。实现按服务器实际有的工具自动挑：
  *   1) qrencode CLI（apt install qrencode）——最省事；
@@ -120,11 +120,11 @@ export async function generateQrCode({ cfg, text, uid, isOwner, options } = {}) 
   if (theText.length > MAX_TEXT) throw new Error(`内容 ${theText.length} 字符，二维码最多 ${MAX_TEXT} 字符`);
   const opts = validateQrOptions(options);
   reserveMediaQuota({ cfg, uid: requester, isOwner: isOwner === true });
-
-  ensureDir(OUT_DIR);
-  const tmp = ensureDir(path.join(TMP_DIR, `qr-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`));
   const started = Date.now();
   try {
+    /* 2026-10-28 审查 P2-2：建目录挪进 try——reserve 后抛出走 catch 的 refund。 */
+    ensureDir(OUT_DIR);
+    const tmp = ensureDir(path.join(TMP_DIR, `qr-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`));
     const dst = path.join(tmp, 'qrcode.png');
     let info = {};
     if (t.mode === 'qrencode') {

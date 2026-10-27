@@ -5,10 +5,10 @@
  *   输入：1~5 个音频文件（wav/mp3/m4a…，干净单人人声）
  *   输出：一个音频文件（默认 mp3，可选 wav / m4a / ogg / flac）
  *
- * 权限与额度（2026-10-27 第二轮定规）：
+ * 权限与额度（2026-10-28 定稿）：
  *   · 只对**私聊**开放；群聊一律拒绝（群里的语音复刻容易被拿去冒充，且无法可靠绑定请求者）。
- *   · 主人（cfg.ownerQQ）不限额；普通用户每天 10 条、2,000 字、3 次建音色、3 个音色档案；普通用户总池 20,000 字/天、100 条、30 次建音色。
- *   · 全局（仅普通用户）每天 100 条、100,000 字、30 次建音色，防止多人叠加把账单打穿。
+ *   · 主人（cfg.ownerQQ）不限额；普通用户每天 10 条、2,000 字、5 次建音色、3 个音色档案。
+ *   · 全站池 = 单用户数额的 600%：60 条 / 12,000 字 / 30 次建音色（多人叠加也打不穿账单）。
  *   · 全部按北京日 0 点刷新（state/tts-usage.json）。
  *
  * 硬规矩：
@@ -185,9 +185,8 @@ function checkEnrollQuota({ cfg, uid, isOwner, voiceCount }) {
  * pre 是预扣前快照，保证「剩余条数/字数」的展示口径与旧实现一致（当前这条已算进去）。 */
 function reserveRenderQuota({ cfg, chars, uid, isOwner }) {
   const r = checkRenderQuota({ cfg, chars, uid, isOwner }); /* 满了在这里抛 */
-  const pre = { jobs: r.per.jobs, chars: r.per.chars };
   commitUsage(r.u, uid, isOwner === true, { chars, jobs: 1 });
-  return { d: r.d, per: r.per, pre };
+  return { d: r.d, per: r.per };
 }
 function refundRenderUsage({ uid, isOwner, chars, jobs = 1 }) {
   const key = String(uid ?? '').trim();
@@ -237,6 +236,21 @@ export function markVoiceConsent(uid, key = '', file = CONSENT_FILE) {
   d.uids = (d.uids && typeof d.uids === 'object') ? d.uids : {};
   if (!d.uids[q]) d.uids[q] = { at: new Date().toISOString(), key: String(key ?? '') };
   atomicWriteJson(file, d);
+}
+
+/** 撤销授权（2026-10-28 主人拍板 #9）：删 uid 记账；从未授权过也按成功回执（幂等）。
+ *  只撤「以后建新音色」的资格——已建成的音色档案不连带删（要删用 misaki@help 体系外的
+ *  tts_voice_delete 工具，那是另一个动作）。 */
+export function revokeVoiceConsent(uid, file = CONSENT_FILE) {
+  const q = String(uid ?? '').trim();
+  if (!q) throw new Error('缺少 uid，无法撤授权');
+  const d = readJsonSafe(file, {});
+  if (d.uids && typeof d.uids === 'object' && d.uids[q]) {
+    delete d.uids[q];
+    atomicWriteJson(file, d);
+    return true; /* 真删了一条 */
+  }
+  return false; /* 本来就没有，幂等成功 */
 }
 
 /* ── 音色档案（按 ownerUid 隔离） ── */
@@ -548,14 +562,14 @@ export async function enrollFromSamples({ cfg, files, name, targetModel, uid, is
   const d = loadProfiles(cfg);
   const myVoices = d.voices.filter((v) => String(v.ownerUid ?? '') === requester).length;
   reserveEnrollQuota({ cfg, uid: requester, isOwner: isOwner === true, voiceCount: myVoices });
-  /* 先建客户端：缺 key / 缺 workspace 时立刻报错，不要让用户先等完整套质检再看到"没配置"。 */
-  const client = createQwenClient(cfg);
-
-  ensureDir(SAMPLE_DIR);
-  const jobId = `enroll-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
-  const tmp = ensureDir(path.join(TMP_DIR, jobId));
-  const candidates = [];
   try {
+    /* 2026-10-28 审查 P2-2：准备步骤挪进 try（catch 有 refund）——缺 key/建目录失败不再白扣。
+     * 先建客户端的语义保留：缺 key / 缺 workspace 时立刻报错，不等完整套质检。 */
+    const client = createQwenClient(cfg);
+    ensureDir(SAMPLE_DIR);
+    const jobId = `enroll-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+    const tmp = ensureDir(path.join(TMP_DIR, jobId));
+    const candidates = [];
     for (let i = 0; i < files.length; i += 1) {
       const f = files[i];
       const ext = path.extname(f.name).toLowerCase() || '.audio';
@@ -739,15 +753,16 @@ export async function renderToAudio({ cfg, voice, text, title, uid, isOwner, for
   if (!t) throw new Error('要读的文本是空的');
   const chars = [...t].length;
   const { d, per } = reserveRenderQuota({ cfg, chars, uid: requester, isOwner: isOwner === true });
-  const chunks = splitText(t, d.chunkChars);
-  if (!chunks.length) throw new Error('文本分块后为空');
-
-  const client = createQwenClient(cfg);
-  const jobId = `render-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
-  ensureDir(OUT_DIR);
-  const tmp = ensureDir(path.join(TMP_DIR, jobId));
   const started = Date.now();
   try {
+    /* 2026-10-28 审查 P2-2：准备步骤放进 try——reserve 之后任何一处抛出（缺 key/分块异常/
+     * 建目录失败）都要走 catch 的 refund，不再白扣一次额度。 */
+    const chunks = splitText(t, d.chunkChars);
+    if (!chunks.length) throw new Error('文本分块后为空');
+    const client = createQwenClient(cfg);
+    const jobId = `render-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+    ensureDir(OUT_DIR);
+    const tmp = ensureDir(path.join(TMP_DIR, jobId));
     const parts = [];
     let actualRate = client.config.sampleRate;
     for (let i = 0; i < chunks.length; i += 1) {

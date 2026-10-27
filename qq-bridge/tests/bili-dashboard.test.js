@@ -32,14 +32,17 @@ assert.equal(readSelfMid(authFile), '');
 /* ── 汇总链路（fetch 打桩；形状=2026-10-28 服务器实测：
  *    新投稿在 arc_audits（x.Archive，过审也在），archives 要有播放数据才进，总数 page.count） ── */
 fs.writeFileSync(authFile, JSON.stringify({ DedeUserID: '42', bili_jct: 'tok' }));
-const ARC_1 = { aid: 1, bvid: 'BV1aaa', title: '第一条', tname: '科技', ptime: 1761000000, state: 0, stat: { view: 100, like: 20, coin: 5, favorite: 3, share: 2, reply: 4, danmaku: 7 } };
+/* 重叠期语义（2026-10-28 审查 P2-3）：同一 bvid 两表并存时，arc_audits 侧 stat 空、
+ * archives 侧才有播放数据——去重必须保 archives 那份。fixture 故意让两份不一致。 */
+const ARC_1_AUDIT = { aid: 1, bvid: 'BV1aaa', title: '第一条', tname: '科技', ptime: 1761000000, state: 0, stat: {} };
+const ARC_1_STATS = { aid: 1, bvid: 'BV1aaa', title: '第一条', tname: '科技', ptime: 1761000000, state: 0, stat: { view: 100, like: 20, coin: 5, favorite: 3, share: 2, reply: 4, danmaku: 7 } };
 const ARC_2 = { aid: 2, bvid: 'BV1bbb', title: '第二条', tname: '科技', ptime: 1761100000, state: -30, stat: {} };
 const ARCHIVES = {
   code: 0,
   data: {
     class: { pubed: 1, is_pubing: 1, not_pubed: 0 },
-    arc_audits: [{ Archive: ARC_2 }, { Archive: ARC_1 }],
-    archives: [ARC_1], /* 同一条也会出现在 archives（有播放数据后）——必须去重 */
+    arc_audits: [{ Archive: ARC_2 }, { Archive: ARC_1_AUDIT }],
+    archives: [ARC_1_STATS],
     page: { pn: 1, ps: 20, count: 2 },
   },
 };
@@ -61,7 +64,7 @@ try {
   assert.equal(s.fetched, 2);
   assert.deepEqual(s.auditClass, { pubed: 1, auditing: 1, rejected: 0 });
   assert.equal(s.fans, 123);
-  assert.deepEqual(s.sum, { view: 100, like: 20, coin: 5, favorite: 3, share: 2, reply: 4, danmaku: 7 });
+  assert.deepEqual(s.sum, { view: 100, like: 20, coin: 5, favorite: 3, share: 2, reply: 4, danmaku: 7 }, '重叠期必须取 archives 侧的统计');
   assert.equal(s.pending.length, 1);
   assert.equal(s.pending[0].bvid, 'BV1bbb');
   assert.equal(s.pending[0].label, '审核中');
