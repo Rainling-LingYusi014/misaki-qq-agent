@@ -655,7 +655,7 @@ function isDuplicateInbound(key, messageId) {
       }
       if (mcmd.kind === 'action-voice-consent') {
         /* 2026-10-28（审查 P1-3 修复）：声音复刻的用户侧授权闸——必须用户本人在 QQ 里
-         * 发「misaki@确认授权」才算数（模型传的 consent=true 只是转述，硬闸在 tts-delivery）。
+         * 发「misaki@confirm」才算数（模型传的 consent=true 只是转述，硬闸在 tts-delivery）。
          * 记账落 state/voice-consent.json；桥直接回执，不进模型、零 token。 */
         const uid = String(key).split(':')[1] ?? '';
         let text;
@@ -665,7 +665,7 @@ function isDuplicateInbound(key, messageId) {
           text = '声音复刻授权已开通：以后可以让美咲用你的声音读东西了，建音色时不会再重复询问。';
         } catch (e) {
           log(`[misaki-cmd] 声音授权记账失败 ${key}: ${e?.message ?? e}`);
-          text = '开通好像没成功（授权没记上），请再发一次 misaki@确认授权 试试。';
+          text = '开通好像没成功（授权没记上），请再发一次 misaki@confirm 试试。';
         }
         try { await sendToQQ(key, text, { single: true }); } catch (e) { log(`[misaki-cmd] 授权回执失败 ${key}: ${e?.message ?? e}`); }
         try { recordSentMessages(key, [{ text }]); } catch { /* 回执入库失败不影响主流程 */ }

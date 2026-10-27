@@ -46,7 +46,7 @@ export const ACTIONS = [
   { token: 'reset', kind: 'action-reset', label: '清空所有过往认知' },
   // 2026-10-28（审查 P1-3 修复）：声音复刻的用户侧授权闸——用户本人发过这条才算授权，
   // 模型传的 consent=true 只是转述。执行在 mux.js（记账落 state/voice-consent.json）。
-  { token: '确认授权', kind: 'action-voice-consent', label: '开通声音复刻授权（建音色前发一次）' },
+  { token: 'confirm', kind: 'action-voice-consent', label: '开通声音复刻授权（建音色前发一次）' },
 ];
 
 /** misaki@help：指令一览（注册表自动生成，加新模式/动作自动出现）+ 用法规范。
