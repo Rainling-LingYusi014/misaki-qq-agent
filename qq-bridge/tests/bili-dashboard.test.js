@@ -29,16 +29,18 @@ assert.equal(readSelfMid(authFile), '99');
 fs.writeFileSync(authFile, JSON.stringify({ bili_jct: 'tok' }));
 assert.equal(readSelfMid(authFile), '');
 
-/* ── 汇总链路（fetch 打桩） ── */
+/* ── 汇总链路（fetch 打桩；形状=2026-10-28 服务器实测：
+ *    新投稿在 arc_audits（x.Archive，过审也在），archives 要有播放数据才进，总数 page.count） ── */
 fs.writeFileSync(authFile, JSON.stringify({ DedeUserID: '42', bili_jct: 'tok' }));
+const ARC_1 = { aid: 1, bvid: 'BV1aaa', title: '第一条', tname: '科技', ptime: 1761000000, state: 0, stat: { view: 100, like: 20, coin: 5, favorite: 3, share: 2, reply: 4, danmaku: 7 } };
+const ARC_2 = { aid: 2, bvid: 'BV1bbb', title: '第二条', tname: '科技', ptime: 1761100000, state: -30, stat: {} };
 const ARCHIVES = {
   code: 0,
   data: {
-    arc_count: 2,
-    arcDatas: [
-      { aid: 1, bvid: 'BV1aaa', title: '第一条', tname: '科技', ptime: 1761000000, state: 0, stat: { view: 100, like: 20, coin: 5, favorite: 3, share: 2, reply: 4, danmaku: 7 } },
-      { aid: 2, bvid: 'BV1bbb', title: '第二条', tname: '科技', ptime: 1761100000, state: -30, stat: { view: 0, like: 0, coin: 0, favorite: 0, share: 0, reply: 0, danmaku: 0 } },
-    ],
+    class: { pubed: 1, is_pubing: 1, not_pubed: 0 },
+    arc_audits: [{ Archive: ARC_2 }, { Archive: ARC_1 }],
+    archives: [ARC_1], /* 同一条也会出现在 archives（有播放数据后）——必须去重 */
+    page: { pn: 1, ps: 20, count: 2 },
   },
 };
 let seenUrls = [];
@@ -57,12 +59,15 @@ try {
   assert.equal(s.ok, true);
   assert.equal(s.total, 2);
   assert.equal(s.fetched, 2);
+  assert.deepEqual(s.auditClass, { pubed: 1, auditing: 1, rejected: 0 });
   assert.equal(s.fans, 123);
   assert.deepEqual(s.sum, { view: 100, like: 20, coin: 5, favorite: 3, share: 2, reply: 4, danmaku: 7 });
   assert.equal(s.pending.length, 1);
   assert.equal(s.pending[0].bvid, 'BV1bbb');
   assert.equal(s.pending[0].label, '审核中');
-  assert.equal(s.videos[1].url, 'https://www.bilibili.com/video/BV1bbb');
+  const bbb = s.videos.find((v) => v.bvid === 'BV1bbb');
+  assert.equal(bbb.url, 'https://www.bilibili.com/video/BV1bbb');
+  assert.equal(s.videos.length, 2, '同 bvid 出现在两表必须去重');
   assert.ok(s.sumScope.includes('最近 2 条'), `sumScope 说明缺失：${s.sumScope}`);
   assert.ok(seenUrls.some((u) => u.includes('member.bilibili.com/x/web/archives?status=all&pn=1&ps=20')), `archives URL 不符：${seenUrls.join(' | ')}`);
   assert.ok(seenCookie.includes('DedeUserID=42'), '登录 cookie 没带全');

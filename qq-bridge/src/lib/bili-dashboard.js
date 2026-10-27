@@ -55,17 +55,37 @@ export function readSelfMid(authFile = BILI_AUTH_FILE) {
   return /^\d{1,16}$/.test(s) ? s : '';
 }
 
-/** 创作中心稿件列表（一页）。返回 { ok, total, items:[{bvid,aid,title,tname,ptime,state,label,stat}] }。 */
+/** 创作中心稿件列表（一页）。返回 { ok, total, auditClass, items:[{bvid,aid,title,tname,ptime,state,label,stat}] }。
+ *  2026-10-28 服务器实测：新投稿（即使已过审）先出现在 data.arc_audits（x.Archive），
+ *  有播放数据后才挪进 data.archives —— 两表合并、按 bvid 去重；总数看 data.page.count，
+ *  审核分账看 data.class = {pubed, is_pubing, not_pubed}。 */
 export async function listMyArchives({ pn = 1, ps = 20, status = 'all', authFile = BILI_AUTH_FILE, circuitFile = BILI_CIRCUIT_FILE } = {}) {
   const qs = `status=${encodeURIComponent(status)}&pn=${Math.max(1, Number(pn) || 1)}&ps=${Math.max(1, Math.min(50, Number(ps) || 20))}`;
   const j = await biliJson(`${MEMBER}/x/web/archives?${qs}`, {
     referer: REFERER, scope: 'dashboard', authFile, circuitFile,
   });
   if (j.code !== 0) return { ok: false, why: `archives code=${j.code} ${j.message ?? ''}` };
-  const rows = Array.isArray(j.data?.arcDatas) ? j.data.arcDatas : [];
+  const d = j.data ?? {};
+  const merged = [
+    ...(Array.isArray(d.arc_audits) ? d.arc_audits : []).map((x) => x?.Archive).filter(Boolean),
+    ...(Array.isArray(d.archives) ? d.archives : []),
+  ];
+  const seen = new Set();
+  const rows = merged.filter((r) => {
+    const k = String(r.bvid ?? '');
+    if (!k || seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+  const cls = (d.class && typeof d.class === 'object') ? d.class : {};
   return {
     ok: true,
-    total: Number(j.data?.arc_count ?? rows.length) || rows.length,
+    total: Number(d.page?.count ?? rows.length) || rows.length,
+    auditClass: {
+      pubed: Number(cls.pubed) || 0,
+      auditing: Number(cls.is_pubing) || 0,
+      rejected: Number(cls.not_pubed) || 0,
+    },
     items: rows.map((r) => ({
       bvid: String(r.bvid ?? ''),
       aid: Number(r.aid) || 0,
@@ -94,7 +114,7 @@ export async function fanCount({ mid, authFile = BILI_AUTH_FILE, circuitFile = B
   }
 }
 
-/** 面板汇总：稿件统计 + 审核中/打回清单 + 粉丝数。
+/** 面板汇总：稿件统计 + 审核分账/待处理清单 + 粉丝数。
  *  合计只覆盖拉到的这一页（ps 默认 20）——返回里带 sumScope 说明，调用方照实说，不冒充全站总数。 */
 export async function dashboardSummary({ pageSize = 20, authFile = BILI_AUTH_FILE, circuitFile = BILI_CIRCUIT_FILE } = {}) {
   const arcs = await listMyArchives({ ps: pageSize, authFile, circuitFile });
@@ -104,6 +124,7 @@ export async function dashboardSummary({ pageSize = 20, authFile = BILI_AUTH_FIL
   return {
     ok: true,
     total: arcs.total,
+    auditClass: arcs.auditClass,
     fetched: arcs.items.length,
     sumScope: `最近 ${arcs.items.length} 条（共 ${arcs.total} 条）`,
     sum: sumStats(arcs.items),
