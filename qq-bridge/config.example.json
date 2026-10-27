@@ -205,6 +205,19 @@
       "help": true,
       "biliDashboard": true
     },
+    "budget": {
+      "_note": "token 预算闸（审查 P2-1；owner 私聊全豁免——用量照记、永不拦截）。dailyGlobal=全局日预算（含 owner 用量）；dailyPerConv=每会话日预算；dailyNonOwnerGlobal=非主人全局池（2026-10-28 开放好友：合计时剔除 owner 会话，主人自己的消耗不吃好友的池子）。0 或缺省=该级不限额。多级并存时任一超限即拦，提示报占比最紧的一级。本部署建议口径：单好友 50 万/天、好友池=600%（300 万/天，≈ DeepSeek Flash 峰段 ¥12 上限，实际因缓存命中与闲时半价远低于此）。",
+      "dailyPerConv": 0,
+      "dailyGlobal": 0,
+      "dailyNonOwnerGlobal": 0
+    },
+    "friendApproval": {
+      "_note": "好友申请拟人化审批（2026-10-07）：黑名单秒拒、owner/白名单秒过；其余默认随机晾 minDelayMs~maxDelayMs 再自动通过并伪消息通报 owner。autoApprove=false = 手动模式（2026-10-28 开放好友，主人亲自审批）：桥不代批不挂定时器（重启恢复也不补批），只通报 owner 去 QQ 里亲自处理——通过后记得把对方加进 allow.private 私聊白名单，否则消息进不来。",
+      "autoApprove": true,
+      "minDelayMs": 600000,
+      "maxDelayMs": 21600000,
+      "notifyOwner": true
+    },
     "wake": {
       "defaultMode": "active",
       "preSleepWaitEnabled": true,
