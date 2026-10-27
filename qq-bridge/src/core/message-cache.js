@@ -106,9 +106,12 @@ export async function resolveReplyInfo(kind, convId, messageId, selfId = null) {
             includeReply: false
           });
           const senderUserId = raw.sender?.user_id ?? raw.user_id ?? null;
+          /* 2026-10-28（主人拍板）：引用预览 200→2000 字，且截断时显式标注——
+           * 原来静默切片，模型只能靠猜（"断在 misaki@re"），还可能把截断当原文句尾。 */
+          const quoteRaw = String(text ?? '');
           info = {
             sender: String(sender ?? ''),
-            text: String(text ?? '').slice(0, 200),
+            text: quoteRaw.length > 2000 ? quoteRaw.slice(0, 2000) + '\n…（引用原文过长，已截断）' : quoteRaw,
             userId: senderUserId != null ? String(senderUserId) : null
           };
         }
@@ -140,7 +143,8 @@ function resolveReplyInfoFromDb(kind, convId, messageId, selfId) {
     const rowMessageId = String(row.messageId || '');
     return {
       sender: String(row.sender || row.userId || '未知'),
-      text: String(row.text || '').slice(0, 200),
+      // 与上方 OneBot 路径同一规则（2026-10-28）：2000 字 + 显式截断标记
+      text: String(row.text || '').slice(0, 2000) + (String(row.text || '').length > 2000 ? '\n…（引用原文过长，已截断）' : ''),
       // 自发消息（is_self）在 DB 里 sender_uid='self'：能对上 selfId 就按“引用我自己”返回，否则不给 userId
       userId: row.isSelf ? (selfId != null ? String(selfId) : null) : (row.userId || null),
       // 该行真实 QQ message id（拍一拍等没有 id 的行为空串）；matchedBySeq=true 表示本次是「按本地 seq」
