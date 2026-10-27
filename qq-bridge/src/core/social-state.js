@@ -18,7 +18,7 @@ import { typingHoldDecision, typingHoldText, STEER_IN_TURN_DEFER_MAX_MS } from '
 import {
   DEFAULT_MODE, MODES, modeLabel, companionCfg, inCompanionQuietHours,
   companionTypingDecisionCfg, companionToolRefusal,
-  COMPANION_ENTER_TEXT, COMPANION_EXIT_TEXT, COMPANION_ALREADY_TEXT, unknownCommandText,
+  enterModeText, alreadyInModeText, unknownCommandText,
 } from './companion-mode.js';
 import { isDirectedAtAi } from '../lib/social-timeline.js';
 import { looksLikeUnfinished } from '../wait.js';
@@ -430,7 +430,10 @@ export function saveSocialState() {
         agentMode: stAgentMode(st),
         companionMode: st.companionMode && typeof st.companionMode === 'object' ? { ...st.companionMode } : { proactiveDay: '', proactiveCount: 0, unansweredStreak: 0, awaitingReplySince: 0 },
         stopNoteAt: Number(st.stopNoteAt) || 0,
-        // misaki@reset -1 锁定期（重启不丢；到点执行由 mux 注册的 executor 完成）
+        // [ModeChanged] 挂起标记（重启不丢；与 stopNote 同构）
+        modeNoteAt: Number(st.modeNoteAt) || 0,
+        modeNoteMode: String(st.modeNoteMode || ''),
+        // misaki@reset 锁定期（重启不丢；到点执行由 mux 注册的 executor 完成）
         pendingReset: st.pendingReset && typeof st.pendingReset === 'object' ? { executeAt: Number(st.pendingReset.executeAt) || 0 } : null
       };
     }
@@ -571,7 +574,10 @@ export function getSocialState(key) {
       companionMode: { proactiveDay: '', proactiveCount: 0, unansweredStreak: 0, awaitingReplySince: 0 },
       // misaki@stop 的"另行说明"挂起标记：下一轮唤醒注入 [Stopped] 行时消费（落盘防重启丢失）
       stopNoteAt: 0,
-      // misaki@reset -1 锁定期：{ executeAt } 挂起期间收到任何回话即取消；到点且无回话才执行（落盘防重启丢失）
+      // [ModeChanged] 挂起标记：桥替她切换模式后下一轮注入说明行（与 stopNote 同构，落盘防重启丢失）
+      modeNoteAt: 0,
+      modeNoteMode: '',
+      // misaki@reset 锁定期：{ executeAt } 挂起期间收到任何回话即取消；到点且无回话才执行（落盘防重启丢失）
       pendingReset: null,
       wakeTimes: [],
       sendTimes: [],
@@ -708,7 +714,8 @@ export function loadSocialState() {
           proactiveCount: Number(val.proactiveCount) || 0,
           proactiveRolled: val.proactiveRolled === true,
           // 2026-10-26 模式系统：读回来也要认这两个字段，否则重启后模式丢失
-          agentMode: val.agentMode === 'companion' ? 'companion' : 'regular',
+          // 2026-10-27 三模式：白名单必须列全，否则 interactive 重启后被静默折叠回 regular
+          agentMode: (val.agentMode === 'companion' || val.agentMode === 'interactive') ? val.agentMode : 'regular',
           companionMode: {
             proactiveDay: String(val.companionMode?.proactiveDay ?? ''),
             proactiveCount: Number(val.companionMode?.proactiveCount) || 0,
@@ -716,6 +723,8 @@ export function loadSocialState() {
             awaitingReplySince: Number(val.companionMode?.awaitingReplySince) || 0
           },
           stopNoteAt: Number(val.stopNoteAt) || 0,
+          modeNoteAt: Number(val.modeNoteAt) || 0,
+          modeNoteMode: String(val.modeNoteMode || ''),
           pendingReset: (val.pendingReset && typeof val.pendingReset === 'object') ? { executeAt: Number(val.pendingReset.executeAt) || 0 } : null,
           memberImpressions: (() => {
             const rawImp = (val.memberImpressions && typeof val.memberImpressions === 'object') ? val.memberImpressions : {};
@@ -764,7 +773,7 @@ export function loadSocialState() {
   } catch (error) {
     log('读取 social 状态失败:', error?.message ?? error);
   }
-  // 2026-10-26 misaki@reset -1：锁定期挂起状态随状态文件恢复（executor 已在 initMuxCore 注册）
+  // 2026-10-26 misaki@reset：锁定期挂起状态随状态文件恢复（executor 已在 initMuxCore 注册）
   try { rearmPendingResets(); } catch (e) { log('[misaki-cmd] 锁定期恢复失败:', e?.message ?? e); }
 }
 
@@ -850,7 +859,8 @@ export function setupSleepTimer(key) {
 // ── 模式系统（2026-10-26）：常规模式（默认）/ 陪伴模式；misaki@ 指令切换 ──────────
 // st 层的模式读取（未知/异常值一律视为常规模式）
 function stAgentMode(st) {
-  return st && st.agentMode === 'companion' ? 'companion' : DEFAULT_MODE;
+  const m = st && st.agentMode;
+  return (m === 'companion' || m === 'interactive') ? m : DEFAULT_MODE;
 }
 
 /** 会话当前模式 id（'regular' | 'companion'；只读，不为陌生 key 创建状态） */
@@ -890,10 +900,14 @@ export function setConversationMode(key, modeId) {
   const mode = MODES.some((m) => m.id === String(modeId)) ? String(modeId) : DEFAULT_MODE;
   const st = getSocialState(key);
   st.agentMode = mode;
+  // [ModeChanged] 挂起标记（2026-10-26 实测事故后加）：桥替她切模式她毫无感知，下一轮唤醒注入说明行
+  st.modeNoteAt = Date.now();
+  st.modeNoteMode = mode;
   if (mode === 'companion') {
     st.companionMode = { proactiveDay: '', proactiveCount: 0, unansweredStreak: 0, awaitingReplySince: 0 };
   }
   if (st.proactiveTimer) { clearTimeout(st.proactiveTimer); st.proactiveTimer = null; }
+  log(`[mode] ${key} 模式切换 → ${modeLabel(mode)}（misaki@ 指令）`);
   saveSocialState();
   if (!social.paused) { try { scheduleProactiveCheck(key); } catch { /* 重排失败不影响模式切换 */ } }
   return mode;
@@ -901,22 +915,17 @@ export function setConversationMode(key, modeId) {
 
 /**
  * misaki@ 指令的应用（mux.handleIncoming 调用）：改状态 + 返回要直发的固定文案（零 token）。
- * 返回 null = 放行正常流程（passthrough / 已在常规模式时收到 off / 其它不可执行情形）。
+ * 返回 null = 放行正常流程（passthrough / 其它不可执行情形）。
+ * 2026-10-27 三模式直切：mode-switch 统一处理——目标=当前模式回「当前已处于X模式。」，否则切换并按目标模式回执。
  */
 export function applyMisakiCommand(key, cmd) {
   if (!cmd || typeof cmd !== 'object') return null;
-  if (cmd.kind === 'mode-on') {
-    if (conversationMode(key) === cmd.mode) return COMPANION_ALREADY_TEXT;
-    setConversationMode(key, cmd.mode);
-    appendActivity(`${key} 进入${modeLabel(cmd.mode)}（misaki@ 指令）`);
-    return COMPANION_ENTER_TEXT;
-  }
-  if (cmd.kind === 'mode-off') {
-    if (conversationMode(key) === DEFAULT_MODE) return null;
+  if (cmd.kind === 'mode-switch') {
+    if (conversationMode(key) === cmd.mode) return alreadyInModeText(cmd.mode);
     const from = modeLabel(conversationMode(key));
-    setConversationMode(key, DEFAULT_MODE);
-    appendActivity(`${key} 退出${from} → 常规模式（misaki@ 指令）`);
-    return COMPANION_EXIT_TEXT;
+    setConversationMode(key, cmd.mode);
+    appendActivity(`${key} ${from} → ${modeLabel(cmd.mode)}（misaki@ 指令）`);
+    return enterModeText(cmd.mode);
   }
   if (cmd.kind === 'unknown') return unknownCommandText(cmd.token);
   return null;
@@ -937,7 +946,18 @@ export function consumeStopNote(key) {
   return at;
 }
 
-// ── misaki@reset -1 锁定期（2026-10-26）：1 小时静默确认 ─────────────────────
+/** 读取并清除挂起的 [ModeChanged] 标记（一次性）：桥替她切换模式后，下一轮唤醒注入说明行。
+ *  2026-10-26 实测事故：切换对模型不可见 → 她否认桥的退场回执、自称还在陪伴模式、反索指令。 */
+export function consumeModeNote(key) {
+  const st = social.conversations.get(canonicalKey(key));
+  if (!st || !Number(st.modeNoteAt)) return null;
+  const out = { at: Number(st.modeNoteAt), mode: String(st.modeNoteMode || DEFAULT_MODE) };
+  st.modeNoteAt = 0;
+  st.modeNoteMode = '';
+  return out;
+}
+
+// ── misaki@reset 锁定期（2026-10-26）：1 小时静默确认 ─────────────────────
 // 进入锁定期后，对方任何一条普通回话立即取消；一条都没有，到点自动执行清空。
 // 到点执行由注入的 executor（mux 在 initMuxCore 注册）完成；misaki@stop 不触碰这里（主人定规）。
 // 挂起状态随会话落盘，重启后由 loadSocialState 末尾的 rearmPendingResets 重新挂表。
@@ -1004,7 +1024,7 @@ export function rearmPendingResets() {
     if (at <= Date.now()) firePendingReset(key);
     else armResetTimer(key, at);
   }
-  if (n) log(`[misaki-cmd] 已恢复 ${n} 个 misaki@reset -1 锁定期计时`);
+  if (n) log(`[misaki-cmd] 已恢复 ${n} 个 misaki@reset 锁定期计时`);
   return n;
 }
 

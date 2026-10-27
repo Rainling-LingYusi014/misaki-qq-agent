@@ -120,6 +120,19 @@ const MANAGEMENT = [
   'qq_config_get',          // 读桥配置/语音页配置（密钥打码）
   'qq_config_set',          // 改一个配置点路径（服务端读真值改写，密钥类拒绝）
   'qq_voice_manage',        // 音色库：列/建（文字设计或复刻已有音色）/删/设默认
+  /* 2026-10-27 千问复刻交付（主人定规：只收音频文件、只交付 MP3）。
+   * 同样属于"主人不在电脑前也要能用"的能力，medium/high 必须保留；
+   * extreme 档为省钱砍掉（那时也不能做长文交付）。 */
+  'tts_enroll_voice',
+  'tts_render_file',
+  'tts_voice_list',
+  'tts_voice_delete',
+  'qq_convert_file',
+  'qq_image_edit',
+  'qq_text_tool',
+  'qq_pdf_tool',
+  'qq_qrcode',
+  'qq_help',
 ];
 
 export const TOOL_TIERS = {

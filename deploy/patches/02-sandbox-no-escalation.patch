@@ -1,5 +1,5 @@
---- /home/ubuntu/qq-agent/dsh/node_modules/@deepseek-ai/dsh-sandbox/lib/index.js.bak-pre-cred-hardening-20261026	2026-10-26 10:52:59.495817406 +0800
-+++ /home/ubuntu/qq-agent/dsh/node_modules/@deepseek-ai/dsh-sandbox/lib/index.js	2026-10-26 10:52:59.497817419 +0800
+--- dsh-sandbox/lib/index.js.bak-pre-cred-hardening-20261026	2026-10-26 10:52:59.495817406 +0800
++++ dsh-sandbox/lib/index.js	2026-10-26 10:52:59.497817419 +0800
 @@ -39,7 +39,7 @@
  * mode sits below it (a `danger-full-access` default would advertise nothing
  * while a narrower-switched session stays confined with no lever).

@@ -1,5 +1,5 @@
---- /home/ubuntu/qq-agent/dsh/node_modules/@deepseek-ai/dsh-sandbox-local/lib/index.js.bak-pre-cred-hardening-20261026	2026-10-26 10:29:20.324945398 +0800
-+++ /home/ubuntu/qq-agent/dsh/node_modules/@deepseek-ai/dsh-sandbox-local/lib/index.js	2026-10-26 11:12:14.272261395 +0800
+--- dsh-sandbox-local/lib/index.js.bak-pre-cred-hardening-20261026	2026-10-26 10:29:20.324945398 +0800
++++ dsh-sandbox-local/lib/index.js	2026-10-26 11:12:14.272261395 +0800
 @@ -45,10 +45,20 @@
  function landlockProfileArgs(policy) {
  	const readWrite = ["/dev/null"];

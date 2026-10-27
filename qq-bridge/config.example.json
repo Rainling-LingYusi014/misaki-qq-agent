@@ -106,6 +106,54 @@
     "workspaceTitle": "SlangAgent",
     "autoResearch": true
   },
+  "convert": {
+    "_note": "通用文件格式转换（2026-10-27）：只私聊；主人不限额，普通用户 10 次/天，全局 100 次/天；输入 50MB、输出 150MB；Office 宏禁用且不保留。能力取决于服务器装了 ffmpeg / LibreOffice / pandoc / poppler / img2pdf。视频压缩（crf/level/maxHeight/mute）、视频转 GIF（start/duration/fps/width）、多图合成 PDF 走同一份额度。",
+    "enabled": true,
+    "userDailyJobs": 10,
+    "globalDailyJobs": 100,
+    "maxInputBytes": 52428800,
+    "maxOutputBytes": 157286400,
+    "timeoutMs": 180000,
+    "videoTimeoutMs": 300000,
+    "retentionDays": 3
+  },
+  "text": {
+    "_note": "文本/JSON 工具（2026-10-27 晚）：JSON 格式化/校验、base64/url、哈希、行去重排序、替换等纯字符操作；与转换同一私聊规则，额度独立。结果 ≤5000 字符内联返回，超过落成 .txt 文件发回。",
+    "enabled": true,
+    "userDailyJobs": 50,
+    "globalDailyJobs": 500,
+    "maxInputChars": 1000000
+  },
+  "voice": {
+    "_note": "TTS 交付链路（2026-10-27）：只收音频文件、只交付音频文件、复刻走千问。与 state/voice-config.json 的 MiMo 聊天语音完全分开。密钥建议放 ~/.config/qq-agent.env 的 DASHSCOPE_API_KEY，不要写进这个文件；workspaceId 是百炼工作空间 ID（复刻域名 {WorkspaceId}.cn-beijing.maas.aliyuncs.com）。",
+    "qwen": {
+      "enabled": false,
+      "workspaceId": "",
+      "apiKey": "",
+      "apiKeyEnv": "DASHSCOPE_API_KEY",
+      "region": "cn-beijing",
+      "baseUrl": "",
+      "targetModel": "qwen-audio-3.1-tts-plus",
+      "sampleRate": 44100,
+      "format": "wav"
+    },
+    "delivery": {
+      "_note": "主人不限额；普通用户每天 10 条 / 2000 字 / 3 次建音色 / 3 个音色档案，按北京日 0 点刷新；普通用户总池每天 20000 字 / 100 条 / 30 次建音色，防止多人叠加。单次 3000 字，分块 450 字，产物保留 7 天。",
+      "maxChars": 3000,
+      "ownerDailyChars": 0,
+      "userDailyJobs": 10,
+      "userDailyChars": 2000,
+      "userEnrollPerDay": 3,
+      "userMaxVoices": 3,
+      "globalDailyJobs": 100,
+      "globalDailyChars": 20000,
+      "globalEnrollPerDay": 30,
+      "chunkChars": 450,
+      "defaultFormat": "mp3",
+      "bitrate": "192k",
+      "retentionDays": 7
+    }
+  },
   "social": {
     "enabled": true,
     "autoReplyCheckMs": 30000,
@@ -319,43 +367,14 @@
           "AI 编程",
           "科技 测评"
         ]
+      },
+      "dynamic": {
+        "_note": "M3 动态发布（周计划调度，复用 QZone 模式）。等级门：Lv0 新号 init_check 返回 4126021，调度器每 24h 复查，达标自动开闸；首条=明牌AI自我介绍，此后随机 pool。",
+        "enabled": false,
+        "twoPostsProbability": 0.6,
+        "minGapHours": 12,
+        "pool": []
       }
-    },
-    "misakiCommands": {
-      "_note": "misaki@ 指令通道（桥层硬拦截，零 token）：companion mode on/off、stop、reset -1（1h 锁定期）、consumption、help。未知指令回提醒；句中提及不触发。",
-      "passthroughSuffixes": [
-        "ling014.com"
-      ]
-    },
-    "companionMode": {
-      "_note": "陪伴模式参数档（节奏与常规模式完全独立；breakProbability 代码强制 0）",
-      "typingHoldMaxMs": 30000,
-      "typingRefreshMs": 5000,
-      "linearPerCharMs": 480,
-      "linearMinMs": 1500,
-      "linearCapMs": 6000,
-      "linearJitterRatio": 0.2,
-      "checkIntervalMinMs": 3600000,
-      "checkIntervalMaxMs": 7200000,
-      "idleThresholdMs": 900000,
-      "dailyMax": 2,
-      "quietStart": "23:30",
-      "quietEnd": "07:30",
-      "unansweredWindowMs": 21600000,
-      "unansweredStreakLimit": 2,
-      "backoffDailyMax": 1,
-      "allowedTools": [
-        "reply",
-        "sendMessage",
-        "markRead",
-        "sendSticker",
-        "listStickers",
-        "getStickerImage",
-        "getImages",
-        "memoryRemember",
-        "memorySearch",
-        "memory"
-      ]
     }
   }
 }

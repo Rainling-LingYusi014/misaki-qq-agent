@@ -1848,6 +1848,21 @@ export function startConsoleServer() {
         sendJson({ ok: true, keptLedgerKeys: keysWithCarriedLedger.length });
         return;
       }
+      /* 2026-10-27：把"当前 agent token 是不是主人"暴露给 MCP —— bili_follow 放开白名单后，
+       * 必须有硬闸保证只有主人能指挥账号去关注陌生人（否则群里任何人都能借她的号刷粉）。
+       * 只回布尔值与会话 key，不泄露任何凭据。 */
+      if (req.method === 'GET' && url.pathname === '/api/social/whoami') {
+        const t = String(req.headers['x-agent-token'] ?? '');
+        let key = null;
+        for (const [ck, cst] of social.conversations.entries()) {
+          if (cst && cst.agentToken && String(cst.agentToken) === t) { key = ck; break; }
+        }
+        const trust = trustLevelForToken(t);
+        /* 关注这类对外动作只认「主人私聊」这一档：群里"主人刚说过话"的 10 分钟信任窗口
+         * 足够被群成员的话术借走，不能拿来做关注/转发的授权。 */
+        sendJson({ ok: true, owner: trust === 'owner-private', trust: trust || null, key });
+        return;
+      }
       if (req.method === 'GET' && url.pathname === '/api/social/state') {
         const key = String(url.searchParams.get('key') ?? '').trim();
         if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
@@ -6460,7 +6475,577 @@ export function startConsoleServer() {
           }
           return;
         }
+        /* ── 千问复刻 / MP3 交付（2026-10-27 主人定规）────────────────────────────
+         * 与上面 MiMo 那条语音链路**完全分开**：
+         *   · 只收音频文件（file 段），明确拒绝语音气泡（silk 有损，做样本先天缺高频）；
+         *   · 只交付 MP3 文件，不发语音气泡（避免"听着不像"被误判成模型能力）；
+         *   · owner-private 专属：复刻音色是这套系统里最容易越界的能力，群里一律拒绝。
+         * 端点：
+         *   POST /api/voice/qwen/enroll   {key, messageIds[], name?, targetModel?}
+         *   POST /api/voice/qwen/render   {key, voice, text, title?}
+         *   GET  /api/voice/qwen/profiles
+         *   POST /api/voice/qwen/delete   {key, id}
+         * 语音文件由模型从消息标记里拿到 messageId 后传进来；样本最多 5 个、每个 ≤10MB。 */
+        if (url.pathname.startsWith('/api/voice/qwen/')) {
+          let deliveryMod;
+          try {
+            deliveryMod = await import('../core/tts-delivery.js');
+          } catch (error) {
+            log(`控制台：TTS 交付模块加载失败：${error?.message ?? error}`);
+            sendJson({ ok: false, error: 'tts delivery module unavailable' }, 503);
+            return;
+          }
+          const key = String(body.key ?? url.searchParams.get('key') ?? '').trim();
+          const token = String(req.headers['x-agent-token'] ?? '').trim();
+          if (!token) { sendJson({ ok: false, error: '这个接口必须携带 agent token' }, 403); return; }
+          /* 2026-10-27 第二轮：从"仅主人"放开到"私聊用户"，但必须把请求者绑死在会话上。
+           * agentTokenOk() 只证明 token 是本桥签发的，不证明它属于这个 key；这里要求
+           * token 就是这条私聊会话的 agentToken，模型换 key 也冒充不了别人。
+           * 群聊一律拒绝：群里的语音复刻无法可靠绑定"谁在要求"，也最容易拿去冒充。 */
+          const km = /^(private|group):(\d+)$/.exec(key);
+          if (!km) { sendJson({ ok: false, error: 'key 格式应为 private:QQ号' }, 400); return; }
+          if (km[1] !== 'private') {
+            sendJson({ ok: false, error: '复刻音色和音频交付只在私聊里开放；群里请私聊我' }, 403);
+            return;
+          }
+          const conv = social.conversations.get(key);
+          if (!(conv?.agentToken && String(conv.agentToken) === token)) {
+            sendJson({ ok: false, error: '这个会话的令牌不匹配，请重新唤醒后再试' }, 403);
+            return;
+          }
+          const uid = km[2];
+          const isOwner = uid === String(cfgRef.ownerQQ ?? '');
+          log(`控制台：TTS 交付请求 key=${key} uid=${uid} owner=${isOwner} path=${url.pathname}`);
+          if (req.method === 'POST' && url.pathname === '/api/voice/qwen/enroll') {
+            try {
+              const ids = Array.isArray(body.messageIds) ? body.messageIds : (body.messageId ? [body.messageId] : []);
+              const files = await deliveryMod.fetchAudioFilesFromMessages({ cfg: cfgRef, messageIds: ids });
+              const r = await deliveryMod.enrollFromSamples({
+                cfg: cfgRef,
+                files,
+                name: body.name,
+                targetModel: body.targetModel,
+                uid,
+                isOwner,
+                consent: body.consent,
+              });
+              log(`控制台：千问音色创建成功 uid=${uid} owner=${isOwner} name=${r.profile?.name} voice=${r.profile?.voiceId} 样本=${files.length}`);
+              sendJson(r);
+            } catch (error) {
+              const msg = error?.message ?? String(error);
+              sendJson({ ok: false, error: msg }, /额度|已经用完|已满/.test(msg) ? 429 : 400);
+            }
+            return;
+          }
+          if (req.method === 'POST' && url.pathname === '/api/voice/qwen/render') {
+            try {
+              const r = await deliveryMod.renderToAudio({
+                cfg: cfgRef,
+                voice: body.voice,
+                text: body.text,
+                title: body.title,
+                uid,
+                isOwner,
+                format: body.format,
+              });
+              const docxMod = await import('../core/docx.js');
+              /* 上传偶发失败时重试一次：合成已经花了字符额度，不能因为一次网络抖动让用户重做。 */
+              try {
+                await docxMod.uploadFileToQQ(key, r.filePath, r.fileName);
+              } catch (e1) {
+                log(`控制台：音频首次上传失败，1.2s 后重试：${e1?.message ?? e1}`);
+                await new Promise((resolve) => setTimeout(resolve, 1200));
+                await docxMod.uploadFileToQQ(key, r.filePath, r.fileName);
+              }
+              log(`控制台：音频已交付 key=${key} uid=${uid} file=${r.fileName} ${r.format} ${r.durationSec}s ${r.chars}字 voice=${r.voice}`);
+              const { filePath, ...pub } = r;
+              sendJson({ ...pub, sent: true, sentTo: key });
+            } catch (error) {
+              const msg = error?.message ?? String(error);
+              sendJson({ ok: false, error: msg }, /额度|已经用完|已满/.test(msg) ? 429 : 400);
+            }
+            return;
+          }
+          if (req.method === 'GET' && url.pathname === '/api/voice/qwen/profiles') {
+            try {
+              sendJson({ ok: true, voices: deliveryMod.listProfiles({ cfg: cfgRef, uid }) });
+            } catch (error) {
+              sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+            }
+            return;
+          }
+          if (req.method === 'POST' && url.pathname === '/api/voice/qwen/delete') {
+            try {
+              sendJson(await deliveryMod.deleteProfile({ cfg: cfgRef, id: body.id, uid }));
+            } catch (error) {
+              sendJson({ ok: false, error: error?.message ?? String(error) }, 400);
+            }
+            return;
+          }
+          sendJson({ ok: false, error: `未知千问语音接口：${url.pathname}` }, 404);
+          return;
+        }
         sendJson({ ok: false, error: `未知语音接口：${url.pathname}` }, 404);
+        return;
+      }
+
+      /* ── 通用文件格式转换（2026-10-27）────────────────────────────────────────
+       *   GET  /api/convert/capabilities  → 当前机器实际能转哪些格式（按工具探测生成）
+       *   POST /api/convert {key, messageId, target} → 取 QQ 文件 → 转换 → 发回文件
+       * 与 TTS 同一条身份规则：只私聊、token 必须属于该会话；主人不限额，普通用户 10 次/天。
+       * 转换在临时目录里做，Office 用宏安全=3 的独立配置，能用 unshare 就断网跑。 */
+      if (url.pathname.startsWith('/api/convert')) {
+        let convMod;
+        try {
+          convMod = await import('../core/file-convert.js');
+        } catch (error) {
+          log(`控制台：文件转换模块加载失败：${error?.message ?? error}`);
+          sendJson({ ok: false, error: 'convert module unavailable' }, 503);
+          return;
+        }
+        const cbody = req.method === 'GET' ? {} : await readBody();
+        const key = String(cbody.key ?? url.searchParams.get('key') ?? '').trim();
+        const token = String(req.headers['x-agent-token'] ?? '').trim();
+        if (!token) { sendJson({ ok: false, error: '这个接口必须携带 agent token' }, 403); return; }
+        const km = /^private:(\d+)$/.exec(key);
+        if (!km) { sendJson({ ok: false, error: '文件转换只在私聊里开放；群里请私聊我' }, 403); return; }
+        const conv = social.conversations.get(key);
+        if (!(conv?.agentToken && String(conv.agentToken) === token)) {
+          sendJson({ ok: false, error: '这个会话的令牌不匹配，请重新唤醒后再试' }, 403);
+          return;
+        }
+        const uid = km[1];
+        const isOwner = uid === String(cfgRef.ownerQQ ?? '');
+        if (req.method === 'GET' && url.pathname === '/api/convert/capabilities') {
+          try {
+            sendJson({ ok: true, ...convMod.capabilities() });
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+          }
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/convert') {
+          try {
+            const target = String(cbody.target ?? '').trim();
+            const multiIds = Array.isArray(cbody.messageIds) ? cbody.messageIds.map((x) => String(x ?? '').trim()).filter(Boolean) : [];
+            let r;
+            if (multiIds.length > 1 && target === 'pdf') {
+              /* 多图合成一个 PDF（按 messageIds 顺序做页序）；单张图仍走下面的单文件链路。 */
+              const imgs = [];
+              for (const id of multiIds.slice(0, 50)) {
+                const f = await convMod.fetchImageFromMessage({ cfg: cfgRef, messageId: id });
+                imgs.push({ name: f.name, buf: f.buf });
+              }
+              r = await convMod.convertImagesToPdf({
+                cfg: cfgRef, images: imgs, uid, isOwner,
+                options: { pageSize: cbody.pageSize, margin: cbody.margin },
+              });
+            } else {
+              const f = await convMod.fetchFileFromMessage({ cfg: cfgRef, messageId: cbody.messageId });
+              r = await convMod.convertFile({
+                cfg: cfgRef,
+                name: f.name,
+                buf: f.buf,
+                target,
+                uid,
+                isOwner,
+                /* options：视频压缩 crf/level/maxHeight/mute；GIF start/duration/fps/width */
+                options: cbody.options,
+              });
+            }
+            const docxMod = await import('../core/docx.js');
+            try {
+              await docxMod.uploadFileToQQ(key, r.filePath, r.fileName);
+            } catch (e1) {
+              log(`控制台：转换结果首次上传失败，1.2s 后重试：${e1?.message ?? e1}`);
+              await new Promise((resolve) => setTimeout(resolve, 1200));
+              await docxMod.uploadFileToQQ(key, r.filePath, r.fileName);
+            }
+            log(`控制台：文件转换已交付 key=${key} uid=${uid} ${r.from}→${r.to} file=${r.fileName}`);
+            const { filePath, ...pub } = r;
+            sendJson({ ...pub, sent: true, sentTo: key });
+          } catch (error) {
+            const msg = error?.message ?? String(error);
+            sendJson({ ok: false, error: msg }, /额度|已经用完|已满/.test(msg) ? 429 : 400);
+          }
+          return;
+        }
+        sendJson({ ok: false, error: `未知转换接口：${url.pathname}` }, 404);
+        return;
+      }
+
+      /* ── 图片编辑（2026-10-27）：压缩 / 缩放 / 裁剪 / 图形裁剪 ────────────────
+       *   GET  /api/image/capabilities → 有没有 Pillow、支持哪些动作
+       *   POST /api/image/edit {key, messageId, action, ...} → 取图 → 处理 → 发回文件
+       * 与转换共用私聊身份绑定与 10 次/天额度；结果以文件发回，避免 QQ 二次压缩。 */
+      if (url.pathname.startsWith('/api/image/')) {
+        let imgMod;
+        try {
+          imgMod = await import('../core/image-edit.js');
+        } catch (error) {
+          log(`控制台：图片编辑模块加载失败：${error?.message ?? error}`);
+          sendJson({ ok: false, error: 'image edit module unavailable' }, 503);
+          return;
+        }
+        const ibody = req.method === 'GET' ? {} : await readBody();
+        const key = String(ibody.key ?? url.searchParams.get('key') ?? '').trim();
+        const token = String(req.headers['x-agent-token'] ?? '').trim();
+        if (!token) { sendJson({ ok: false, error: '这个接口必须携带 agent token' }, 403); return; }
+        const km = /^private:(\d+)$/.exec(key);
+        if (!km) { sendJson({ ok: false, error: '图片编辑只在私聊里开放；群里请私聊我' }, 403); return; }
+        const conv = social.conversations.get(key);
+        if (!(conv?.agentToken && String(conv.agentToken) === token)) {
+          sendJson({ ok: false, error: '这个会话的令牌不匹配，请重新唤醒后再试' }, 403);
+          return;
+        }
+        const uid = km[1];
+        const isOwner = uid === String(cfgRef.ownerQQ ?? '');
+        if (req.method === 'GET' && url.pathname === '/api/image/capabilities') {
+          try {
+            sendJson({ ok: true, ...imgMod.imageCapabilities() });
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+          }
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/image/edit') {
+          try {
+            const imgIds = Array.isArray(ibody.messageIds) ? ibody.messageIds.map((x) => String(x ?? '').trim()).filter(Boolean) : [];
+            const actionLc = String(ibody.action ?? '').toLowerCase();
+            let r;
+            if (actionLc === 'demo-watermark') {
+              /* 水印演示图（教学）：程序化背景 + 同一水印管线，不占媒体额度。 */
+              r = await imgMod.demoWatermark({ cfg: cfgRef, uid, isOwner, options: { watermark: ibody.watermark, format: ibody.format } });
+            } else if (actionLc === 'gif' && imgIds.length > 0) {
+              /* 多图合成 GIF：messageIds 按顺序当帧序。 */
+              const frames = [];
+              for (const id of imgIds.slice(0, 60)) {
+                const f = await imgMod.fetchImageForEdit({ cfg: cfgRef, messageId: id });
+                frames.push({ name: f.name, buf: f.buf });
+              }
+              r = await imgMod.makeGif({
+                cfg: cfgRef, images: frames, uid, isOwner,
+                options: { width: ibody.width, delay: ibody.delay, fps: ibody.fps, loop: ibody.loop },
+              });
+            } else if (imgIds.length > 1 && actionLc) {
+              /* 批量处理（工作站第三批）：同一组参数逐张跑，打包 ZIP 发回。 */
+              const frames = [];
+              for (const id of imgIds.slice(0, 12)) {
+                const f = await imgMod.fetchImageForEdit({ cfg: cfgRef, messageId: id });
+                frames.push({ name: f.name, buf: f.buf });
+              }
+              let wmBuf;
+              let wmName;
+              if (ibody.watermarkMessageId) {
+                const w = await imgMod.fetchImageForEdit({ cfg: cfgRef, messageId: ibody.watermarkMessageId });
+                wmBuf = w.buf;
+                wmName = w.name;
+              }
+              r = await imgMod.batchEditImages({
+                cfg: cfgRef, images: frames, watermarkBuf: wmBuf, watermarkName: wmName, uid, isOwner,
+                options: {
+                  action: ibody.action,
+                  format: ibody.format,
+                  quality: ibody.quality,
+                  targetKB: ibody.targetKB,
+                  maxDim: ibody.maxDim,
+                  width: ibody.width,
+                  height: ibody.height,
+                  mode: ibody.mode,
+                  crop: ibody.crop,
+                  aspect: ibody.aspect,
+                  shape: ibody.shape,
+                  radius: ibody.radius,
+                  watermark: ibody.watermark,
+                },
+              });
+            } else {
+              const f = await imgMod.fetchImageForEdit({ cfg: cfgRef, messageId: ibody.messageId });
+              let wmBuf;
+              let wmName;
+              if (ibody.watermarkMessageId) {
+                const w = await imgMod.fetchImageForEdit({ cfg: cfgRef, messageId: ibody.watermarkMessageId });
+                wmBuf = w.buf;
+                wmName = w.name;
+              }
+              r = await imgMod.editImage({
+                cfg: cfgRef,
+                name: f.name,
+                buf: f.buf,
+                watermarkBuf: wmBuf,
+                watermarkName: wmName,
+                uid,
+                isOwner,
+                options: {
+                  action: ibody.action,
+                  format: ibody.format,
+                  quality: ibody.quality,
+                  maxDim: ibody.maxDim,
+                  width: ibody.width,
+                  height: ibody.height,
+                  mode: ibody.mode,
+                  crop: ibody.crop,
+                  aspect: ibody.aspect,
+                  shape: ibody.shape,
+                  radius: ibody.radius,
+                  targetKB: ibody.targetKB,
+                  watermark: ibody.watermark,
+                },
+              });
+            }
+            const docxMod = await import('../core/docx.js');
+            try {
+              await docxMod.uploadFileToQQ(key, r.filePath, r.fileName);
+            } catch (e1) {
+              log(`控制台：图片结果首次上传失败，1.2s 后重试：${e1?.message ?? e1}`);
+              await new Promise((resolve) => setTimeout(resolve, 1200));
+              await docxMod.uploadFileToQQ(key, r.filePath, r.fileName);
+            }
+            log(`控制台：图片编辑已交付 key=${key} uid=${uid} action=${ibody.action} file=${r.fileName}`);
+            const { filePath, ...pub } = r;
+            sendJson({ ...pub, sent: true, sentTo: key });
+          } catch (error) {
+            const msg = error?.message ?? String(error);
+            sendJson({ ok: false, error: msg }, /额度|已经用完|已满/.test(msg) ? 429 : 400);
+          }
+          return;
+        }
+        sendJson({ ok: false, error: `未知图片接口：${url.pathname}` }, 404);
+        return;
+      }
+
+      /* ── 文本 / JSON 工具（2026-10-27 晚，ling014 工作站对齐）─────────────────
+       *   POST /api/text {key, op?, text?, messageId?, options?}
+       * op 缺省或未知 → 回能力表。结果 ≤5000 字符内联返回（模型自己转述给用户），
+       * 更长就落成 .txt 文件发回。私聊 + token 同一条规则；额度独立在 text 段。 */
+      if (url.pathname === '/api/text') {
+        let txtMod;
+        try {
+          txtMod = await import('../core/text-tools.js');
+        } catch (error) {
+          log(`控制台：文本工具模块加载失败：${error?.message ?? error}`);
+          sendJson({ ok: false, error: 'text tools module unavailable' }, 503);
+          return;
+        }
+        const tbody = req.method === 'GET' ? {} : await readBody();
+        const key = String(tbody.key ?? url.searchParams.get('key') ?? '').trim();
+        const token = String(req.headers['x-agent-token'] ?? '').trim();
+        if (!token) { sendJson({ ok: false, error: '这个接口必须携带 agent token' }, 403); return; }
+        const km = /^private:(\d+)$/.exec(key);
+        if (!km) { sendJson({ ok: false, error: '文本工具只在私聊里开放；群里请私聊我' }, 403); return; }
+        const conv = social.conversations.get(key);
+        if (!(conv?.agentToken && String(conv.agentToken) === token)) {
+          sendJson({ ok: false, error: '这个会话的令牌不匹配，请重新唤醒后再试' }, 403);
+          return;
+        }
+        const uid = km[1];
+        const isOwner = uid === String(cfgRef.ownerQQ ?? '');
+        if (req.method === 'POST') {
+          try {
+            let text = String(tbody.text ?? '');
+            if (!text && tbody.messageId) {
+              const convMod = await import('../core/file-convert.js');
+              const f = await convMod.fetchFileFromMessage({ cfg: cfgRef, messageId: tbody.messageId });
+              if (f.buf.length > 2 * 1024 * 1024) throw new Error('文件超过 2MB，文本工具不处理这么大的文件');
+              text = f.buf.toString('utf8');
+            }
+            const r = await txtMod.runTextTool({ cfg: cfgRef, op: tbody.op, text, uid, isOwner, options: tbody.options });
+            if (r.inline === false) {
+              const docxMod = await import('../core/docx.js');
+              try {
+                await docxMod.uploadFileToQQ(key, r.filePath, r.fileName);
+              } catch (e1) {
+                log(`控制台：文本结果首次上传失败，1.2s 后重试：${e1?.message ?? e1}`);
+                await new Promise((resolve) => setTimeout(resolve, 1200));
+                await docxMod.uploadFileToQQ(key, r.filePath, r.fileName);
+              }
+              const { filePath, ...pub } = r;
+              sendJson({ ...pub, sent: true, sentTo: key });
+            } else {
+              sendJson(r);
+            }
+          } catch (error) {
+            const msg = error?.message ?? String(error);
+            sendJson({ ok: false, error: msg }, /额度|已经用完|已满/.test(msg) ? 429 : 400);
+          }
+          return;
+        }
+        sendJson({ ok: false, error: `未知文本接口：${url.pathname}` }, 404);
+        return;
+      }
+
+      /* ── PDF 工具（2026-10-27 晚，工作站第二批）：合并 / 拆分 / 加水印 ────────
+       *   POST /api/pdf {key, op?, messageId?, messageIds?, watermarkMessageId?, options?}
+       * op 缺省 → 能力表。merge：messageIds 2-20 份 PDF 按序拼一个；
+       * split：messageId + options.pages("1-3,5") 或 options.every(N 页一拆→ZIP)；
+       * watermark：messageId (+watermarkMessageId 图片水印) + options{text,position,...}。
+       * 额度与转换共用；需要 pypdf（水印另需 reportlab），没有就如实说。 */
+      if (url.pathname === '/api/pdf') {
+        let pdfMod;
+        try {
+          pdfMod = await import('../core/pdf-tools.js');
+        } catch (error) {
+          log(`控制台：PDF 工具模块加载失败：${error?.message ?? error}`);
+          sendJson({ ok: false, error: 'pdf tools module unavailable' }, 503);
+          return;
+        }
+        const pbody = req.method === 'GET' ? {} : await readBody();
+        const key = String(pbody.key ?? url.searchParams.get('key') ?? '').trim();
+        const token = String(req.headers['x-agent-token'] ?? '').trim();
+        if (!token) { sendJson({ ok: false, error: '这个接口必须携带 agent token' }, 403); return; }
+        const km = /^private:(\d+)$/.exec(key);
+        if (!km) { sendJson({ ok: false, error: 'PDF 工具只在私聊里开放；群里请私聊我' }, 403); return; }
+        const conv = social.conversations.get(key);
+        if (!(conv?.agentToken && String(conv.agentToken) === token)) {
+          sendJson({ ok: false, error: '这个会话的令牌不匹配，请重新唤醒后再试' }, 403);
+          return;
+        }
+        const uid = km[1];
+        const isOwner = uid === String(cfgRef.ownerQQ ?? '');
+        if (req.method === 'POST') {
+          try {
+            const op = String(pbody.op ?? '').trim().toLowerCase();
+            if (!op) { sendJson({ ok: true, capabilities: pdfMod.pdfCapabilities() }); return; }
+            const convMod = await import('../core/file-convert.js');
+            let r;
+            if (op === 'merge') {
+              const ids = Array.isArray(pbody.messageIds) ? pbody.messageIds.map((x) => String(x ?? '').trim()).filter(Boolean) : [];
+              const files = [];
+              for (const id of ids.slice(0, 20)) {
+                const f = await convMod.fetchFileFromMessage({ cfg: cfgRef, messageId: id });
+                files.push({ name: f.name, buf: f.buf });
+              }
+              r = await pdfMod.pdfMerge({ cfg: cfgRef, files, uid, isOwner });
+            } else if (op === 'split') {
+              const f = await convMod.fetchFileFromMessage({ cfg: cfgRef, messageId: pbody.messageId });
+              r = await pdfMod.pdfSplit({ cfg: cfgRef, name: f.name, buf: f.buf, uid, isOwner, options: pbody.options });
+            } else if (op === 'watermark') {
+              const f = await convMod.fetchFileFromMessage({ cfg: cfgRef, messageId: pbody.messageId });
+              let wmBuf;
+              let wmName;
+              if (pbody.watermarkMessageId) {
+                const w = await convMod.fetchImageFromMessage({ cfg: cfgRef, messageId: pbody.watermarkMessageId });
+                wmBuf = w.buf;
+                wmName = w.name;
+              }
+              r = await pdfMod.pdfWatermark({
+                cfg: cfgRef, name: f.name, buf: f.buf, watermarkBuf: wmBuf, watermarkName: wmName,
+                uid, isOwner, options: pbody.options,
+              });
+            } else {
+              sendJson({ ok: false, error: `未知 PDF 操作 ${op}；只有 merge / split / watermark` }, 400);
+              return;
+            }
+            const docxMod = await import('../core/docx.js');
+            try {
+              await docxMod.uploadFileToQQ(key, r.filePath, r.fileName);
+            } catch (e1) {
+              log(`控制台：PDF 结果首次上传失败，1.2s 后重试：${e1?.message ?? e1}`);
+              await new Promise((resolve) => setTimeout(resolve, 1200));
+              await docxMod.uploadFileToQQ(key, r.filePath, r.fileName);
+            }
+            log(`控制台：PDF ${op} 已交付 key=${key} uid=${uid} file=${r.fileName}`);
+            const { filePath, ...pub } = r;
+            sendJson({ ...pub, sent: true, sentTo: key });
+          } catch (error) {
+            const msg = error?.message ?? String(error);
+            sendJson({ ok: false, error: msg }, /额度|已经用完|已满/.test(msg) ? 429 : 400);
+          }
+          return;
+        }
+        sendJson({ ok: false, error: `未知 PDF 接口：${url.pathname}` }, 404);
+        return;
+      }
+
+      /* ── 二维码（2026-10-27 晚，工作站第三批）──────────────────────────────────
+       *   POST /api/qrcode {key, text?, options?} → 生成 QR PNG 以文件发回
+       * text 缺省 → 能力表。引擎自动挑 qrencode / python-qrcode / segno；
+       * 额度与转换共用。 */
+      if (url.pathname === '/api/qrcode') {
+        let qrMod;
+        try {
+          qrMod = await import('../core/qrcode-tool.js');
+        } catch (error) {
+          log(`控制台：二维码模块加载失败：${error?.message ?? error}`);
+          sendJson({ ok: false, error: 'qrcode module unavailable' }, 503);
+          return;
+        }
+        const qbody = req.method === 'GET' ? {} : await readBody();
+        const key = String(qbody.key ?? url.searchParams.get('key') ?? '').trim();
+        const token = String(req.headers['x-agent-token'] ?? '').trim();
+        if (!token) { sendJson({ ok: false, error: '这个接口必须携带 agent token' }, 403); return; }
+        const km = /^private:(\d+)$/.exec(key);
+        if (!km) { sendJson({ ok: false, error: '二维码只在私聊里开放；群里请私聊我' }, 403); return; }
+        const conv = social.conversations.get(key);
+        if (!(conv?.agentToken && String(conv.agentToken) === token)) {
+          sendJson({ ok: false, error: '这个会话的令牌不匹配，请重新唤醒后再试' }, 403);
+          return;
+        }
+        const uid = km[1];
+        const isOwner = uid === String(cfgRef.ownerQQ ?? '');
+        if (req.method === 'POST') {
+          try {
+            if (!String(qbody.text ?? '').trim()) {
+              sendJson({ ok: true, capabilities: qrMod.qrCapabilities() });
+              return;
+            }
+            const r = await qrMod.generateQrCode({ cfg: cfgRef, text: qbody.text, uid, isOwner, options: qbody.options });
+            const docxMod = await import('../core/docx.js');
+            try {
+              await docxMod.uploadFileToQQ(key, r.filePath, r.fileName);
+            } catch (e1) {
+              log(`控制台：二维码首次上传失败，1.2s 后重试：${e1?.message ?? e1}`);
+              await new Promise((resolve) => setTimeout(resolve, 1200));
+              await docxMod.uploadFileToQQ(key, r.filePath, r.fileName);
+            }
+            log(`控制台：二维码已交付 key=${key} uid=${uid} file=${r.fileName}`);
+            const { filePath, ...pub } = r;
+            sendJson({ ...pub, sent: true, sentTo: key });
+          } catch (error) {
+            const msg = error?.message ?? String(error);
+            sendJson({ ok: false, error: msg }, /额度|已经用完|已满/.test(msg) ? 429 : 400);
+          }
+          return;
+        }
+        sendJson({ ok: false, error: `未知二维码接口：${url.pathname}` }, 404);
+        return;
+      }
+
+      /* ── 功能自解释（2026-10-27）：知识库查询 ─────────────────────────────────
+       *   POST /api/help {key, topic?}  topic 缺省 → 目录；有 topic → 整卡
+       * 卡片内容 = src/core/capabilities-kb.js；美咲被要求"先查卡再回答"，
+       * 不许编参数/额度/默认值。演示图走 /api/image/edit 的 demo-watermark。 */
+      if (url.pathname === '/api/help') {
+        let kbMod;
+        try {
+          kbMod = await import('../core/capabilities-kb.js');
+        } catch (error) {
+          log(`控制台：知识库模块加载失败：${error?.message ?? error}`);
+          sendJson({ ok: false, error: 'knowledge base unavailable' }, 503);
+          return;
+        }
+        const hbody = req.method === 'GET' ? {} : await readBody();
+        const key = String(hbody.key ?? url.searchParams.get('key') ?? '').trim();
+        const token = String(req.headers['x-agent-token'] ?? '').trim();
+        if (!token) { sendJson({ ok: false, error: '这个接口必须携带 agent token' }, 403); return; }
+        const km = /^private:(\d+)$/.exec(key);
+        if (!km) { sendJson({ ok: false, error: '功能说明只在私聊里开放；群里请私聊我' }, 403); return; }
+        const conv = social.conversations.get(key);
+        if (!(conv?.agentToken && String(conv.agentToken) === token)) {
+          sendJson({ ok: false, error: '这个会话的令牌不匹配，请重新唤醒后再试' }, 403);
+          return;
+        }
+        if (req.method === 'POST') {
+          try {
+            const topic = String(hbody.topic ?? '').trim();
+            const r = topic ? kbMod.helpTopic(topic) : kbMod.helpIndex();
+            sendJson({ ok: true, ...r });
+          } catch (error) {
+            sendJson({ ok: false, error: error?.message ?? String(error) }, 500);
+          }
+          return;
+        }
+        sendJson({ ok: false, error: `未知帮助接口：${url.pathname}` }, 404);
         return;
       }
 
@@ -6889,9 +7474,10 @@ export function startConsoleServer() {
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/napcat/guard/heal') {
-          /* 2026-09-23 需求「去除探针与状态检测」："手动自愈"依赖探针判定，已一并去除。
-           * 这里不再重启容器、不再探活，只如实告诉调用方"这个能力没有了"。 */
-          sendJson({ ok: false, removed: true, error: '「会话守护 / 探针自愈」已去除：桥不再探活、也不再自动或手动重启 NapCat。要看状态请直接开 NapCat 界面。' }, 410);
+          /* 2026-10-27 L0 恢复：手动自愈回来（重启 systemd 单元 + 等登录回来）。
+           * 与自动自愈共用同一道「正在等扫码就不重启」的闸，避免把主人手上那张码作废。 */
+          const r = await gMod.healNow('管理端手动');
+          sendJson(r, r.ok ? 200 : 409);
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/napcat/quick-password') {

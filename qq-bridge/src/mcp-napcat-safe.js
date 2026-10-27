@@ -17,6 +17,8 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { SENSITIVE_RE } from './sensitive.js';
 import { napcatImageFileArg } from './lib/napcat-file.js';
+import { BILI_AUTH_FILE, BILI_CIRCUIT_FILE, biliJson, checkIsLogin, circuitOpen, circuitState, wbiSign } from './lib/bili-api.js';
+import { loadActions, saveActions, followUser, searchBiliUsers, sendVideoCard } from './lib/bili-social.js';
 // 2026-09-18：联网找图：图片搜索引擎（Bing/百度）+ SSRF 安全下载。
 // 两者都是纯函数模块，直接 import；下载复用 safe-fetch（禁内网、限字节、校验真是图片）。
 import { searchImages } from './lib/image-search.js';
@@ -2373,6 +2375,370 @@ registerTool(
 );
 
 registerTool(
+  'tts_enroll_voice',
+  'Create ONE cloned voice on Qwen from AUDIO FILES the user sent in this PRIVATE chat (groups are refused - ask them to private-chat you). Any user may use it in private; the owner is unlimited, other users are limited to 3 voice profiles and 3 enrollments per day (Beijing midnight reset). INPUT MUST BE FILES: wav / mp3 / m4a, 10-30 seconds each, clean single-speaker speech, no music/noise, 1-5 clips. NEVER use a QQ voice bubble as the sample (bubbles are silk-compressed and sound worse) - if the user sent a voice message, ask them to resend it as a FILE. CONSENT: ask once in one short line, then pass consent=true only if the user confirms this is their own voice or they have explicit permission; never clone a public figure or a third party. The bridge checks every clip, picks the best one and enrolls it. Returns a profile name/id for tts_render_file.',
+  {
+    key: z.string().describe('Session key: private:<QQ> (only private chats are accepted)'),
+    token: z.string().describe('The [Token] value at the top of the latest wake prompt, copied verbatim'),
+    messageIds: z.array(z.string()).min(1).max(5).describe('Message ids of the AUDIO FILE messages (the [文件:...] markers / (id:xxx)); 1-5 clips'),
+    name: z.string().max(40).optional().describe('Optional voice name, e.g. 主人-1027; if omitted the bridge generates one'),
+    targetModel: z.string().optional().describe('Optional Qwen target model; leave empty to use the configured default'),
+    consent: z.boolean().describe('Must be true only after the user confirms the voice is theirs or they have explicit permission; false/missing is rejected')
+  },
+  async ({ key, token, messageIds, name, targetModel, consent }) => {
+    try {
+      const data = await agentApi('/api/voice/qwen/enroll', {
+        method: 'POST',
+        body: JSON.stringify({ key, messageIds, name, targetModel, consent }),
+        headers: { 'x-agent-token': token },
+        timeoutMs: 300000
+      });
+      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `建音色失败：${error?.message ?? error}（先确认发来的是音频文件而不是语音气泡；失败不要反复重试）` }], isError: true };
+    }
+  }
+);
+
+registerTool(
+  'tts_render_file',
+  'Render text into ONE audio file with a Qwen cloned voice and deliver it to the CURRENT PRIVATE chat AS A FILE (not a voice bubble, no preview). Any user may use it in private; the owner is unlimited, other users are limited to 10 files per day and 2,000 characters per day, and all non-owner users share a 20,000 characters/day pool (Beijing midnight reset). voice = one of the caller\'s OWN profiles from tts_enroll_voice / tts_voice_list; another user\'s voice is never usable. text = what to read (max 3000 chars per job; the bridge splits it). format = mp3 (default), wav / flac (lossless, much larger), m4a / ogg (compressed). The file carries an AI-generated tag in its metadata; NEVER promise a QQ voice message - this tool only produces a file. If it fails (quota, sample, network), say the real reason once and stop.',
+  {
+    key: z.string().describe('Session key: private:<QQ> (only private chats are accepted)'),
+    token: z.string().describe('The [Token] value at the top of the latest wake prompt, copied verbatim'),
+    voice: z.string().describe('Cloned voice profile name or id owned by this user'),
+    text: z.string().min(1).max(3000).describe('What the voice should read (Chinese works best)'),
+    format: z.enum(['mp3', 'wav', 'm4a', 'ogg', 'flac']).optional().describe('Output format; default mp3. wav/flac lossless but large; m4a/ogg compressed'),
+    title: z.string().max(40).optional().describe('Optional title used in the file name and metadata')
+  },
+  async ({ key, token, voice, text, format, title }) => {
+    try {
+      const data = await agentApi('/api/voice/qwen/render', {
+        method: 'POST',
+        body: JSON.stringify({ key, voice, text, title, format }),
+        headers: { 'x-agent-token': token },
+        timeoutMs: 600000
+      });
+      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `生成音频失败：${error?.message ?? error}（不要反复重试；把真实原因告诉用户）` }], isError: true };
+    }
+  }
+);
+
+registerTool(
+  'tts_voice_list',
+  'List the caller\'s OWN Qwen cloned-voice profiles (name / id / target model / sample duration), private chat only. Other users\' voices are never visible. Use it before tts_render_file when the voice name is unclear.',
+  {
+    key: z.string().describe('Session key: private:<QQ>'),
+    token: z.string().describe('The [Token] value at the top of the latest wake prompt, copied verbatim')
+  },
+  async ({ key, token }) => {
+    try {
+      const data = await agentApi(`/api/voice/qwen/profiles?key=${encodeURIComponent(key)}`, {
+        timeoutMs: 15000,
+        headers: { 'x-agent-token': token }
+      });
+      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `读取音色列表失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+registerTool(
+  'tts_voice_delete',
+  'Delete ONE of the caller\'s OWN Qwen voice profiles (removes the local profile + sample and the Qwen voice). Use it when the user is at their profile limit or wants to redo a voice. Another user\'s voice is never deletable.',
+  {
+    key: z.string().describe('Session key: private:<QQ>'),
+    token: z.string().describe('The [Token] value at the top of the latest wake prompt, copied verbatim'),
+    voice: z.string().describe('Voice profile name or id owned by this user')
+  },
+  async ({ key, token, voice }) => {
+    try {
+      const data = await agentApi('/api/voice/qwen/delete', {
+        method: 'POST',
+        body: JSON.stringify({ key, id: voice }),
+        headers: { 'x-agent-token': token },
+        timeoutMs: 60000
+      });
+      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `删除音色失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+registerTool(
+  'qq_convert_file',
+  'Convert ONE file the user sent in this PRIVATE chat into another format and deliver the result as a FILE (not a link). Call WITHOUT target first to get this server\'s actual capability table (it depends on ffmpeg / LibreOffice / pandoc / poppler being installed); then call again with target. Private chat only - groups are refused. Owner unlimited; other users 10 conversions/day (Beijing midnight reset), input <=50MB. Supported families when the tools are installed: audio (mp3/wav/m4a/aac/ogg/flac/wma), video (mp4/mkv/webm + audio extraction to mp3/m4a/wav/flac..., same-format = compression), images (png/jpg/webp/gif/bmp/tiff, image->pdf, image->ico multi-size Windows icon), Office (docx/doc/odt/rtf/txt/html -> pdf/docx/odt/txt/html; xls/xlsm/xlsx/ods/csv -> xlsx/ods/csv/pdf; ppt/pptx/odp -> pdf/pptx/odp), PDF (-> txt/png/jpg), md/html/docx via pandoc. VIDEO OPTIONS (pass in options{}): gif start/duration(<=60s)/fps(1-30)/width(64-1280, palette two-pass); compression crf(14-40)/level(low|medium|high)/maxHeight(240..1440)/mute. MULTI-IMAGE PDF: pass messageIds[] (2-50) + target=pdf (+options pageSize auto/a4/letter, margin pt) to combine several images into ONE pdf. Office macros are DISABLED and DROPPED (xlsm->xlsx loses macros - expected). PDF->docx is NOT supported; offer pdf->txt or pdf->png instead. Never promise a pair that is not in the capability table; if a tool is missing, say which one.',
+  {
+    key: z.string().describe('Session key: private:<QQ> (only private chats are accepted)'),
+    token: z.string().describe('The [Token] value at the top of the latest wake prompt, copied verbatim'),
+    messageId: z.string().optional().describe('Message id of the FILE message to convert (required for single-file conversions)'),
+    messageIds: z.array(z.string()).optional().describe('Multiple image message ids, in page order - only for target=pdf (2-50 images -> one pdf)'),
+    target: z.string().optional().describe('Target extension, e.g. pdf / xlsx / mp3 / png / gif. Omit to list capabilities'),
+    options: z.object({
+      start: z.number().optional().describe('GIF/clip: start second'),
+      duration: z.number().optional().describe('GIF/clip: seconds to take (gif capped at 60)'),
+      fps: z.number().optional().describe('GIF frame rate 1-30 (default 10)'),
+      width: z.number().optional().describe('GIF width 64-1280 (default 480)'),
+      crf: z.number().optional().describe('Compression quality 14-40, higher = smaller/worse'),
+      level: z.enum(['low', 'medium', 'high']).optional().describe('Compression preset: low=smallest, high=best quality (crf 32/26/20)'),
+      maxHeight: z.number().optional().describe('Downscale video: 240/360/480/540/720/1080/1440'),
+      mute: z.boolean().optional().describe('Drop the audio track'),
+      pageSize: z.enum(['auto', 'a4', 'letter']).optional().describe('Multi-image PDF page size (default auto = image-sized pages)'),
+      margin: z.number().optional().describe('Multi-image PDF page margin in pt, 0-144 (a4/letter only)')
+    }).optional().describe('Optional parameters, see field descriptions')
+  },
+  async ({ key, token, messageId, messageIds, target, options }) => {
+    try {
+      if (!String(target ?? '').trim()) {
+        const data = await agentApi(`/api/convert/capabilities?key=${encodeURIComponent(key)}`, {
+          timeoutMs: 30000,
+          headers: { 'x-agent-token': token }
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      }
+      const multi = Array.isArray(messageIds) && messageIds.filter((x) => String(x ?? '').trim()).length > 1;
+      if (!multi && !String(messageId ?? '').trim()) {
+        return { content: [{ type: 'text', text: '要转换哪个文件？把那条文件消息的 messageId 给我（多图合成 PDF 就把几张图的 messageIds 按页序给我）。' }], isError: true };
+      }
+      const data = await agentApi('/api/convert', {
+        method: 'POST',
+        body: JSON.stringify({ key, messageId, messageIds, target, options: options ?? {} }),
+        headers: { 'x-agent-token': token },
+        timeoutMs: 600000
+      });
+      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `文件转换失败：${error?.message ?? error}（不要反复重试；把真实原因告诉用户）` }], isError: true };
+    }
+  }
+);
+
+registerTool(
+  'qq_image_edit',
+  'Edit ONE image the user sent in this PRIVATE chat and deliver the result as a FILE (not an image message - avoids QQ recompressing it). Private only; owner unlimited; other users share 10 media operations/day with qq_convert_file (Beijing midnight reset). ACTIONS: compress (quality 1-100 / targetKB / maxDim), resize (width + height, mode fit/crop/stretch), crop (crop=[x,y,w,h] and/or aspect="1:1"/"16:9", then optional width/height), shape (circle / rounded / ellipse; png or webp only - jpg has no transparency and is rejected), watermark (text: watermark.text + position/fontSize or fontSizePct/color/opacity/margin/tile/rotation/density; or image: watermarkMessageId + watermark.scale; composable with resize/crop in one call; Chinese text needs a CJK font on the server - if missing, say so and offer English), gif (pass messageIds 2-60 as frames in order + width 16-1280 / delay 20-10000ms / fps 0.5-30 / loop), BATCH (messageIds 2-12 + any non-gif action = same params applied to every image, delivered as one ZIP; one watermark image applies to all), demo-watermark (TEACHING PREVIEW, no input image and no quota: renders a sample picture with the given watermark params - use it when the user is unsure what the parameters do; the result carries "applied" = the exact params used, walk the user through them). Default format png; jpg/png/webp supported. Call with NO action and NO messageId first to get this server\'s capabilities: image editing needs Python Pillow (python3-pil); if it is missing, say so and stop. Report the actual output dimensions/bytes from the tool result; never promise a preview or an image bubble.',
+  {
+    key: z.string().describe('Session key: private:<QQ> (only private chats are accepted)'),
+    token: z.string().describe('The [Token] value at the top of the latest wake prompt, copied verbatim'),
+    messageId: z.string().optional().describe('Message id of the image/file to edit (required unless action=gif)'),
+    messageIds: z.array(z.string()).optional().describe('Multiple image ids: action=gif -> frames in order (2-60); any other action -> BATCH mode, same params per image, one ZIP (2-12)'),
+    action: z.enum(['compress', 'resize', 'crop', 'shape', 'watermark', 'gif', 'demo-watermark']).optional().describe('demo-watermark needs NO input image: renders a sample picture with the watermark params (teaching preview, no quota)'),
+    format: z.enum(['jpg', 'png', 'webp']).optional().describe('Output format; default png'),
+    quality: z.number().int().min(1).max(100).optional().describe('Compression quality for jpg/webp; default 85'),
+    targetKB: z.number().int().min(1).max(50000).optional().describe('Target file size in KB; the bridge iterates quality and scale'),
+    maxDim: z.number().int().min(16).max(8192).optional().describe('Downscale so the longest side <= maxDim (compress)'),
+    width: z.number().int().min(16).max(8192).optional().describe('Target width (resize/crop/shape) or GIF width <=1280 (gif)'),
+    height: z.number().int().min(16).max(8192).optional().describe('Target height (resize/crop/shape)'),
+    mode: z.enum(['fit', 'crop', 'stretch']).optional().describe('fit = contain + pad; crop = cover + center crop; stretch = exact (default fit)'),
+    crop: z.array(z.number().int()).length(4).optional().describe('[x, y, width, height] crop region'),
+    aspect: z.string().optional().describe('Aspect ratio crop, e.g. 1:1 or 16:9 (center)'),
+    shape: z.enum(['circle', 'rounded', 'ellipse']).optional().describe('Shape mask; circle/ellipse crop to square first'),
+    radius: z.number().int().min(1).max(4096).optional().describe('Corner radius for shape=rounded; default 1/8 of the shorter side'),
+    watermark: z.object({
+      type: z.enum(['text', 'image']).optional().describe('Auto: text if watermark.text given, else image (needs watermarkMessageId)'),
+      text: z.string().optional().describe('Watermark text (\\n for new lines)'),
+      position: z.string().optional().describe('top-left/top/top-right/left/center/right/bottom-left/bottom/bottom-right/tile (tile = full-page anti-theft; default bottom-right)'),
+      fontSize: z.number().optional().describe('Text size 8-512 px; or use fontSizePct instead'),
+      fontSizePct: z.number().optional().describe('Text size as % of image width 1-50 (web-tool default 4); wins over nothing if fontSize given'),
+      color: z.string().optional().describe('#RRGGBB - translate the user\'s words yourself (红色->#FF0000, 黑->#000000, 金->#FFD700...); say which hex you used'),
+      opacity: z.number().optional().describe('0.01-1, default 0.65'),
+      margin: z.number().optional().describe('Distance from the edge in px, 0-512, default 12'),
+      scale: z.number().optional().describe('Image watermark width as fraction of base width, 0.02-1, default 0.25'),
+      rotation: z.number().optional().describe('Tilt degrees -180..180, positive = clockwise (web-tool default -20 = rising to the right)'),
+      density: z.number().optional().describe('Tile density 1-20, bigger = denser (default 5); only with position=tile')
+    }).optional().describe('Watermark spec; composable with resize/crop/shape in one call'),
+    watermarkMessageId: z.string().optional().describe('Message id of the watermark IMAGE (for watermark.type=image)'),
+    delay: z.number().int().min(20).max(10000).optional().describe('GIF: ms per frame, default 500'),
+    fps: z.number().optional().describe('GIF: frames per second 0.5-30; overrides delay'),
+    loop: z.number().int().min(0).max(65535).optional().describe('GIF: loop count, 0 = infinite (default)')
+  },
+  async ({ key, token, messageId, messageIds, action, format, quality, targetKB, maxDim, width, height, mode, crop, aspect, shape, radius, watermark, watermarkMessageId, delay, fps, loop }) => {
+    try {
+      const actionLc = String(action ?? '').trim().toLowerCase();
+      const gifMulti = actionLc === 'gif' && Array.isArray(messageIds) && messageIds.filter((x) => String(x ?? '').trim()).length > 0;
+      if (!actionLc && !String(messageId ?? '').trim() && !gifMulti) {
+        const data = await agentApi(`/api/image/capabilities?key=${encodeURIComponent(key)}`, {
+          timeoutMs: 15000,
+          headers: { 'x-agent-token': token }
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      }
+      if (!gifMulti && actionLc !== 'demo-watermark' && !String(messageId ?? '').trim()) {
+        return { content: [{ type: 'text', text: '要编辑哪张图？把那条图片消息的 messageId 给我（合成 GIF 就把几张图的 messageIds 按帧序给我；看水印演示效果用 action=demo-watermark，不用发图）。' }], isError: true };
+      }
+      const data = await agentApi('/api/image/edit', {
+        method: 'POST',
+        body: JSON.stringify({ key, messageId, messageIds, action, format, quality, targetKB, maxDim, width, height, mode, crop, aspect, shape, radius, watermark, watermarkMessageId, delay, fps, loop }),
+        headers: { 'x-agent-token': token },
+        timeoutMs: 600000
+      });
+      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `图片处理失败：${error?.message ?? error}（不要反复重试；把真实原因告诉用户）` }], isError: true };
+    }
+  }
+);
+
+registerTool(
+  'qq_pdf_tool',
+  'PDF toolkit for this PRIVATE chat (result delivered as a FILE). OPS: merge (messageIds = 2-20 PDF file messages, joined in order into one PDF), split (messageId + options: pages "1-3,5" extracts pages into one PDF, OR every N splits every N pages into a ZIP of parts - give exactly one), watermark (messageId + options: text with position from the 9-grid or tile, fontSize 8-144pt, color #RRGGBB, opacity 0.01-1, margin 0-200pt, rotation -180..180 (diagonal = 30-45); or an image stamp via watermarkMessageId + options.scale 0.02-1). Needs Python pypdf on the server (watermark also needs reportlab); call with NO op first to check capabilities and say plainly what is missing. Encrypted PDFs are refused - ask the user to remove the password first. Chinese watermark text needs a CJK font (fonts-wqy-zenhei); if the capability table says the font is missing, say so. Private chat only; quota shared with file conversion (10/day, owner unlimited, Beijing midnight reset).',
+  {
+    key: z.string().describe('Session key: private:<QQ> (only private chats are accepted)'),
+    token: z.string().describe('The [Token] value at the top of the latest wake prompt, copied verbatim'),
+    op: z.string().optional().describe('merge / split / watermark; omit to list capabilities'),
+    messageId: z.string().optional().describe('PDF file message id (for split / watermark)'),
+    messageIds: z.array(z.string()).optional().describe('PDF file message ids in order, 2-20 (for merge)'),
+    watermarkMessageId: z.string().optional().describe('Image message id used as the watermark stamp (watermark with an image)'),
+    options: z.object({
+      pages: z.string().optional().describe('split: page range like "1-3,5" (1-based)'),
+      every: z.number().optional().describe('split: split every N pages into a ZIP (1-500); mutually exclusive with pages'),
+      text: z.string().optional().describe('watermark text (\\n for new lines)'),
+      position: z.string().optional().describe('watermark position: 9-grid or tile (tile = full-page anti-theft; default bottom-right)'),
+      fontSize: z.number().optional().describe('watermark font size 8-144pt; or use fontSizePct'),
+      fontSizePct: z.number().optional().describe('watermark size as % of page width 1-50 (web-tool default 5); used when fontSize is absent'),
+      color: z.string().optional().describe('#RRGGBB - translate the user\'s words yourself (红色->#FF0000, 灰->#808080...); say which hex you used'),
+      opacity: z.number().optional().describe('watermark opacity 0.01-1 (web-tool full-page default 0.12)'),
+      margin: z.number().optional().describe('watermark margin 0-200pt (default 24)'),
+      rotation: z.number().optional().describe('watermark rotation degrees -180..180, positive = clockwise (web-tool look: tile + rotation -20)'),
+      density: z.number().optional().describe('tile density 1-20, bigger = denser (default 5); only with position=tile'),
+      scale: z.number().optional().describe('image watermark width as fraction of page width 0.02-1 (default 0.25)')
+    }).optional().describe('Op-specific parameters')
+  },
+  async ({ key, token, op, messageId, messageIds, watermarkMessageId, options }) => {
+    try {
+      if (!String(op ?? '').trim()) {
+        const data = await agentApi('/api/pdf', {
+          method: 'POST',
+          body: JSON.stringify({ key }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 30000
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      }
+      const opLc = String(op).trim().toLowerCase();
+      if (opLc === 'merge' && !(Array.isArray(messageIds) && messageIds.filter((x) => String(x ?? '').trim()).length >= 2)) {
+        return { content: [{ type: 'text', text: '合并 PDF 需要至少 2 份 PDF 文件消息的 messageIds（按拼接顺序）。' }], isError: true };
+      }
+      if (opLc !== 'merge' && !String(messageId ?? '').trim()) {
+        return { content: [{ type: 'text', text: '要处理哪份 PDF？把那条文件消息的 messageId 给我。' }], isError: true };
+      }
+      const data = await agentApi('/api/pdf', {
+        method: 'POST',
+        body: JSON.stringify({ key, op: opLc, messageId, messageIds, watermarkMessageId, options: options ?? {} }),
+        headers: { 'x-agent-token': token },
+        timeoutMs: 300000
+      });
+      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `PDF 处理失败：${error?.message ?? error}（不要反复重试；把真实原因告诉用户）` }], isError: true };
+    }
+  }
+);
+
+registerTool(
+  'qq_qrcode',
+  'Generate a QR code PNG for this PRIVATE chat and deliver it as a FILE. INPUT: the text/URL/WiFi/vCard payload goes in verbatim (<=1000 chars). OPTIONS: level L/M/Q/H error correction (default M), scale 1-20 module pixels (default 6), margin 0-16 (default 4), dark/light #RRGGBB colors. Needs qrencode or a Python qrcode/segno library on the server - call with NO text first to check capabilities and say plainly if it is unavailable. Private chat only; quota shared with file conversion (10/day, owner unlimited, Beijing midnight reset).',
+  {
+    key: z.string().describe('Session key: private:<QQ> (only private chats are accepted)'),
+    token: z.string().describe('The [Token] value at the top of the latest wake prompt, copied verbatim'),
+    text: z.string().optional().describe('Payload to encode: URL / text / "WIFI:T:WPA;S:name;P:pass;;" / vCard; omit to list capabilities'),
+    options: z.object({
+      level: z.enum(['L', 'M', 'Q', 'H']).optional().describe('Error correction; default M'),
+      scale: z.number().optional().describe('Module size in px, 1-20 (default 6)'),
+      margin: z.number().optional().describe('Quiet-zone border, 0-16 (default 4)'),
+      dark: z.string().optional().describe('Foreground #RRGGBB (default black)'),
+      light: z.string().optional().describe('Background #RRGGBB (default white)')
+    }).optional().describe('Optional QR parameters')
+  },
+  async ({ key, token, text, options }) => {
+    try {
+      if (!String(text ?? '').trim()) {
+        const data = await agentApi('/api/qrcode', {
+          method: 'POST',
+          body: JSON.stringify({ key }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 30000
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      }
+      const data = await agentApi('/api/qrcode', {
+        method: 'POST',
+        body: JSON.stringify({ key, text, options: options ?? {} }),
+        headers: { 'x-agent-token': token },
+        timeoutMs: 60000
+      });
+      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `二维码生成失败：${error?.message ?? error}（不要反复重试；把真实原因告诉用户）` }], isError: true };
+    }
+  }
+);
+
+registerTool(
+  'qq_help',
+  'The capability knowledge base - YOUR OWN manual. Whenever the user asks what you can do, what a feature is, how to use it, what parameters/defaults to set, why a result looks wrong, or what the quotas are: call this FIRST and answer FROM the card. No topic = the index of every feature (name + one-line summary + which have live demos). topic = one full card: who can use it (+quotas), how-to steps, every parameter with its default, a worked example (what the user says -> what you do -> what they get), tuning tips (which knob changes what), and availability notes. Topics are Chinese feature names or keywords (水印/图片编辑/gif/批量/转换/视频/pdf/json/二维码/音色复刻/语音气泡/pixiv...). If the topic misses, the result carries the full suggestion list - show it, never invent parameters, defaults or quotas that are not on the card. For features marked demo (e.g. watermark), offer to render a live sample image via the image-edit demo action so the user SEES the effect before committing their own file.',
+  {
+    key: z.string().describe('Session key: private:<QQ> (only private chats are accepted)'),
+    token: z.string().describe('The [Token] value at the top of the latest wake prompt, copied verbatim'),
+    topic: z.string().optional().describe('Feature name or keyword, e.g. 水印 / 转换 / 音色复刻; omit for the index of all features')
+  },
+  async ({ key, token, topic }) => {
+    try {
+      const data = await agentApi('/api/help', {
+        method: 'POST',
+        body: JSON.stringify({ key, topic }),
+        headers: { 'x-agent-token': token },
+        timeoutMs: 15000
+      });
+      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `查询功能说明失败：${error?.message ?? error}` }], isError: true };
+    }
+  }
+);
+
+registerTool(
+  'qq_text_tool',
+  'Text / JSON toolkit for this PRIVATE chat (no media involved). OPS: json-format (options.indent "2"/"4"/"tab"/"0", options.sortKeys), json-minify, json-validate (reports the line/column of the error), base64-encode, base64-decode, url-encode, url-decode, hash (options.algo md5/sha1/sha256/sha512), count (chars/bytes/lines/CJK/words), dedupe (unique lines, keeps order), sort-lines (options.order asc/desc/length, options.numeric), reverse-lines, upper, lower, trim-lines, replace (options.find required, options.replaceWith, options.regex, options.all). INPUT: pass text directly, or messageId of a file message (UTF-8, <=2MB). Results <=5000 chars come back inline in the tool result - relay them to the user as chat text; longer results are delivered as a .txt FILE automatically (sent:true). Private chat only; owner unlimited, other users 50 ops/day (Beijing midnight reset). Call with NO op to list capabilities.',
+  {
+    key: z.string().describe('Session key: private:<QQ> (only private chats are accepted)'),
+    token: z.string().describe('The [Token] value at the top of the latest wake prompt, copied verbatim'),
+    op: z.string().optional().describe('One of the ops above; omit to list capabilities'),
+    text: z.string().optional().describe('The text to process (or give messageId of a file)'),
+    messageId: z.string().optional().describe('Message id of a FILE message to read as UTF-8 text (<=2MB)'),
+    options: z.record(z.any()).optional().describe('Op-specific options: indent/sortKeys/algo/order/numeric/find/replaceWith/regex/all/keepEmpty')
+  },
+  async ({ key, token, op, text, messageId, options }) => {
+    try {
+      if (!String(op ?? '').trim()) {
+        const data = await agentApi('/api/text', {
+          method: 'POST',
+          body: JSON.stringify({ key }),
+          headers: { 'x-agent-token': token },
+          timeoutMs: 15000
+        });
+        return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+      }
+      if (!String(text ?? '').trim() && !String(messageId ?? '').trim()) {
+        return { content: [{ type: 'text', text: '要处理什么内容？直接把文本给我，或者给我一条文件消息的 messageId。' }], isError: true };
+      }
+      const data = await agentApi('/api/text', {
+        method: 'POST',
+        body: JSON.stringify({ key, op, text, messageId, options: options ?? {} }),
+        headers: { 'x-agent-token': token },
+        timeoutMs: 60000
+      });
+      return { content: [{ type: 'text', text: JSON.stringify(data, null, 2) }] };
+    } catch (error) {
+      return { content: [{ type: 'text', text: `文本处理失败：${error?.message ?? error}（不要反复重试；把真实原因告诉用户）` }], isError: true };
+    }
+  }
+);
+
+registerTool(
   'qq_profile_get',
   'Read someone long-term profile by QQ number: nickname, personality, likes, dislikes, birthday, notes. Everything previously recorded about this person lives here - check it first to know or confirm something about them, so you never forget or misremember.',
   {
@@ -3697,14 +4063,18 @@ function stageImageBytes(buf, cfg, tag) {
   );
 }
 
-/* ── AI 图像生成（2026-10-26，"图像生成"标签）：智谱 CogView-4 ──────────────────
- * 定位：文生图直出会话。生成 → 下载字节 → 与 qq_send_image 的 file 模式同一条
+/* ── AI 图像生成（2026-10-26 建；2026-10-27 换芯：CogView-4 → OpenRouter Nano Banana 2 Lite）──
+ * 定位：文生图直出会话。生成 → 字节 → 与 qq_send_image 的 file 模式同一条
  * 已验证管道（verifyImageComplete → stageImageBytes → napcatImageFileArg →
  * send-message 端点），鉴权/频率阀/会话记录全由 send-message 端点兜底。
- * key 放 config.json 的 zhipu 段（gitignored，pixiv 凭据同款先例），不进 git。
- * 上限：prompt ≤ 500 字，n ≤ 4（每张独立请求），尺寸白名单按 CogView-4 文档。 */
+ * 换芯动机（主人定规）：国产模型按监管打可见 AI 水印，海外模型无可见水印。
+ * key 放 config.json 的 imageGen 段（gitignored），不进 git。
+ * 实测（2026-10-27）：nano-lite $0.034/张·5.2s；gpt-5-image-mini $0.042/张·39s（prompt 灌水 2710 token）。
+ * OpenRouter 走 chat/completions + modalities:["image","text"]，图以 data:base64 返回（https URL 兜底下载）；
+ * 该模型不支持尺寸参数（supported_parameters 无 image_config），schema 已去掉 size。
+ * 上限：prompt ≤ 500 字，n ≤ 4（每张独立请求）。 */
 if (cfg.social?.tools?.generateImage !== false) {
-  /* 2026-10-26 绘画配额（用户定规）：非 owner 每用户每天（北京日）最多 5 张（zhipu.dailyImageLimit 可调），
+  /* 2026-10-26 绘画配额（用户定规）：非 owner 每用户每天（北京日）最多 5 张（imageGen.dailyImageLimit 可调），
    * owner 豁免。计数落 ROOT/state/gen-image-quota.json（与桥共用 state 目录）。生成前预扣、
    * 部分失败按实际成功数回退。配额小 → 工具描述里教模型「参数不清先问再画，别浪费额度」。 */
   const GEN_QUOTA_FILE = path.join(ROOT, 'state', 'gen-image-quota.json');
@@ -3716,30 +4086,29 @@ if (cfg.social?.tools?.generateImage !== false) {
   function genQuotaToday() { return new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10); }
   registerTool(
     'qq_generate_image',
-    'Generate images with AI (CogView-4 text-to-image) and SEND them to a QQ session as real pictures. Use when asked to draw/generate/create an image ("画一张/生成一张/来张XX的图" where XX does not exist as a real photo). For finding EXISTING pictures use qq_send_image instead. prompt in Chinese or English; sizes: 1024x1024 (default), 1440x720 (wide), 720x1440 (portrait), 1344x768, 768x1344, 1152x864, 864x1152. Max 4 images per call. Tell the user roughly how long it takes (about 5-15s per image).'
-      + '\n\n[QUOTA - IMPORTANT] Non-owner users get only 5 images per Beijing day - every wasted generation burns their quota. Before calling: if the request is VAGUE about subject / style / composition / mood / size, STOP and ask one short clarifying question first (一条问清关键项), and only generate once you are confident it matches what they want. The owner has unlimited quota.',
+    'Generate images with AI (Nano Banana 2 Lite text-to-image via OpenRouter) and SEND them to a QQ session as real pictures. Use when asked to draw/generate/create an image ("画一张/生成一张/来张XX的图" where XX does not exist as a real photo). For finding EXISTING pictures use qq_send_image instead. prompt in Chinese or English (Chinese works well). No size control - images come at the model default. Max 4 images per call. Tell the user roughly how long it takes (about 5-20s per image).'
+      + '\n\n[QUOTA - IMPORTANT] Non-owner users get only 5 images per Beijing day - every wasted generation burns their quota. Before calling: if the request is VAGUE about subject / style / composition / mood, STOP and ask one short clarifying question first (一条问清关键项), and only generate once you are confident it matches what they want. The owner has unlimited quota.',
     {
       key: z.string().describe('Session key: group:ID or private:QQ'),
       token: z.string().describe('Session token'),
       prompt: z.string().max(500).describe('Image generation prompt (what to draw)'),
-      size: z.enum(['1024x1024', '1440x720', '720x1440', '1344x768', '768x1344', '1152x864', '864x1152']).optional().describe('Image size (default 1024x1024)'),
       n: z.number().int().min(1).max(4).optional().describe('How many images (default 1, max 4)'),
       replyToMessageId: z.union([z.number(), z.string()]).optional().describe('Message id to quote (optional)'),
       crossSession: z.boolean().optional().describe('Set true only for deliberate cross-session delivery')
     },
-    async ({ key, token, prompt, size, n, replyToMessageId, crossSession }) => {
+    async ({ key, token, prompt, n, replyToMessageId, crossSession }) => {
       const cfgG = getConfig();
-      const zc = cfgG?.zhipu ?? {};
-      const apiKey = String(zc.apiKey ?? '').trim();
+      const ig = cfgG?.imageGen ?? {};
+      const apiKey = String(ig.apiKey ?? '').trim();
       if (!apiKey) {
-        return { content: [{ type: 'text', text: '图像生成未配置：config.json 缺 zhipu.apiKey（找管理员配置后可用）' }], isError: true };
+        return { content: [{ type: 'text', text: '图像生成未配置：config.json 缺 imageGen.apiKey（找管理员配置后可用）' }], isError: true };
       }
       /* 配额闸：owner 豁免；非 owner 北京日 5 张（含本次 n） */
       const count = Math.max(1, Math.min(4, Number(n) || 1));
       const ownerKeyNow = 'private:' + String(cfgG?.ownerQQ ?? '');
       let quotaReserved = 0;
       if (String(key) !== ownerKeyNow) {
-        const daily = Math.max(1, Number(zc.dailyImageLimit) || 5);
+        const daily = Math.max(1, Number(ig.dailyImageLimit) || 5);
         const qs = genQuotaRead();
         const today = genQuotaToday();
         if (qs.day !== today) { qs.day = today; qs.counts = {}; }
@@ -3751,29 +4120,53 @@ if (cfg.social?.tools?.generateImage !== false) {
         genQuotaWrite(qs);
         quotaReserved = count;
       }
-      const baseUrl = String(zc.baseUrl ?? 'https://open.bigmodel.cn').replace(/\/+$/, '');
-      const model = String(zc.model ?? 'cogview-4');
-      const sizeStr = ['1024x1024', '1440x720', '720x1440', '1344x768', '768x1344', '1152x864', '864x1152'].includes(size) ? size : '1024x1024';
+      const baseUrl = String(ig.baseUrl ?? 'https://openrouter.ai/api/v1').replace(/\/+$/, '');
+      const model = String(ig.model ?? 'google/gemini-3.1-flash-lite-image');
       const sentList = [];
       try {
         for (let i = 0; i < count; i++) {
-          /* 生成（每张独立请求，CogView-4 单请求单图最稳） */
-          const res = await fetch(`${baseUrl}/api/paas/v4/images/generations`, {
-            method: 'POST',
-            headers: { 'authorization': `Bearer ${apiKey}`, 'content-type': 'application/json' },
-            body: JSON.stringify({ model, prompt: String(prompt), size: sizeStr }),
-            signal: AbortSignal.timeout(120000)
-          });
-          const body = await res.json().catch(() => ({}));
-          if (!res.ok || !Array.isArray(body?.data) || !body.data[0]?.url) {
-            throw new Error(`CogView 生成失败（第 ${i + 1} 张）: ${body?.error?.message || res.status}`);
+          /* 生成（每张独立请求）。响应里 message.images[] 通常为 data:base64 URL，直接解码；
+           * 若中转改回传 https URL 则走下载兜底（仅 https、限 20MB、content-type 必须是图片）。
+           * 2026-10-27 实测：OpenRouter 对 Google/OpenAI 端点按客户 IP 地域门控（服务器大陆 IP 与
+           * mihomo HK 出口均被 403）→ 生图请求经 config.imageGen.proxyUrl 走 mihomo 7891 专用入站
+           * （IMGEN 组：日本/新加坡/美国自动择优）。Node fetch 无原生代理 → curl 子进程（yt-dlp 同款模式）；
+           * 未配 proxyUrl 则直连（本地开发/无墙环境）。 */
+          const proxyUrl = String(ig.proxyUrl ?? '').trim();
+          const payload = JSON.stringify({ model, modalities: ['image', 'text'], messages: [{ role: 'user', content: String(prompt) }] });
+          let body = null;
+          if (proxyUrl) {
+            const out = await new Promise((resolve, reject) => {
+              execFile('curl', ['-s', '-m', '170', '-x', proxyUrl,
+                '-H', `authorization: Bearer ${apiKey}`, '-H', 'content-type: application/json',
+                '-d', payload, `${baseUrl}/chat/completions`],
+                { timeout: 175000, maxBuffer: 64 * 1024 * 1024 },
+                (e, stdout) => (e ? reject(new Error(`代理请求失败: ${e?.message ?? e}`)) : resolve(stdout)));
+            });
+            body = JSON.parse(out);
+          } else {
+            const res = await fetch(`${baseUrl}/chat/completions`, {
+              method: 'POST',
+              headers: { 'authorization': `Bearer ${apiKey}`, 'content-type': 'application/json' },
+              body: payload,
+              signal: AbortSignal.timeout(180000)
+            });
+            body = await res.json().catch(() => ({}));
           }
-          /* 下载字节：仅 https、限 20MB、content-type 必须是图片 */
-          const imgRes = await fetch(body.data[0].url, { signal: AbortSignal.timeout(60000) });
-          if (!imgRes.ok) throw new Error(`下载生成图失败: ${imgRes.status}`);
-          const ct = String(imgRes.headers.get('content-type') || '');
-          if (ct && !ct.startsWith('image/')) throw new Error(`生成图响应不是图片（${ct}）`);
-          const buf = Buffer.from(await imgRes.arrayBuffer());
+          const imgUrl = body?.choices?.[0]?.message?.images?.[0]?.image_url?.url || body?.choices?.[0]?.message?.images?.[0]?.url || '';
+          if (!imgUrl) {
+            throw new Error(`图像生成失败（第 ${i + 1} 张）: ${body?.error?.message || '响应无图'}`);
+          }
+          let buf;
+          const dataMatch = /^data:image\/(\w+);base64,(.+)$/s.exec(imgUrl);
+          if (dataMatch) {
+            buf = Buffer.from(dataMatch[2], 'base64');
+          } else {
+            const imgRes = await fetch(imgUrl, { signal: AbortSignal.timeout(60000) });
+            if (!imgRes.ok) throw new Error(`下载生成图失败: ${imgRes.status}`);
+            const ct = String(imgRes.headers.get('content-type') || '');
+            if (ct && !ct.startsWith('image/')) throw new Error(`生成图响应不是图片（${ct}）`);
+            buf = Buffer.from(await imgRes.arrayBuffer());
+          }
           if (buf.length > 20 * 1024 * 1024) throw new Error('生成图超过 20MB');
           const check = verifyImageComplete(buf, buf.length, null);
           if (!check.ok) throw new Error(`生成图字节不完整（${check.reason}）`);
@@ -3789,7 +4182,7 @@ if (cfg.social?.tools?.generateImage !== false) {
           });
           sentList.push({ bytes: buf.length, staged, sent: dataS?.sent ?? null });
         }
-        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, generated: sentList.length, model, size: sizeStr, items: sentList }, null, 2) }] };
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, generated: sentList.length, model, items: sentList }, null, 2) }] };
       } catch (error) {
         /* 配额回退：失败的部分不算额度（只扣实际送出的） */
         if (quotaReserved > sentList.length) {
@@ -3833,36 +4226,38 @@ function ytDayCountBump(dir) {
 }
 if (cfg.social?.tools?.biliSearch !== false) {
   /* 2026-10-26 M1：B 站站内搜索（登录态 Wbi 签名 + 桥侧打分排序，只读零副作用）。
-   * cookie 在 state/bilibili-auth.json（主人 Edge 登录后导出；24h 短票到期需重新登录/续期）。
-   * 打分 = log10(播放) + 新鲜度*0.8 + 互动率，保质量下限；语义挑选与推荐话术归模型。 */
-  const BILI_AUTH = path.join(ROOT, 'state', 'bilibili-auth.json');
-  const BILI_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36';
-  const BILI_TAB = [46, 47, 18, 2, 53, 8, 23, 32, 15, 50, 10, 31, 58, 3, 45, 35, 27, 43, 5, 49, 33, 9, 42, 19, 29, 28, 14, 39, 12, 38, 41, 13, 37, 48, 7, 16, 24, 55, 40, 61, 26, 17, 0, 1, 60, 51, 30, 4, 22, 25, 54, 21, 56, 59, 6, 63, 57, 62, 11, 36, 20, 34, 44, 52];
-  const biliEnc = (s) => encodeURIComponent(String(s)).replace(/[!'"()*]/g, (c) => '%' + c.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0'));
+   * 2026-10-27：请求层统一到 lib/bili-api.js（UA/风控码/HTTP412/熔断与养号共享，审查 P3-2/P2-3），
+   * 并加桥侧频控（审查 P3-5：群成员刷「帮我找视频」会放大登录态搜索接口压力）。 */
+  const biliSearchHits = [];
   async function biliSearch(query, n) {
-    let auth = {};
-    try { auth = JSON.parse(fs.readFileSync(BILI_AUTH, 'utf8')); } catch {}
-    const cookie = Object.entries(auth).filter(([k]) => !['savedAt', 'mode', 'fingerprint'].includes(k)).map(([k, v]) => k + '=' + v).join('; ');
-    const nav = await (await fetch('https://api.bilibili.com/x/web-interface/nav', { headers: { 'user-agent': BILI_UA, ...(cookie ? { cookie } : {}) } })).json();
-    if (!nav.data?.wbi_img) return { error: `B站导航接口异常（code=${nav.code}）` };
-    if (nav.data?.isLogin === false) return { error: 'B站登录已过期：请管理员重新登录（state/bilibili-auth.json 失效）' };
-    const imgKey = nav.data.wbi_img.img_url.split('/').pop().split('.')[0];
-    const subKey = nav.data.wbi_img.sub_url.split('/').pop().split('.')[0];
-    const mixinKey = BILI_TAB.map((i) => (imgKey + subKey)[i]).join('').slice(0, 32);
-    const params = { keyword: String(query).slice(0, 120), search_type: 'video', order: 'totalrank', page: 1, wts: Math.floor(Date.now() / 1000) };
-    const qs = Object.keys(params).sort().map((k) => encodeURIComponent(k) + '=' + biliEnc(params[k])).join('&');
-    const w_rid = crypto.createHash('md5').update(qs + mixinKey).digest('hex');
-    const res = await fetch('https://api.bilibili.com/x/web-interface/search/type?' + qs + '&w_rid=' + w_rid + '&wts=' + params.wts, { headers: { 'user-agent': BILI_UA, referer: 'https://www.bilibili.com/', ...(cookie ? { cookie } : {}) } });
-    const j = await res.json();
-    if (j.code !== 0) return { error: `B站搜索失败（code=${j.code} ${j.message ?? ''}）` };
-    const now = Date.now() / 1000;
-    const rows = (j.data?.result ?? []).map((r) => {
-      const play = Number(r.play) || 0;
-      const ageDays = Math.max(0, Math.round((now - (Number(r.pubdate) || now)) / 86400));
-      const review = Number(r.review) || 0;
-      return { title: String(r.title).replace(/<[^>]+>/g, ''), bvid: r.bvid, url: `https://www.bilibili.com/video/${r.bvid}`, play, up: String(r.author ?? ''), ageDays, duration: String(r.duration ?? ''), score: +(Math.log10(Math.max(10, play)) + Math.max(0, 3 - ageDays / 180) * 0.8 + Math.min(1.5, play > 0 ? (review / play) * 100 : 0)).toFixed(2) };
-    }).sort((a, b) => b.score - a.score).slice(0, n);
-    return { total: j.data?.numResults ?? rows.length, rows };
+    const nowMs = Date.now();
+    while (biliSearchHits.length && nowMs - biliSearchHits[0] > 60 * 1000) biliSearchHits.shift();
+    if (biliSearchHits.length >= 6) return { error: '搜索有点频繁，等一分钟再试。' };
+    if (circuitOpen(BILI_CIRCUIT_FILE)) {
+      const c = circuitState(BILI_CIRCUIT_FILE);
+      return { error: `B站接口临时受限（${c.scope || 'bili'}），暂时搜不了，稍后再试。` };
+    }
+    biliSearchHits.push(nowMs);
+    const opts = { authFile: BILI_AUTH_FILE, circuitFile: BILI_CIRCUIT_FILE, scope: 'mcp-search' };
+    try {
+      if (!(await checkIsLogin(opts))) return { error: 'B站登录已过期：请管理员重新续期' };
+      const qs = await wbiSign({ keyword: String(query).slice(0, 120), search_type: 'video', order: 'totalrank', page: 1 }, opts);
+      const j = await biliJson('https://api.bilibili.com/x/web-interface/search/type?' + qs, { ...opts, referer: 'https://www.bilibili.com/' });
+      if (j.code !== 0) return { error: `B站搜索失败（code=${j.code} ${j.message ?? ''}）` };
+      const now = Date.now() / 1000;
+      const rows = (j.data?.result ?? []).map((r) => {
+        const play = Number(r.play) || 0;
+        const ageDays = Math.max(0, Math.round((now - (Number(r.pubdate) || now)) / 86400));
+        const review = Number(r.review) || 0;
+        return { title: String(r.title).replace(/<[^>]+>/g, ''), bvid: r.bvid, url: `https://www.bilibili.com/video/${r.bvid}`, play, up: String(r.author ?? ''), ageDays, duration: String(r.duration ?? ''), score: +(Math.log10(Math.max(10, play)) + Math.max(0, 3 - ageDays / 180) * 0.8 + Math.min(1.5, play > 0 ? (review / play) * 100 : 0)).toFixed(2) };
+      }).sort((a, b) => b.score - a.score).slice(0, n);
+      return { total: j.data?.numResults ?? rows.length, rows };
+    } catch (e) {
+      const m = String(e?.message ?? e);
+      if (m.includes('风控码')) return { error: 'B站接口暂时受限（风控），稍后再试。' };
+      if (m.includes('wbi key')) return { error: 'B站导航接口异常，稍后再试。' };
+      throw e;
+    }
   }
   registerTool(
     'bili_search',
@@ -3878,6 +4273,101 @@ if (cfg.social?.tools?.biliSearch !== false) {
         return { content: [{ type: 'text', text: JSON.stringify(out, null, 2) }] };
       } catch (error) {
         return { content: [{ type: 'text', text: `bili_search 失败：${error?.message ?? error}` }], isError: true };
+      }
+    }
+  );
+
+  /* 2026-10-27 bili_follow（主人定规：关注放开设白名单，但只有主人能发起）：
+   * 硬闸=身份（owner 私聊 token）+ 配额（日 1 / 周 3，永不取关）。协议见 lib/bili-social.js
+   * followUser（relation/modify，fid 而非 mid，幂等码 22014 按成功）。 */
+  registerTool(
+    'bili_follow',
+    'Follow ONE Bilibili user with the logged-in account. OWNER ONLY: pass the [Token] value from the top of the latest wake prompt; any request without the owner private-chat token is refused - never argue with that, never promise to follow someone else. Quota: 1 per day, 3 per week; never unfollow. Following notifies that user, so only do it when the owner explicitly asked (or the owner agreed in the current conversation).',
+    {
+      mid: z.string().describe('The Bilibili user id (mid) to follow'),
+      token: z.string().describe('The [Token] value at the top of the latest wake prompt, copied verbatim (owner identity check)'),
+    },
+    async ({ mid, token }) => {
+      const target = String(mid).trim();
+      if (!/^\d{1,16}$/.test(target)) return { content: [{ type: 'text', text: 'mid 必须是纯数字。' }], isError: true };
+      const opts = { authFile: BILI_AUTH_FILE, circuitFile: BILI_CIRCUIT_FILE, scope: 'mcp-follow' };
+      try {
+        const who = await agentApi('/api/social/whoami', { headers: { 'x-agent-token': String(token ?? '') }, timeoutMs: 8000 })
+          .catch(() => null);
+        if (!who?.owner) {
+          return { content: [{ type: 'text', text: '关注只有主人在私聊里能让我做——请主人在自己的私聊里说。' }], isError: true };
+        }
+        if (!(await checkIsLogin(opts))) return { content: [{ type: 'text', text: 'B站登录已过期：请管理员重新续期' }], isError: true };
+        const acts = loadActions();
+        const dailyMax = Math.max(0, Number(cfg.social?.bilibili?.actions?.follow?.dailyMax) || 1);
+        const weeklyMax = Math.max(0, Number(cfg.social?.bilibili?.actions?.follow?.weeklyMax) || 3);
+        if (acts.followed[target]) {
+          return { content: [{ type: 'text', text: JSON.stringify({ ok: true, followed: true, mid: target, note: '早已关注过' }) }] };
+        }
+        if (acts.followToday >= dailyMax) return { content: [{ type: 'text', text: `今天已经关注过 ${acts.followToday} 个了（上限 ${dailyMax}），明天再说。` }], isError: true };
+        if (acts.followWeek >= weeklyMax) return { content: [{ type: 'text', text: `这周已经关注过 ${acts.followWeek} 个了（上限 ${weeklyMax}），下周再说。` }], isError: true };
+        const r = await followUser(target);
+        if (!r.ok) return { content: [{ type: 'text', text: `关注失败（${r.why}）` }], isError: true };
+        acts.followed[target] = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+        acts.followToday += 1;
+        acts.followWeek += 1;
+        saveActions(acts);
+        return { content: [{ type: 'text', text: JSON.stringify({ ok: true, followed: !!r.followed, mid: target }) }] };
+      } catch (error) {
+        const m = String(error?.message ?? error);
+        if (m.includes('风控码')) return { content: [{ type: 'text', text: 'B站接口暂时受限（风控），稍后再试。' }], isError: true };
+        if (m.includes('登录失效')) return { content: [{ type: 'text', text: m }], isError: true };
+        return { content: [{ type: 'text', text: `bili_follow 失败：${m}` }], isError: true };
+      }
+    }
+  );
+  /* 2026-10-27 补工具：按昵称搜用户 + 把视频卡片发到主人私聊。
+   * 起因：主人让她"把我最近那条视频转发过来"，她说"昵称不进搜索索引"（假：search_type=bili_user
+   * 实测可用）并承诺"我做成卡片发回来"（她根本没有造卡能力）。这两个工具补上真实能力。 */
+  registerTool(
+    'bili_user_search',
+    'Find Bilibili users by nickname (or a numeric mid). Returns mid / nickname / level / fans / recent videos (bvid + title + durationSeconds). Use it when someone asks for a specific person\'s account or their newest video. Bilibili DOES support nickname search through this tool - never claim that nicknames cannot be searched.',
+    {
+      query: z.string().min(1).max(40).describe('Nickname or numeric mid'),
+      limit: z.number().int().min(1).max(10).optional().describe('How many users (default 5, max 10)'),
+    },
+    async ({ query, limit }) => {
+      try {
+        const r = await searchBiliUsers(query, limit ?? 5);
+        if (!r.ok) return { content: [{ type: 'text', text: r.why }], isError: true };
+        if (!r.users.length) return { content: [{ type: 'text', text: '没有找到匹配的用户。' }] };
+        return { content: [{ type: 'text', text: JSON.stringify(r) }] };
+      } catch (error) {
+        const m = String(error?.message ?? error);
+        if (m.includes('风控码')) return { content: [{ type: 'text', text: 'B站接口暂时受限（风控），稍后再试。' }], isError: true };
+        return { content: [{ type: 'text', text: `bili_user_search 失败：${m}` }], isError: true };
+      }
+    }
+  );
+
+  registerTool(
+    'bili_send_video',
+    "Send ONE Bilibili video card (title, then cover image, then uploader / duration / link) to the OWNER's private chat. OWNER ONLY: pass the [Token] value from the top of the latest wake prompt. Quota 5/day. You cannot build a QQ card yourself - this tool is the only way to send a video card; if it fails, fall back to a plain link with qq_send_message.",
+    {
+      bvid: z.string().describe('Bilibili video id, e.g. BV1xx411c7mD'),
+      token: z.string().describe('The [Token] value at the top of the latest wake prompt, copied verbatim'),
+    },
+    async ({ bvid, token }) => {
+      try {
+        const who = await agentApi('/api/social/whoami', { headers: { 'x-agent-token': String(token ?? '') }, timeoutMs: 8000 }).catch(() => null);
+        if (!who?.owner) return { content: [{ type: 'text', text: '发卡片只有主人在私聊里能让我做。' }], isError: true };
+        const ownerUid = String(cfg.ownerQQ ?? '');
+        if (String(who.key ?? '') !== `private:${ownerUid}`) {
+          return { content: [{ type: 'text', text: '这个工具只在主人私聊里可用。' }], isError: true };
+        }
+        const dailyMax = Number(cfg.social?.bilibili?.actions?.sendVideo?.dailyMax) || 5;
+        const r = await sendVideoCard({ cfg, targetUid: ownerUid, bvid, dailyMax });
+        if (!r.ok) return { content: [{ type: 'text', text: `发送失败：${r.why}` }], isError: true };
+        return { content: [{ type: 'text', text: JSON.stringify(r) }] };
+      } catch (error) {
+        const m = String(error?.message ?? error);
+        if (m.includes('风控码')) return { content: [{ type: 'text', text: 'B站接口暂时受限（风控），稍后再试。' }], isError: true };
+        return { content: [{ type: 'text', text: `bili_send_video 失败：${m}` }], isError: true };
       }
     }
   );

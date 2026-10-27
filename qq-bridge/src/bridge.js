@@ -96,6 +96,8 @@ import {
 } from './core/sticker.js';
 import { postRandomQzone, initQzoneCore, startQzoneAutoLike, startQzoneWeeklyScheduler } from './core/qzone.js';
 import { initBiliNurtureCore, startBiliNurture } from './core/bili-nurture.js';
+import { initBiliDynamicCore, startBiliDynamicScheduler } from './core/bili-dynamic.js';
+import { auditSandboxPatch } from './core/sandbox-audit.js';
 import {
   cancelPendingEntry, handlePendingAnswer, handlePokeNotice, handleInputStatusNotice,
   registerPending, initEventsAuxCore, setEventsAuxApi,
@@ -325,6 +327,8 @@ async function main() {
   // 顺带消灭审计 P1 第 8 条（GET /api/qzone-cookie）的实际暴露面；要重开置 social.qzoneEnabled=true
   if (cfg.social?.qzoneEnabled === true) { initQzoneCore(cfg); startQzoneAutoLike(); startQzoneWeeklyScheduler(); } else log('[qzone] 已按工具型默认下线（social.qzoneEnabled 未开启）');
   initBiliNurtureCore(cfg); startBiliNurture();
+  initBiliDynamicCore(cfg); startBiliDynamicScheduler();
+  auditSandboxPatch(cfg.dsh?.workspaceRoot);
   initEventsAuxCore(cfg);
   initMemoryCore(cfg);
   initWakeCore(cfg);

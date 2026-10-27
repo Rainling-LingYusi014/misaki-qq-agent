@@ -323,6 +323,14 @@ export function loadConfig() {
      * core/napcat-guard.js 的 guardCfg() 读的就是 cfgRef?.guard，于是改 guard.* 完全无效、守护照旧按默认值跑，
      * napcat-guard.js 里 verdict='disabled' 那条分支也不可达。这里把 guard 段透传进来（出厂默认见 config.example.json）。 */
     guard: { ...(file.guard ?? {}) },
+    /* 2026-10-27：TTS 交付链路（千问复刻）的配置。loadConfig 返回的是显式键字面量，
+     * 不在这里透传的话 config.json 里的 voice 段会被整段丢掉（与上面 guard 的 BL2 坑同型）。
+     * 注意它和 state/voice-config.json 的 MiMo 聊天语音是两套东西，互不影响。 */
+    voice: { ...(file.voice ?? {}) },
+    /* 2026-10-27：通用文件格式转换（同样必须显式透传，否则 config.json 里的 convert 段会被丢掉）。 */
+    convert: { ...(file.convert ?? {}) },
+    /* 2026-10-27 晚：文本/JSON 工具的小额度（JSON 格式化、文本处理；与上面同型，不透传会整段丢）。 */
+    text: { ...(file.text ?? {}) },
   };
 
   // social.tools 需要与默认值深度合并：旧 config.json 若缺少新增工具开关，

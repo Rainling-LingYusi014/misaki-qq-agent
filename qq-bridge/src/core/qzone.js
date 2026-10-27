@@ -1,13 +1,55 @@
 // M2 空间说说
 import fs from 'node:fs';
 import path from 'node:path';
-import { STATE_DIR } from '../lib/paths.js';
+import { STATE_DIR, ROOT } from '../lib/paths.js';
 import { readJsonSafe, atomicWriteJson } from '../lib/json-fs.js';
 import { log } from '../lib/log.js';
 import { initMemoryDb } from './memory.js';
 
 let cfgRef = null;
 export function initQzoneCore(cfg) { cfgRef = cfg; }
+
+/* 曲库池（2026-10-27 v3）：assets/qzone-pool.json 由《空间文案池_定稿审阅_20261027.md》生成，
+ * 按类目权重抽（日常侧写 15% / 工作痕迹 15% / 治愈短句 70%），类目内均匀随机。
+ * 文件缺失/不可读时退回下面的内置兜底池——宁可发一条旧的，也不要因为缺文件而不发。
+ * 缓存按 mtime 失效：改池文件后下次选文即生效，无需重启。 */
+const QZONE_POOL_FILE = path.join(ROOT, 'assets', 'qzone-pool.json');
+let qzonePoolCache = null;
+let qzonePoolMtime = 0;
+
+export function loadQzonePool() {
+  try {
+    const st = fs.statSync(QZONE_POOL_FILE);
+    if (qzonePoolCache !== null && st.mtimeMs === qzonePoolMtime) return qzonePoolCache;
+    const j = readJsonSafe(QZONE_POOL_FILE, null);
+    const cats = Array.isArray(j?.categories)
+      ? j.categories.filter((c) => Array.isArray(c?.items) && c.items.length)
+      : [];
+    qzonePoolCache = cats.length ? { version: String(j.version ?? ''), cats } : null;
+    qzonePoolMtime = st.mtimeMs;
+  } catch {
+    qzonePoolCache = null;
+  }
+  return qzonePoolCache;
+}
+
+export function pickFromQzonePool() {
+  const p = loadQzonePool();
+  if (!p) return null;
+  const weights = p.cats.map((c) => { const w = Number(c.weight); return Number.isFinite(w) && w > 0 ? w : 0; });
+  const totalW = weights.reduce((a, b) => a + b, 0) || p.cats.length;
+  let r = Math.random() * totalW;
+  let idx = p.cats.length - 1;
+  for (let i = 0; i < p.cats.length; i++) {
+    r -= weights[i];
+    if (r <= 0) { idx = i; break; }
+  }
+  const cat = p.cats[idx];
+  const it = cat.items[Math.floor(Math.random() * cat.items.length)];
+  const text = typeof it === 'string' ? it : String(it?.text ?? '');
+  if (!text) return null;
+  return { text, id: typeof it === 'string' ? '' : String(it?.id ?? ''), catName: String(cat.name ?? cat.id ?? '') };
+}
 
 export async function postRandomQzone() {
   const napcatBase = String(cfgRef.napcat?.httpUrl || 'http://127.0.0.1:3000').replace(/\/+$/, '');
@@ -25,7 +67,9 @@ export async function postRandomQzone() {
     '错过不可怕，可怕的是没来得及把想说的话说完。所以我现在就说了：你好呀。',
     '我就是我，没什么特别，但每天都过得还算认真。这大概就是我的全部浪漫。'
   ];
-  const content = pool[Math.floor(Math.random() * pool.length)];
+  const picked = pickFromQzonePool();
+  const content = picked?.text ?? pool[Math.floor(Math.random() * pool.length)];
+  const fromPool = picked ? `（${picked.catName}${picked.id ? ' ' + picked.id : ''}）` : '（内置兜底池）';
   const body = { content };
   const res = await fetch(`${napcatBase}/send_qzone_msg`, {
     method: 'POST',
@@ -44,7 +88,7 @@ export async function postRandomQzone() {
         .run(uid, 'qzone_post', `我主动发了一条空间说说：${content}`, Date.now());
     }
   } catch {}
-  log(`[qzone] 主动发说说成功: ${content.slice(0, 30)}…`);
+  log(`[qzone] 主动发说说成功${fromPool}: ${content.slice(0, 30)}…`);
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
@@ -232,6 +276,10 @@ export function startQzoneWeeklyScheduler() {
   if (weeklyTimer) { clearTimeout(weeklyTimer); weeklyTimer = null; }
   const qz = cfgRef?.social?.qzone ?? {};
   if (qz.enabled === false) { log('[qzone-weekly] social.qzone.enabled=false，不发'); return; }
+  const poolInfo = loadQzonePool();
+  log(poolInfo
+    ? `[qzone-weekly] 文案池 ${poolInfo.version}：${poolInfo.cats.reduce((a, c) => a + c.items.length, 0)} 条（${poolInfo.cats.map((c) => `${c.name} ${c.items.length}`).join(' / ')}）`
+    : '[qzone-weekly] 文案池文件缺失，将用内置兜底池');
   const twoProb = (() => { const v = Number(qz.weeklyTwoPostsProbability); return Number.isFinite(v) ? Math.min(1, Math.max(0, v)) : 0.6; })();
   const minGapMs = Math.max(0, Number(qz.weeklyMinGapHours) || 12) * 3600 * 1000;
   const schedule = () => {
