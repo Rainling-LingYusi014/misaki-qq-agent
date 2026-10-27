@@ -14,7 +14,9 @@
     "enabled": true,
     "thresholdRatio": 0.16,
     "retainRatio": 0.02,
-    "toolResultMaxChars": 8192
+    "toolResultMaxChars": 8192,
+    "summarizationProvider": "",
+    "summarizationModel": ""
   },
   "napcat": {
     "wsUrl": "ws://127.0.0.1:3001",
@@ -188,7 +190,19 @@
       "stickerNote": true,
       "collectSticker": true,
       "getSelfImage": true,
-      "characterCards": true
+      "characterCards": true,
+      "pixiv": false,
+      "_toolsNote20261027": "以下十个是工作站/复刻批次的 config 开关（审查 P2-2 补齐）：默认开（不写=开），显式 false 才下线——下线单个能力不用停整个服务。查表位置 src/mcp-napcat-safe.js 的 TOOL_CONFIG_SWITCHES。",
+      "ttsEnroll": true,
+      "ttsRender": true,
+      "ttsVoiceList": true,
+      "ttsVoiceDelete": true,
+      "convertFile": true,
+      "imageEdit": true,
+      "textTool": true,
+      "pdfTool": true,
+      "qrcode": true,
+      "help": true
     },
     "wake": {
       "defaultMode": "active",
@@ -285,7 +299,10 @@
       "checkIntervalMaxMs": 5400000,
       "idleThresholdMs": 900000,
       "probability": 0.3,
-      "privateProbability": 0.7
+      "privateProbability": 0.7,
+      "freshContextOnly": false,
+      "privateDailyMax": 2,
+      "_proactiveNote20261027": "freshContextOnly=true 时只有冷场窗口里有「新话题」才主动冒泡（实测私有默认 false）；privateDailyMax 是私聊主动冒泡的每日硬上限（与 budget 分开数，0=不限）。"
     },
     "feedback": {
       "maxLength": 500,
@@ -345,6 +362,36 @@
       "level": "medium",
       "excludeTools": [],
       "toonify": false
+    },
+    "misakiCommands": {
+      "_note": "misaki@ 统一指令前缀（桥层拦截，不进模型，2026-10-27 审查 P2-6 回流 example）。现在可切换的模式只有 companion（陪伴模式）：misaki@companion mode on / off。passthroughSuffixes：misaki@ 后紧跟这些串时按普通聊天放行（例如美咲自己的域名邮箱后缀——部署者换成自己的，被提及不能报「指令不认得」）。",
+      "passthroughSuffixes": []
+    },
+    "companionMode": {
+      "_note": "陪伴模式参数（具体数值可随时调）：checkInterval 主动关心检查间隔；idleThresholdMs 冷场阈值；dailyMax 每日主动上限（与常规模式 2 次配额分开计数）；quietStart/quietEnd 静默时段（北京时间，不主动关心）；unansweredWindowMs 主动后多久没回算无回应；unansweredStreakLimit 连续无回应几次后降档到 backoffDailyMax；typingHoldMaxMs/typingRefreshMs 打字等待；allowedTools 陪伴回合可用工具白名单（桥侧强制）。",
+      "checkIntervalMinMs": 2400000,
+      "checkIntervalMaxMs": 5400000,
+      "idleThresholdMs": 600000,
+      "dailyMax": 3,
+      "quietStart": "23:30",
+      "quietEnd": "07:30",
+      "unansweredWindowMs": 21600000,
+      "unansweredStreakLimit": 2,
+      "backoffDailyMax": 1,
+      "typingHoldMaxMs": 45000,
+      "typingRefreshMs": 5000,
+      "allowedTools": [
+        "reply",
+        "sendMessage",
+        "markRead",
+        "sendSticker",
+        "listStickers",
+        "getStickerImage",
+        "getImages",
+        "memoryRemember",
+        "memorySearch",
+        "memory"
+      ]
     },
     "bilibili": {
       "_note": "M2 养号实验（B站行为边界，主人定规）：只观看+点赞；点赞仅白名单UID视频且先看后赞；不评论/不私信/不关注/不投币/不收藏。登录态在 state/bilibili-auth.json（本地浏览器登录+CDP导出，见 bili-login.mjs）。风控码出现当天自动停。",

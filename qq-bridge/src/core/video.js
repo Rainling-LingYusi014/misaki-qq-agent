@@ -550,6 +550,9 @@ export async function fetchBiliShareCode(bvid, aid = 0) {
     build: '6114514',
   }).toString();
 
+  /* 2026-10-27（审查 P2-3）：这里有意不走 lib/bili-api.js 单源——本链路是匿名（无 cookie）
+   * 的分享上报，双 host 互为备份、风控语义与带 cookie 的单源不同；强并会把匿名失败
+   * 记进共享熔断。改动前先想清楚这一点。 */
   for (const host of ['https://api.bilibili.com', 'https://api.biliapi.net']) {
     try {
       const r = await fetch(`${host}/x/share/click`, {

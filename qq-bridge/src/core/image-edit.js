@@ -21,7 +21,10 @@ import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { STATE_DIR } from '../lib/paths.js';
 import { log } from '../lib/log.js';
-import { probeTools, fetchImageFromMessage, reserveMediaQuota, commitMediaQuota } from './file-convert.js';
+import { probeTools, fetchImageFromMessage, reserveMediaQuota, refundMediaQuota } from './file-convert.js';
+
+/* 控制台交付失败时回补额度用（与 file-convert 同一份小本本）。 */
+export { refundMediaQuota };
 
 const OUT_DIR = path.join(STATE_DIR, 'image-out');
 const TMP_DIR = path.join(STATE_DIR, 'image-tmp');
@@ -473,7 +476,7 @@ export async function editImage({ cfg, name, buf, watermarkBuf, watermarkName, u
     throw new Error('图片水印需要再给一张水印图（watermarkMessageId）');
   }
   applyWatermarkFont(opts);
-  const { u } = reserveMediaQuota({ cfg, uid: requester, isOwner: isOwner === true });
+  reserveMediaQuota({ cfg, uid: requester, isOwner: isOwner === true });
 
   ensureDir(OUT_DIR);
   const jobId = `img-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
@@ -495,10 +498,12 @@ export async function editImage({ cfg, name, buf, watermarkBuf, watermarkName, u
     const base = path.basename(String(name || 'image'), path.extname(String(name || '')));
     const { fileName, outPath } = stampName(base, opts.action === 'watermark' ? 'watermark' : 'edited', opts.format);
     fs.copyFileSync(dst, outPath);
-    commitMediaQuota(u, requester, isOwner === true);
     cleanOld();
     log(`[image-edit] ${opts.action} ${opts.format} 完成：${fileName} ${(outBytes / 1024).toFixed(0)}KB ${((Date.now() - started) / 1000).toFixed(1)}s uid=${requester} owner=${isOwner === true}`);
     return { ok: true, filePath: outPath, fileName, format: opts.format, bytes: outBytes, ms: Date.now() - started, ...info };
+  } catch (e) {
+    refundMediaQuota(requester, isOwner === true);
+    throw e;
   } finally {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
   }
@@ -520,7 +525,7 @@ export async function makeGif({ cfg, images, uid, isOwner, options } = {}) {
   }
   const total = frames.reduce((s, f) => s + f.buf.length, 0);
   if (total > 200 * 1024 * 1024) throw new Error(`帧图片总量 ${(total / 1048576).toFixed(0)}MB，超过 200MB 上限，请先压缩`);
-  const { u } = reserveMediaQuota({ cfg, uid: requester, isOwner: isOwner === true });
+  reserveMediaQuota({ cfg, uid: requester, isOwner: isOwner === true });
 
   ensureDir(OUT_DIR);
   const jobId = `gif-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
@@ -552,10 +557,12 @@ export async function makeGif({ cfg, images, uid, isOwner, options } = {}) {
     try { info = JSON.parse(String(r.stdout || '{}').trim().split(/\r?\n/).pop() || '{}'); } catch { /* ignore */ }
     const { fileName, outPath } = stampName(path.basename(String(frames[0].name || 'frames'), path.extname(String(frames[0].name || ''))), 'gif', 'gif');
     fs.copyFileSync(dst, outPath);
-    commitMediaQuota(u, requester, isOwner === true);
     cleanOld();
     log(`[image-edit] gif ${info.frames ?? frames.length} 帧 ${info.width ?? '?'}x${info.height ?? '?'} 完成：${fileName} ${(outBytes / 1024).toFixed(0)}KB ${((Date.now() - started) / 1000).toFixed(1)}s uid=${requester} owner=${isOwner === true}`);
     return { ok: true, filePath: outPath, fileName, format: 'gif', bytes: outBytes, ms: Date.now() - started, ...info };
+  } catch (e) {
+    refundMediaQuota(requester, isOwner === true);
+    throw e;
   } finally {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
   }
@@ -599,7 +606,7 @@ export async function batchEditImages({ cfg, images, watermarkBuf, watermarkName
   }
   if (watermarkBuf?.length && watermarkBuf.length > maxIn) throw new Error('水印图片太大');
   applyWatermarkFont(opts);
-  const { u } = reserveMediaQuota({ cfg, uid: requester, isOwner: isOwner === true });
+  reserveMediaQuota({ cfg, uid: requester, isOwner: isOwner === true });
 
   ensureDir(OUT_DIR);
   const tmp = ensureDir(path.join(TMP_DIR, `batch-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`));
@@ -643,10 +650,12 @@ export async function batchEditImages({ cfg, images, watermarkBuf, watermarkName
       outPath = path.join(OUT_DIR, fileName);
     }
     fs.copyFileSync(zipPath, outPath);
-    commitMediaQuota(u, requester, isOwner === true);
     cleanOld();
     log(`[image-edit] batch ${opts.action} × ${list.length} 完成：${fileName} ${(outBytes / 1024).toFixed(0)}KB ${((Date.now() - started) / 1000).toFixed(1)}s uid=${requester} owner=${isOwner === true}`);
     return { ok: true, filePath: outPath, fileName, format: 'zip', action: opts.action, images: list.length, bytes: outBytes, ms: Date.now() - started, ...info };
+  } catch (e) {
+    refundMediaQuota(requester, isOwner === true);
+    throw e;
   } finally {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
   }

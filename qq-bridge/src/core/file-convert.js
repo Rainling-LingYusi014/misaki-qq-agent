@@ -323,12 +323,14 @@ export function planFor(from, to, t = probeTools(), opts = {}) {
   throw new Error(`不支持 ${f} → ${o}；可用目标：${(buildCapabilities(t).targets[f] || []).join('/') || '无'}`);
 }
 
-/* ── 安全：zip 解压总量 / 宏安全配置 ── */
+/* ── 安全：zip 解压总量 / 宏安全配置 ──
+ * 2026-10-27（审查 P1-2）：fail-closed——没装 unzip、或清单读不出来，都拒绝处理 Office 文件，
+ * 不再静默跳过 zip-bomb 防线。 */
 function zipUncompressedBytes(file) {
   const t = probeTools();
-  if (!t.unzip) return null;
+  if (!t.unzip) throw new Error('服务器缺少 unzip，无法核查 Office 文件解压后的总量（zip 炸弹防线）；请先安装 unzip');
   const r = spawnSync('unzip', ['-l', file], { encoding: 'utf8', timeout: 15000, maxBuffer: 8 * 1024 * 1024 });
-  if (r.status !== 0) return null;
+  if (r.status !== 0) throw new Error('无法读取 Office 包内的文件清单（unzip -l 失败），为防 zip 炸弹拒绝处理');
   let total = 0;
   for (const line of String(r.stdout || '').split(/\r?\n/)) {
     const m = /^\s*(\d+)\s+\d{2}[-:]\d{2}\s+/.exec(line);
@@ -392,13 +394,6 @@ function convertCfg(cfg) {
   };
 }
 export { convertCfg };
-function commit(u, uid, isOwner) {
-  const key = String(uid);
-  u.users[key] = u.users[key] || fresh();
-  u.users[key].count += 1;
-  if (!isOwner) u.global.count += 1;
-  atomicWriteJson(USAGE_FILE, u);
-}
 function checkQuota(cfg, uid, isOwner) {
   const c = convertCfg(cfg);
   if (!c.enabled) throw new Error('文件转换未启用（config.json 的 convert.enabled）');
@@ -407,6 +402,27 @@ function checkQuota(cfg, uid, isOwner) {
   if (per.count >= c.userDailyJobs) throw new Error(`今天 ${c.userDailyJobs} 次转换已经用完，明天 0 点（北京时）恢复`);
   if (c.globalDailyJobs > 0 && u.global.count >= c.globalDailyJobs) throw new Error('今天全站转换次数已满，请明天再试');
   return { u, c, per };
+}
+/* 2026-10-27（审查 P1-1）：旧的「检查→长活→提交」在检查与提交之间隔着长活，
+ * 拿旧快照写回会丢掉并发请求的计数（少扣、可绕日限）。改为预扣制：
+ * reserve = 检查 + 计数 + 立即落盘（全程同步，事件循环插不进其他请求），然后才开始长活；
+ * 失败路径（转换失败 / 控制台交付失败）用 refundQuota 回补。
+ * 进程在长活中途崩溃会白扣一次，可接受。 */
+function reserveQuota(cfg, uid, isOwner) {
+  const { u, c, per } = checkQuota(cfg, uid, isOwner); /* 满了在这里抛 */
+  const pre = { user: per.count, global: u.global.count };
+  u.users[String(uid)].count += 1;
+  if (!isOwner) u.global.count += 1;
+  atomicWriteJson(USAGE_FILE, u);
+  return { c, pre };
+}
+function refundQuota(uid, isOwner) {
+  const key = String(uid ?? '').trim();
+  if (!key) return;
+  const { u } = loadUsage(key);
+  u.users[key].count = Math.max(0, num(u.users[key].count) - 1);
+  if (!isOwner) u.global.count = Math.max(0, num(u.global.count) - 1);
+  atomicWriteJson(USAGE_FILE, u);
 }
 
 /* ── 从 QQ 消息取文件 ── */
@@ -460,12 +476,13 @@ export async function fetchImageFromMessage({ cfg, messageId } = {}) {
   return { name, buf, messageId: id };
 }
 
-/** 图片编辑与文件转换共用同一份额度（10 次/天；主人不限）。 */
+/** 图片编辑与文件转换共用同一份额度（10 次/天；主人不限）。
+ *  2026-10-27（审查 P1-1）：预扣制——检查+记账+落盘一次完成；失败用 refundMediaQuota 回补。 */
 export function reserveMediaQuota({ cfg, uid, isOwner }) {
-  return checkQuota(cfg, uid, isOwner === true);
+  return reserveQuota(cfg, uid, isOwner === true);
 }
-export function commitMediaQuota(u, uid, isOwner) {
-  return commit(u, uid, isOwner === true);
+export function refundMediaQuota(uid, isOwner) {
+  refundQuota(uid, isOwner === true);
 }
 
 /* ── 转换主入口 ── */
@@ -484,7 +501,7 @@ export async function convertFile({ cfg, name, buf, target, uid, isOwner, option
   const t = probeTools();
   const vopts = validateConvertOptions(options ?? {});
   const plan = planFor(from, to, t, vopts);
-  const { u } = checkQuota(cfg, requester, isOwner === true);
+  reserveQuota(cfg, requester, isOwner === true);
 
   ensureDir(OUT_DIR);
   const jobId = `conv-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
@@ -495,7 +512,7 @@ export async function convertFile({ cfg, name, buf, target, uid, isOwner, option
   try {
     if (ZIP_OFFICE.has(from)) {
       const bytes = zipUncompressedBytes(input);
-      if (bytes != null && bytes > 300 * 1024 * 1024) {
+      if (bytes > 300 * 1024 * 1024) {
         throw new Error(`Office 文件解压后 ${(bytes / 1048576).toFixed(0)}MB，超过 300MB 安全上限`);
       }
     }
@@ -574,10 +591,12 @@ export async function convertFile({ cfg, name, buf, target, uid, isOwner, option
       outPath = path.join(OUT_DIR, fileName);
     }
     fs.copyFileSync(produced, outPath);
-    commit(u, requester, isOwner === true);
     cleanup(c);
     log(`[convert] ${from}→${plan.ext} 完成：${fileName} ${(outBytes / 1024).toFixed(0)}KB ${((Date.now() - started) / 1000).toFixed(1)}s uid=${requester} owner=${isOwner === true}`);
     return { ok: true, filePath: outPath, fileName, from, to: plan.ext, bytes: outBytes, ms: Date.now() - started };
+  } catch (e) {
+    refundQuota(requester, isOwner === true);
+    throw e;
   } finally {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
   }
@@ -634,7 +653,7 @@ export async function convertImagesToPdf({ cfg, images, uid, isOwner, options } 
   }
   const t = probeTools();
   if (!t.img2pdf && !t.pillow) throw new Error('图片合成 PDF 需要 img2pdf 或 Python Pillow（两者都没装）');
-  const { u } = checkQuota(cfg, requester, isOwner === true);
+  reserveQuota(cfg, requester, isOwner === true);
 
   ensureDir(OUT_DIR);
   const jobId = `pdf-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
@@ -695,7 +714,6 @@ export async function convertImagesToPdf({ cfg, images, uid, isOwner, options } 
       outPath = path.join(OUT_DIR, fileName);
     }
     fs.copyFileSync(produced, outPath);
-    commit(u, requester, isOwner === true);
     cleanup(c);
     log(`[convert] images×${list.length}→pdf（${engine}）完成：${fileName} ${(outBytes / 1024).toFixed(0)}KB ${((Date.now() - started) / 1000).toFixed(1)}s uid=${requester} owner=${isOwner === true}`);
     return {
@@ -704,6 +722,9 @@ export async function convertImagesToPdf({ cfg, images, uid, isOwner, options } 
       ...(po.pageSize !== 'auto' ? { pageSize: po.pageSize, margin: po.margin } : {}),
       ...info,
     };
+  } catch (e) {
+    refundQuota(requester, isOwner === true);
+    throw e;
   } finally {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
   }

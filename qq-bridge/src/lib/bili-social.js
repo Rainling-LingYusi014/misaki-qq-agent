@@ -57,20 +57,19 @@ function csrfToken() {
   return String(readJsonSafe(BILI_AUTH_FILE, {}).bili_jct ?? '');
 }
 
-/** 当前硬币余额（nav 的 money 字段）。失败返回 null，调用方一律按"不可投"处理。 */
+/** 当前硬币余额（nav 的 money 字段）。失败返回 null，调用方一律按"不可投"处理。
+ *  2026-10-27（审查 P2-3）：原来这里直连 nav 且自带 Chrome/131 UA，与单源 Chrome/126
+ *  构成「同端点两种 UA」的风控特征；改走 biliJson 单源（UA / HTTP 412 归一 / 共享熔断一致）。 */
 export async function getCoinBalance() {
   const ck = cookieHeader();
   if (!ck) return null;
   try {
-    const res = await fetch('https://api.bilibili.com/x/web-interface/nav', {
-      headers: {
-        cookie: ck,
-        'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-        referer: 'https://www.bilibili.com/',
-      },
-      signal: AbortSignal.timeout(10000),
+    const j = await biliJson('https://api.bilibili.com/x/web-interface/nav', {
+      cookie: ck,
+      scope: 'coin',
+      circuitFile: BILI_CIRCUIT_FILE,
+      authFile: BILI_AUTH_FILE,
     });
-    const j = await res.json();
     const n = Number(j?.data?.money);
     return Number.isFinite(n) ? n : null;
   } catch {

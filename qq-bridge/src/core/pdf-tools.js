@@ -20,7 +20,10 @@ import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { STATE_DIR } from '../lib/paths.js';
 import { log } from '../lib/log.js';
-import { probeTools, convertCfg, reserveMediaQuota, commitMediaQuota, cleanupConvertOutputs } from './file-convert.js';
+import { probeTools, convertCfg, reserveMediaQuota, refundMediaQuota, cleanupConvertOutputs } from './file-convert.js';
+
+/* 控制台交付失败时回补额度用（与 file-convert 同一份小本本）。 */
+export { refundMediaQuota };
 import { watermarkFontCandidates, normalizeWatermarkColor } from './image-edit.js';
 
 const OUT_DIR = path.join(STATE_DIR, 'convert-out');
@@ -377,7 +380,7 @@ export async function pdfMerge({ cfg, files, uid, isOwner } = {}) {
   }
   const total = list.reduce((s, f) => s + f.buf.length, 0);
   if (total > c.maxOutputBytes) throw new Error(`文件总量 ${(total / 1048576).toFixed(0)}MB，超过 ${(c.maxOutputBytes / 1048576).toFixed(0)}MB 上限`);
-  const { u } = reserveMediaQuota({ cfg, uid: requester, isOwner: isOwner === true });
+  reserveMediaQuota({ cfg, uid: requester, isOwner: isOwner === true });
   ensureDir(OUT_DIR);
   const tmp = ensureDir(path.join(TMP_DIR, `pdfm-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`));
   const started = Date.now();
@@ -394,10 +397,12 @@ export async function pdfMerge({ cfg, files, uid, isOwner } = {}) {
     checkInOut(outBytes);
     const { fileName, outPath } = stampOut('merged', 'pdf', 'pdf');
     fs.copyFileSync(dst, outPath);
-    commitMediaQuota(u, requester, isOwner === true);
     cleanupConvertOutputs();
     log(`[pdf] merge ${info.inputs ?? list.length} 份 → ${info.pages ?? '?'} 页：${fileName} uid=${requester}`);
     return { ok: true, filePath: outPath, fileName, op: 'merge', pages: info.pages, inputs: list.length, bytes: outBytes, ms: Date.now() - started };
+  } catch (e) {
+    refundMediaQuota(requester, isOwner === true);
+    throw e;
   } finally {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
   }
@@ -421,7 +426,7 @@ export async function pdfSplit({ cfg, name, buf, uid, isOwner, options } = {}) {
   } else throw new Error('拆分要给 pages（如 "1-3,5"）或 every（每 N 页一拆）');
   const c = convertCfg(cfg);
   if (buf.length > c.maxInputBytes) throw new Error(`PDF ${(buf.length / 1048576).toFixed(1)}MB，超过 ${(c.maxInputBytes / 1048576).toFixed(0)}MB 上限`);
-  const { u } = reserveMediaQuota({ cfg, uid: requester, isOwner: isOwner === true });
+  reserveMediaQuota({ cfg, uid: requester, isOwner: isOwner === true });
   ensureDir(OUT_DIR);
   const tmp = ensureDir(path.join(TMP_DIR, `pdfs-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`));
   const started = Date.now();
@@ -437,7 +442,6 @@ export async function pdfSplit({ cfg, name, buf, uid, isOwner, options } = {}) {
     checkInOut(outBytes);
     const { fileName, outPath } = stampOut(base, info.mode === 'every' ? `split${every}` : 'extract', expectZip ? 'zip' : 'pdf');
     fs.copyFileSync(dst, outPath);
-    commitMediaQuota(u, requester, isOwner === true);
     cleanupConvertOutputs();
     log(`[pdf] split ${info.mode} 共 ${info.total ?? '?'} 页：${fileName} uid=${requester}`);
     return {
@@ -445,6 +449,9 @@ export async function pdfSplit({ cfg, name, buf, uid, isOwner, options } = {}) {
       pages: info.mode === 'range' ? info.pages : undefined, every: info.mode === 'every' ? every : undefined,
       total: info.total, parts: info.parts, bytes: outBytes, ms: Date.now() - started,
     };
+  } catch (e) {
+    refundMediaQuota(requester, isOwner === true);
+    throw e;
   } finally {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
   }
@@ -467,7 +474,7 @@ export async function pdfWatermark({ cfg, name, buf, watermarkBuf, watermarkName
   }
   const c = convertCfg(cfg);
   if (buf.length > c.maxInputBytes) throw new Error(`PDF ${(buf.length / 1048576).toFixed(1)}MB，超过 ${(c.maxInputBytes / 1048576).toFixed(0)}MB 上限`);
-  const { u } = reserveMediaQuota({ cfg, uid: requester, isOwner: isOwner === true });
+  reserveMediaQuota({ cfg, uid: requester, isOwner: isOwner === true });
   ensureDir(OUT_DIR);
   const tmp = ensureDir(path.join(TMP_DIR, `pdfw-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`));
   const started = Date.now();
@@ -488,10 +495,12 @@ export async function pdfWatermark({ cfg, name, buf, watermarkBuf, watermarkName
     const base = path.basename(String(name || 'pdf'), path.extname(String(name || '')));
     const { fileName, outPath } = stampOut(base, 'watermark', 'pdf');
     fs.copyFileSync(dst, outPath);
-    commitMediaQuota(u, requester, isOwner === true);
     cleanupConvertOutputs();
     log(`[pdf] watermark ${info.position} × ${info.pages ?? '?'} 页：${fileName} uid=${requester}`);
     return { ok: true, filePath: outPath, fileName, op: 'watermark', pages: info.pages, position: opts.position, bytes: outBytes, ms: Date.now() - started };
+  } catch (e) {
+    refundMediaQuota(requester, isOwner === true);
+    throw e;
   } finally {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
   }

@@ -14,7 +14,10 @@ import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { STATE_DIR } from '../lib/paths.js';
 import { log } from '../lib/log.js';
-import { reserveMediaQuota, commitMediaQuota, cleanupConvertOutputs } from './file-convert.js';
+import { reserveMediaQuota, refundMediaQuota, cleanupConvertOutputs } from './file-convert.js';
+
+/* 控制台交付失败时回补额度用（与 file-convert 同一份小本本）。 */
+export { refundMediaQuota };
 
 const OUT_DIR = path.join(STATE_DIR, 'convert-out');
 const TMP_DIR = path.join(STATE_DIR, 'qrcode-tmp');
@@ -116,7 +119,7 @@ export async function generateQrCode({ cfg, text, uid, isOwner, options } = {}) 
   if (!theText.trim()) throw new Error('要生成二维码的内容是空的（text）');
   if (theText.length > MAX_TEXT) throw new Error(`内容 ${theText.length} 字符，二维码最多 ${MAX_TEXT} 字符`);
   const opts = validateQrOptions(options);
-  const { u } = reserveMediaQuota({ cfg, uid: requester, isOwner: isOwner === true });
+  reserveMediaQuota({ cfg, uid: requester, isOwner: isOwner === true });
 
   ensureDir(OUT_DIR);
   const tmp = ensureDir(path.join(TMP_DIR, `qr-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`));
@@ -152,10 +155,12 @@ export async function generateQrCode({ cfg, text, uid, isOwner, options } = {}) 
       outPath = path.join(OUT_DIR, fileName);
     }
     fs.copyFileSync(dst, outPath);
-    commitMediaQuota(u, requester, isOwner === true);
     cleanupConvertOutputs();
     log(`[qrcode] ${opts.level} scale=${opts.scale} ${outBytes}B ${info.engine ?? ''} uid=${requester}`);
     return { ok: true, filePath: outPath, fileName, op: 'qrcode', engine: info.engine ?? t.mode, bytes: outBytes, ms: Date.now() - started };
+  } catch (e) {
+    refundMediaQuota(requester, isOwner === true);
+    throw e;
   } finally {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
   }

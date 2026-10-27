@@ -178,6 +178,48 @@ function checkEnrollQuota({ cfg, uid, isOwner, voiceCount }) {
   return { u, d, per, owner: isOwner };
 }
 
+/* 2026-10-27（审查 P1-1）：渲染/建音色在检查与提交之间隔着网络 await（synthesize/enroll），
+ * 旧「检查→长活→提交」在并发下拿旧快照写回会丢计数（少扣、可绕日限）。
+ * 改为预扣：reserve 先检查再立即落盘（同步临界区），失败用 refundUsage 回补。
+ * pre 是预扣前快照，保证「剩余条数/字数」的展示口径与旧实现一致（当前这条已算进去）。 */
+function reserveRenderQuota({ cfg, chars, uid, isOwner }) {
+  const r = checkRenderQuota({ cfg, chars, uid, isOwner }); /* 满了在这里抛 */
+  const pre = { jobs: r.per.jobs, chars: r.per.chars };
+  commitUsage(r.u, uid, isOwner === true, { chars, jobs: 1 });
+  return { d: r.d, per: r.per, pre };
+}
+function refundRenderUsage({ uid, isOwner, chars, jobs = 1 }) {
+  const key = String(uid ?? '').trim();
+  if (!key) return;
+  const { u } = loadUsage(key);
+  const b = u.users[key];
+  if (b) {
+    b.chars = Math.max(0, b.chars - chars);
+    b.jobs = Math.max(0, b.jobs - jobs);
+  }
+  if (!isOwner) {
+    u.global.chars = Math.max(0, u.global.chars - chars);
+    u.global.jobs = Math.max(0, u.global.jobs - jobs);
+  }
+  saveUsage(u);
+}
+function reserveEnrollQuota({ cfg, uid, isOwner, voiceCount }) {
+  const r = checkEnrollQuota({ cfg, uid, isOwner, voiceCount }); /* 档案满/次数满在这里抛 */
+  commitUsage(r.u, uid, isOwner === true, { enrolls: 1 });
+  return { d: r.d, per: r.per };
+}
+function refundEnrollUsage({ uid, isOwner }) {
+  const key = String(uid ?? '').trim();
+  if (!key) return;
+  const { u } = loadUsage(key);
+  const b = u.users[key];
+  if (b) b.enrolls = Math.max(0, b.enrolls - 1);
+  if (!isOwner) u.global.enrolls = Math.max(0, u.global.enrolls - 1);
+  saveUsage(u);
+}
+/* 交付失败回补（控制台 /api/voice/qwen/render 上传两次失败时调）。 */
+export { refundRenderUsage, refundEnrollUsage };
+
 /* ── 音色档案（按 ownerUid 隔离） ── */
 function loadProfiles(cfg) {
   const d = readJsonSafe(PROFILE_FILE, {});
@@ -481,7 +523,7 @@ export async function enrollFromSamples({ cfg, files, name, targetModel, uid, is
 
   const d = loadProfiles(cfg);
   const myVoices = d.voices.filter((v) => String(v.ownerUid ?? '') === requester).length;
-  const { u } = checkEnrollQuota({ cfg, uid: requester, isOwner: isOwner === true, voiceCount: myVoices });
+  reserveEnrollQuota({ cfg, uid: requester, isOwner: isOwner === true, voiceCount: myVoices });
   /* 先建客户端：缺 key / 缺 workspace 时立刻报错，不要让用户先等完整套质检再看到"没配置"。 */
   const client = createQwenClient(cfg);
 
@@ -560,9 +602,11 @@ export async function enrollFromSamples({ cfg, files, name, targetModel, uid, is
     };
     d.voices.push(profile);
     saveProfiles(d);
-    commitUsage(u, requester, isOwner === true, { enrolls: 1 });
     log(`[tts-delivery] 千问音色已建好：${nm}（owner=${requester}，${voiceId}，model=${tm}，样本 ${profile.sample.duration}s/${finalScore} 分）`);
     return { ok: true, profile, candidates: candidates.map((c) => ({ name: c.name, ok: c.ok, score: c.score, duration: c.duration, reasons: c.reasons, warnings: c.warnings })) };
+  } catch (e) {
+    refundEnrollUsage({ uid: requester, isOwner: isOwner === true });
+    throw e;
   } finally {
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
   }
@@ -670,7 +714,7 @@ export async function renderToAudio({ cfg, voice, text, title, uid, isOwner, for
   const t = String(text ?? '').trim();
   if (!t) throw new Error('要读的文本是空的');
   const chars = [...t].length;
-  const { u, d, per } = checkRenderQuota({ cfg, chars, uid: requester, isOwner: isOwner === true });
+  const { d, per } = reserveRenderQuota({ cfg, chars, uid: requester, isOwner: isOwner === true });
   const chunks = splitText(t, d.chunkChars);
   if (!chunks.length) throw new Error('文本分块后为空');
 
@@ -739,7 +783,6 @@ export async function renderToAudio({ cfg, voice, text, title, uid, isOwner, for
     if (er.status !== 0) throw new Error(`导出 ${fmt.toUpperCase()} 失败：${(er.stderr || '').trim().slice(0, 200)}`);
 
     const outInfo = probeAudio(outPath);
-    commitUsage(u, requester, isOwner === true, { chars, jobs: 1 });
     cleanOld(cfg);
     const remainingJobs = isOwner === true ? null : Math.max(0, d.userDailyJobs - per.jobs);
     log(`[tts-delivery] 交付完成：${fileName}（${fmt}），owner=${requester}，${chars} 字 / ${chunks.length} 块 / ${outInfo.duration.toFixed(1)}s / ${((Date.now() - started) / 1000).toFixed(1)}s`);
@@ -759,6 +802,7 @@ export async function renderToAudio({ cfg, voice, text, title, uid, isOwner, for
       remainingChars: isOwner === true || d.userDailyChars === 0 ? null : Math.max(0, d.userDailyChars - per.chars),
     };
   } catch (e) {
+    refundRenderUsage({ uid: requester, isOwner: isOwner === true, chars });
     try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
     throw e;
   } finally {

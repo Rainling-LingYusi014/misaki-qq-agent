@@ -614,6 +614,31 @@ export function sanitizeLearningConfigBody(body, cur) {
  * 工具名、描述、返回字段都在暗示"这是记录"，于是模型会拿它当记录翻，权限/裁剪纪律也跟着糊。
  * 现在按主人的分工还原：窗口归窗口、记录归 memory_search；不要再往这里塞库里补的数据。 */
 
+/* 2026-10-27（审查 P1-1）：工作站产物统一从这里交付。模块侧已把额度预扣落盘，
+ * 这里两次上传都失败时把额度回补再抛——用户不能"被扣了额度还没拿到货"。 */
+async function deliverWorkstationFile({ key, filePath, fileName, label, uid, refund }) {
+  const docxMod = await import('../core/docx.js');
+  try {
+    await docxMod.uploadFileToQQ(key, filePath, fileName);
+  } catch (e1) {
+    log(`控制台：${label}首次上传失败，1.2s 后重试：${e1?.message ?? e1}`);
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    try {
+      await docxMod.uploadFileToQQ(key, filePath, fileName);
+    } catch (e2) {
+      if (typeof refund === 'function') {
+        try {
+          refund();
+          log(`控制台：${label}交付失败，额度已回补 uid=${uid}`);
+        } catch (e3) {
+          log(`控制台：${label}额度回补失败：${e3?.message ?? e3}`);
+        }
+      }
+      throw e2;
+    }
+  }
+}
+
 export function startConsoleServer() {
   const port = cfgRef.consolePort ?? 3100;
   // 控制台鉴权：fail-closed（2026-10-25 复用改造，对应审计 P1-1）。
@@ -817,12 +842,21 @@ export function startConsoleServer() {
         return;
       }
       // default AI is paused，所有agent-token session tools are rejected
-      if (social.paused && req.headers['x-agent-token'] && (url.pathname.startsWith('/api/social/') || url.pathname.startsWith('/api/send/') || url.pathname.startsWith('/api/images/'))) {
+      /* 2026-10-27（审查 P1-4）：工作站七个新端点并入急停闸——暂停/总开关关闭后，
+       * 历史会话里残留的旧 token 也不能再调用工作站能力。 */
+      const isAgentToolPath = (p) =>
+        p.startsWith('/api/social/') || p.startsWith('/api/send/') || p.startsWith('/api/images/')
+        || p.startsWith('/api/voice/qwen/')
+        || p === '/api/convert' || p.startsWith('/api/convert/')
+        || p.startsWith('/api/image/')
+        || p === '/api/pdf' || p.startsWith('/api/pdf/')
+        || p === '/api/qrcode' || p === '/api/text' || p === '/api/help';
+      if (social.paused && req.headers['x-agent-token'] && isAgentToolPath(url.pathname)) {
         sendJson({ ok: false, error: 'AI is paused - tools are disabled.' }, 403);
         return;
       }
       // Social engine master switch：关闭后 agent-token session tools are rejected（控制台仍可管理）
-      if (cfgRef.social?.enabled === false && req.headers['x-agent-token'] && (url.pathname.startsWith('/api/social/') || url.pathname.startsWith('/api/send/') || url.pathname.startsWith('/api/images/'))) {
+      if (cfgRef.social?.enabled === false && req.headers['x-agent-token'] && isAgentToolPath(url.pathname)) {
         sendJson({ ok: false, error: 'Social engine is off - tools are disabled.' }, 403);
         return;
       }
@@ -6548,15 +6582,11 @@ export function startConsoleServer() {
                 isOwner,
                 format: body.format,
               });
-              const docxMod = await import('../core/docx.js');
-              /* 上传偶发失败时重试一次：合成已经花了字符额度，不能因为一次网络抖动让用户重做。 */
-              try {
-                await docxMod.uploadFileToQQ(key, r.filePath, r.fileName);
-              } catch (e1) {
-                log(`控制台：音频首次上传失败，1.2s 后重试：${e1?.message ?? e1}`);
-                await new Promise((resolve) => setTimeout(resolve, 1200));
-                await docxMod.uploadFileToQQ(key, r.filePath, r.fileName);
-              }
+              /* 上传偶发失败时重试一次；两次都失败就回补已预扣的字符/条数额度（不能扣了额度不给货）。 */
+              await deliverWorkstationFile({
+                key, filePath: r.filePath, fileName: r.fileName, label: '音频交付', uid,
+                refund: () => deliveryMod.refundRenderUsage({ uid, isOwner, chars: r.chars }),
+              });
               log(`控制台：音频已交付 key=${key} uid=${uid} file=${r.fileName} ${r.format} ${r.durationSec}s ${r.chars}字 voice=${r.voice}`);
               const { filePath, ...pub } = r;
               sendJson({ ...pub, sent: true, sentTo: key });
@@ -6653,14 +6683,10 @@ export function startConsoleServer() {
                 options: cbody.options,
               });
             }
-            const docxMod = await import('../core/docx.js');
-            try {
-              await docxMod.uploadFileToQQ(key, r.filePath, r.fileName);
-            } catch (e1) {
-              log(`控制台：转换结果首次上传失败，1.2s 后重试：${e1?.message ?? e1}`);
-              await new Promise((resolve) => setTimeout(resolve, 1200));
-              await docxMod.uploadFileToQQ(key, r.filePath, r.fileName);
-            }
+            await deliverWorkstationFile({
+              key, filePath: r.filePath, fileName: r.fileName, label: '转换结果', uid,
+              refund: () => convMod.refundMediaQuota(uid, isOwner),
+            });
             log(`控制台：文件转换已交付 key=${key} uid=${uid} ${r.from}→${r.to} file=${r.fileName}`);
             const { filePath, ...pub } = r;
             sendJson({ ...pub, sent: true, sentTo: key });
@@ -6793,14 +6819,10 @@ export function startConsoleServer() {
                 },
               });
             }
-            const docxMod = await import('../core/docx.js');
-            try {
-              await docxMod.uploadFileToQQ(key, r.filePath, r.fileName);
-            } catch (e1) {
-              log(`控制台：图片结果首次上传失败，1.2s 后重试：${e1?.message ?? e1}`);
-              await new Promise((resolve) => setTimeout(resolve, 1200));
-              await docxMod.uploadFileToQQ(key, r.filePath, r.fileName);
-            }
+            await deliverWorkstationFile({
+              key, filePath: r.filePath, fileName: r.fileName, label: '图片结果', uid,
+              refund: () => imgMod.refundMediaQuota(uid, isOwner),
+            });
             log(`控制台：图片编辑已交付 key=${key} uid=${uid} action=${ibody.action} file=${r.fileName}`);
             const { filePath, ...pub } = r;
             sendJson({ ...pub, sent: true, sentTo: key });
@@ -6851,14 +6873,8 @@ export function startConsoleServer() {
             }
             const r = await txtMod.runTextTool({ cfg: cfgRef, op: tbody.op, text, uid, isOwner, options: tbody.options });
             if (r.inline === false) {
-              const docxMod = await import('../core/docx.js');
-              try {
-                await docxMod.uploadFileToQQ(key, r.filePath, r.fileName);
-              } catch (e1) {
-                log(`控制台：文本结果首次上传失败，1.2s 后重试：${e1?.message ?? e1}`);
-                await new Promise((resolve) => setTimeout(resolve, 1200));
-                await docxMod.uploadFileToQQ(key, r.filePath, r.fileName);
-              }
+              /* 文本额度不回补：操作瞬时完成、额度独立且廉价，交付失败让模型重发即可。 */
+              await deliverWorkstationFile({ key, filePath: r.filePath, fileName: r.fileName, label: '文本结果', uid });
               const { filePath, ...pub } = r;
               sendJson({ ...pub, sent: true, sentTo: key });
             } else {
@@ -6936,14 +6952,10 @@ export function startConsoleServer() {
               sendJson({ ok: false, error: `未知 PDF 操作 ${op}；只有 merge / split / watermark` }, 400);
               return;
             }
-            const docxMod = await import('../core/docx.js');
-            try {
-              await docxMod.uploadFileToQQ(key, r.filePath, r.fileName);
-            } catch (e1) {
-              log(`控制台：PDF 结果首次上传失败，1.2s 后重试：${e1?.message ?? e1}`);
-              await new Promise((resolve) => setTimeout(resolve, 1200));
-              await docxMod.uploadFileToQQ(key, r.filePath, r.fileName);
-            }
+            await deliverWorkstationFile({
+              key, filePath: r.filePath, fileName: r.fileName, label: 'PDF 结果', uid,
+              refund: () => pdfMod.refundMediaQuota(uid, isOwner),
+            });
             log(`控制台：PDF ${op} 已交付 key=${key} uid=${uid} file=${r.fileName}`);
             const { filePath, ...pub } = r;
             sendJson({ ...pub, sent: true, sentTo: key });
@@ -6990,14 +7002,10 @@ export function startConsoleServer() {
               return;
             }
             const r = await qrMod.generateQrCode({ cfg: cfgRef, text: qbody.text, uid, isOwner, options: qbody.options });
-            const docxMod = await import('../core/docx.js');
-            try {
-              await docxMod.uploadFileToQQ(key, r.filePath, r.fileName);
-            } catch (e1) {
-              log(`控制台：二维码首次上传失败，1.2s 后重试：${e1?.message ?? e1}`);
-              await new Promise((resolve) => setTimeout(resolve, 1200));
-              await docxMod.uploadFileToQQ(key, r.filePath, r.fileName);
-            }
+            await deliverWorkstationFile({
+              key, filePath: r.filePath, fileName: r.fileName, label: '二维码', uid,
+              refund: () => qrMod.refundMediaQuota(uid, isOwner),
+            });
             log(`控制台：二维码已交付 key=${key} uid=${uid} file=${r.fileName}`);
             const { filePath, ...pub } = r;
             sendJson({ ...pub, sent: true, sentTo: key });

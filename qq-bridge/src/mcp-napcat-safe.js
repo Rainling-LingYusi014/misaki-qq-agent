@@ -770,8 +770,26 @@ if (SCHEMA_LEVEL !== 'off') {
  *  2026-09-21 描述压缩档：`social.slimTools.schemaLevel` 按 mcp-compressor 的档位语义压描述文字：
  *  工具一个不少、参数一个不少（名字/类型/枚举/必填都照旧），只是工具描述与每个参数的描述被压短或去掉。
  *  两档一起算账：list 档位决定"注册哪些"，schema 档位决定"注册了的那份写多长"。 */
+/* 2026-10-27（审查 P2-2）：工作站新十件的 config 开关。老工具的开关是在各自注册点
+ * 用 `if (cfg.social?.tools?.X !== false)` 包裹的；新工具集中在这里查表——
+ * 语义相同（默认开，social.tools.X 显式 false 才下线），以后新工具往表里加一行即可。 */
+const TOOL_CONFIG_SWITCHES = {
+  tts_enroll_voice: 'ttsEnroll',
+  tts_render_file: 'ttsRender',
+  tts_voice_list: 'ttsVoiceList',
+  tts_voice_delete: 'ttsVoiceDelete',
+  qq_convert_file: 'convertFile',
+  qq_image_edit: 'imageEdit',
+  qq_text_tool: 'textTool',
+  qq_pdf_tool: 'pdfTool',
+  qq_qrcode: 'qrcode',
+  qq_help: 'help',
+};
+
 function registerTool(name, ...rest) {
   const bare = bareToolName(name);
+  const cfgSwitch = TOOL_CONFIG_SWITCHES[bare];
+  if (cfgSwitch && cfg.social?.tools?.[cfgSwitch] === false) return;
   const rawDesc = typeof rest[0] === 'string' ? rest[0] : '';
   const rawShape = rest[1] && typeof rest[1] === 'object' ? rest[1] : {};
   const cost = schemaCostOf(name, rawDesc, rawShape);
