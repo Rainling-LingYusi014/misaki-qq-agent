@@ -776,6 +776,35 @@ export function recentChatMessages(convKey, limit = 25) {
   }
 }
 
+/* 2026-10-28：按时间窗导出整段聊天（供 /api/social/export-chat 使用）。
+ * 与 recentChatMessages 的区别：不限"最近 N 条"，按 [fromMs,toMs] 全量取、正序、带 sender 与 kind；
+ * 上限 5 万条防极端。失败返回 {ok:false}，由调用方转成用户能懂的提示。 */
+export function exportChatMessages(convKey, fromMs = 0, toMs = Date.now(), max = 20000) {
+  const db = initChatDb();
+  if (!db || !convKey) return { ok: false, error: '聊天记录库不可用', messages: [] };
+  try {
+    const rows = db.prepare(
+      `SELECT * FROM chat_messages WHERE conv_key = ? AND ts_ms >= ? AND ts_ms <= ?
+       ORDER BY ts_ms ASC, id ASC LIMIT ?`
+    ).all(String(convKey), Number(fromMs) || 0, Number(toMs) || Date.now(), Math.min(50000, Math.max(1, Number(max) || 20000)));
+    return {
+      ok: true,
+      messages: rows.map((r) => ({
+        time: Number(r.ts_ms) || 0,
+        messageId: r.message_id || '',
+        isSelf: !!r.is_self,
+        senderName: r.sender_name || '',
+        senderUid: (r.sender_uid && r.sender_uid !== 'self') ? r.sender_uid : null,
+        kind: r.kind || 'text',
+        content: r.content || '',
+        recalled: !!r.recalled_at,
+      })),
+    };
+  } catch (error) {
+    return { ok: false, error: `读取聊天记录失败：${error?.message ?? error}`, messages: [] };
+  }
+}
+
 /* ══════════════════════════════════════════════════════════════════════════
  * 跨会话「他处最近发生了什么」—— 只读查询
  *

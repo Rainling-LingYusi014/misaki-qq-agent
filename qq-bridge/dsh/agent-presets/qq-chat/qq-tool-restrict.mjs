@@ -40,6 +40,12 @@ const SAFE_PREFIXES = [
   'mcp__napcat__',
   'mcp__napcat-host__',
   'mcp__web-search-safe__',
+  // 【2026-10-29 方案 A】B 站能力（服务器 bili-cli，经本地代理 src/mcp-bili-remote.js 接入）：
+  //   代理已做硬白名单——只读查询 + 投稿/稿件数据；评论/私信/动态/关注/任意命令 run_bili 都不暴露，
+  //   投稿默认「仅自己可见」。红线在代理那一层守，所以这里放行整条前缀是安全的。
+  //   注意：必须改这个**仓库源**——桥/安装脚本会用 cpSync 覆盖 dsh-home 里装好的那份，
+  //   只改装好的那份会在下次重装/重启时被冲掉（2026-10-29 亲身踩过）。
+  'mcp__bili__',
 ]
 
 // 无害模型侧工具：ask_user_question 用于把问题转给管理员/用户，

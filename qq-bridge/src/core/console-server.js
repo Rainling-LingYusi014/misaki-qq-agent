@@ -82,7 +82,7 @@ import { sendMusicCardWithFallback } from './media.js';
 // 这个模块是纯函数、不依赖 cfg，所以直接 import，不走 setConsoleMedia 那套注入
 // （注入点被 bridge.js / dsh-watch.js / mux.js 三处调用，动签名容易漏改）。
 import { resolveVideo, buildVideoCard, videoSearch, parseVideoUrl, extractVideoUrls, fetchMiniAppArk } from './video.js';
-import { redactKnownTokensOnly, sweepMessageArtifacts, stripMessageArtifacts, cleanOutboundText } from '../lib/outbound-text.js';
+import { redactKnownTokensOnly, sweepMessageArtifacts, stripMessageArtifacts, cleanOutboundText, trimCasualPeriod } from '../lib/outbound-text.js';
 import { planSocialTimeline, isDirectedAtAi, withTimeText, findCjkSpaceWarning, findSplitBoundaryWarning } from '../lib/social-timeline.js';
 import { createMediaDomain } from './media.js';
 import {
@@ -191,7 +191,13 @@ import {
   scheduleReplyCheck, buildWakeReminderPrompt,
   clearSocialTimers, clearAllSocialTimers, resetConversationKeepingLedger,
   companionToolBlock, companionToolBlockByToken,
+  bubbleStyleOf,
+  // 2026-10-29 misaki@reaction：括号反馈总开关（按会话）
+  bracketReactionOf,
 } from './social-state.js';
+import { companionCfg } from './companion-mode.js';
+import { shapeBubbles, joinBubbles } from '../lib/bubble-split.js';
+import { shapeBrackets, bracketScene, bracketFeedbackCfg, classifySegment, planRealtimeReply } from '../lib/bracket-feedback.js';
 // 作息仪式（2026-10-13）：晚安熄灯计时 / 早安触发（触发方是 sleep-switch.sh 的 cron）
 import { initRitual, startGoodnight, clearGoodnight } from './ritual.js';
 // 出站回复幂等账本（2026-09-16 修「reset 之后同一条回复发了两遍」，事故经过见模块顶部注释）
@@ -217,9 +223,11 @@ import {
 import {
   warmGroupName, getGroupDisplayName, formatGroupListLine, warmGroupInfo,
   getCachedGroupInfo, formatGroupInfoLine, initGroupCacheCore, setGroupCacheBot,
-  getConvDisplayName, warmConvNames, friendMap,
+  getConvDisplayName, warmConvNames, warmConvName, friendMap,
 } from './group-cache.js';
 import { getConvUsageReport } from './token-meter.js';
+import { exportChatMessages } from './chat-db.js';
+import { isComplexDocument, readDocumentBuffer } from './document-read.js';
 import { handleIncoming, pumpMux, initMuxCore, setMuxApi, setMuxBot } from './mux.js';
 
 // 运行期注入
@@ -1648,7 +1656,7 @@ export function startConsoleServer() {
         if (body.send && typeof body.send === 'object') {
           merged.send = { ...(current.send ?? {}), ...body.send };
           // burstIntervalMinMs/MaxMs 已废弃；打字节拍只有"按字数"一组（linear*），见 send-chain.js。
-          for (const k of ['burstMaxMessages', 'longGapProbability', 'longGapMinMs', 'longGapMaxMs', 'maxSendPerMinute', 'maxSendPerHour', 'maxMessageChars', 'maxGapMs', 'linearPerCharMs', 'linearMinMs', 'linearCapMs', 'linearJitterRatio', 'linearResetMs']) {
+          for (const k of ['burstMaxMessages', 'longGapProbability', 'longGapMinMs', 'longGapMaxMs', 'maxSendPerMinute', 'maxSendPerHour', 'maxMessageChars', 'maxGapMs', 'linearPerCharMs', 'linearMinMs', 'linearCapMs', 'linearJitterRatio', 'linearResetMs', 'replyBaseDelayMs', 'questionHoldMs', 'questionHoldExemptChars']) {
             if (merged.send[k] !== undefined) {
               const n = Number(merged.send[k]);
               merged.send[k] = Number.isFinite(n) ? n : current.send?.[k] ?? 0;
@@ -2434,6 +2442,27 @@ export function startConsoleServer() {
         sendJson({ ok: true, key, wakeConfig: next, wakeSafety: computeWakeSafety(next) });
         return;
       }
+      /* 2026-10-29 主人定规：单气泡仍旧 40 字上限，"除非被用户质疑了你说话怎么这么爱分气泡断句"——
+       * 这时**只对提出质疑的这个人**改成整段发（bubbleStyle=single），不设全局开关、不传染其他联系人。
+       * 按会话存（private:<QQ>），所以换个人聊仍是 70/25/5；群聊不按人改，故只收 private: 键。 */
+      if (req.method === 'POST' && url.pathname === '/api/social/bubble-style') {
+        const body = await readBody();
+        const key = String(body.key ?? '').trim();
+        if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+        if (!key.startsWith('private:')) { sendJson({ ok: false, error: '气泡偏好只对私聊生效（群聊不按单个成员改）' }, 400); return; }
+        if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim' }, 403); return; }
+        if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+        const style = body.style === 'single' ? 'single' : body.style === 'auto' ? 'auto' : '';
+        if (!style) { sendJson({ ok: false, error: 'style 只能是 single（对这位整段发）或 auto（回到 70/25/5）' }, 400); return; }
+        const st = getSocialState(key);
+        st.bubbleStyle = style;
+        st.lastActionAt = Date.now();
+        saveSocialState();
+        log(`[bubble] ${key} 气泡偏好 → ${style}`);
+        appendActivity(`${key} [bubble] 气泡偏好 → ${style}`);
+        sendJson({ ok: true, key, bubbleStyle: style });
+        return;
+      }
       if (req.method === 'GET' && url.pathname === '/api/social/states') {
         const list = [];
         for (const [key, st] of social.conversations) {
@@ -2593,6 +2622,115 @@ export function startConsoleServer() {
             return;
           }
         }
+        /* 2026-10-29 主人定规：一句话落成几个气泡由骰子分配 —— 1/2/3 个的概率 70%/25%/5%
+         * （「是的，一句话现在支持最多三个气泡」）。桥负责成形：先把这一回合的气泡拼回一句，
+         * 再按骰子抽到的条数重切；模型自己分了几条不算数。所以放在幂等判重之前：
+         * 账本记的就是真正发出去的碎片，模型重发同一句原文时拼回再切的结果仍相同，不会双发。
+         * 带图批次不动——图与气泡按 index 配对，重排会错位。条数永远 ≤3，不会破单批上限。 */
+        let bubbleTexts = messages;
+        if (kind === 'private' && images.length === 0) {
+          try {
+            const bs = cfgRef?.social?.bubbleShape ?? {};
+            const shaped = shapeBubbles(messages, {
+              enabled: bs.enabled !== false,
+              // 2026-10-29 主人定规：某位联系人抱怨过被切碎 → 只对他整段发（state 里按会话存，不传染别人）
+              mode: bubbleStyleOf(key) === 'single' ? 'single' : 'auto',
+              odds: [Number(bs.p1), Number(bs.p2), Number(bs.p3)],
+              wallChars: Number(bs.wallChars) || companionCfg(cfgRef).splitOverChars,
+              wall3Chars: Number(bs.wall3Chars) || 0,
+              maxChars,
+            });
+            if (shaped.count > 0 && shaped.count <= maxMsgs) {
+              log(`[Dice] ${key} 气泡 rolled=${shaped.rolled} → ${shaped.count} 条（模型给 ${messages.length} 条，${shaped.text.length} 字${bubbleStyleOf(key) === 'single' ? '，单条偏好' : ''}）`);
+              bubbleTexts = shaped.bubbles;
+            }
+          } catch (e) {
+            /* 2026-10-29：以前这里是空 catch——成形里任何异常（包括引用了暂时性死区的变量）
+             * 都会被悄悄吞掉、退回原文发送，等于功能无声失效。至少要留一行日志。 */
+            log(`[bubble] ${key} 成形异常，按原文发：${e?.message ?? e}`);
+          }
+          /* 2026-10-29 括号反馈（主人定规，陪伴模式专属）：发送瞬间按「用户动作性」读档——
+           * 实时档（动作保持窗内）每句都留，普通档每气泡独立掷 (10+x)%（x 现掷 0~30）；
+           * 单气泡最多两段（10%），保留的归一成半角 ()。同样放在幂等判重之前：账本记最终形态。 */
+          try {
+            const bfCfg = bracketFeedbackCfg(cfgRef?.social?.companionMode?.bracketFeedback);
+            const stBf = getSocialState(key);
+            if (bfCfg.enabled && stBf?.agentMode === 'companion' && bracketReactionOf(key)) {
+              const scene = bracketScene(stBf);
+              /* 2026-10-29 防重放（幂等）：模型 90 秒内重发同一批文本时，直接复现上次的成形结果。
+               * 否则动作去重会读到刚才自己写入的历史，输出少一段、文本变了，反而绕过防重闸导致双发。 */
+              const bfInput = JSON.stringify(messages);
+              const lastBf = stBf._bfLast && typeof stBf._bfLast === 'object' ? stBf._bfLast : null;
+              if (lastBf && lastBf.input === bfInput && Date.now() - Number(lastBf.at || 0) < 90000) {
+                bubbleTexts = Array.isArray(lastBf.out) ? lastBf.out.slice() : bubbleTexts;
+                log(`[BF] ${key} 同一批文本 90s 内重发 → 复现上次成形结果（不重新过动作去重）`);
+              } else {
+                let kept = 0;
+                const baseSeq = Number(stBf.bubbleSeq) || 0;
+                // 逐泡推进：同一批里第二条也要看得见第一条刚用过的动作
+                const hist = Array.isArray(stBf.bracketActions) ? stBf.bracketActions.slice(-60) : [];
+                /* 2026-10-29 实时档「整句变形」（主人定规）：先掷动作链（8%，2 条 67% / 3 条 33%），
+                 * 再掷单个纯动作反馈（8%），都没中才逐气泡成形。普通档两个骰子都不掷。 */
+                const plan = planRealtimeReply(messages, {
+                  scene,
+                  seed: `${key}#bf#${messages.join('|')}`,
+                  cfg: bfCfg,
+                  recentActions: hist,
+                  bubbleSeq: baseSeq,
+                });
+                if (plan.mode !== 'normal' && plan.bubbles.length) {
+                  bubbleTexts = plan.bubbles.map((b) => b.text);
+                  const actions = plan.usedSegs
+                    .filter((u) => classifySegment(String(u.seg).replace(/^\(|\)$/g, '')) === 'action')
+                    .map((u) => ({ seg: u.seg, seq: u.seq }));
+                  stBf.bubbleSeq = baseSeq + plan.bubbles.length;
+                  stBf.bracketActions = hist.concat(actions).slice(-60);
+                  stBf._bfLast = { input: bfInput, out: bubbleTexts.slice(), at: Date.now() };
+                  saveSocialState();
+                  log(`[BF] ${key} 实时档 → ${plan.mode === 'chain' ? `动作链 ${plan.chainSize} 条` : '单个纯动作反馈'}（文字${plan.mode === 'single' ? '已省略' : '保留在末条'}）`);
+                } else {
+                  bubbleTexts = bubbleTexts.map((t, i) => {
+                    const seq = baseSeq + i + 1;
+                    const r = shapeBrackets(t, {
+                      scene,
+                      // 种子只用稳定指纹（会话+序号+文本）：同句重发同形
+                      seed: `${key}#${i}#${t}`,
+                      cfg: bfCfg,
+                      recentActions: hist,
+                      bubbleSeq: seq,
+                    });
+                    kept += r.keptSegments;
+                    for (const seg of (r.keptSegs || [])) {
+                      // 只记动作类；表情/神态/心理不进窗口（主人：这两类暂不限制）
+                      if (classifySegment(String(seg).replace(/^\(|\)$/g, '')) === 'action') hist.push({ seg, seq });
+                    }
+                    return r.text;
+                  });
+                  const dropped = bubbleTexts.filter((t, i) => t !== messages[i]).length;
+                  // 记账：序号推进 + 动作历史截断（上限 60）
+                  stBf.bubbleSeq = baseSeq + bubbleTexts.length;
+                  stBf.bracketActions = hist.slice(-60);
+                  stBf._bfLast = { input: bfInput, out: bubbleTexts.slice(), at: Date.now() };
+                  saveSocialState();
+                  log(`[BF] ${key} 括号反馈 scene=${scene} → 保留 ${kept} 段 / ${bubbleTexts.length} 气泡${dropped ? `（${dropped} 条因动作重复被砍）` : ''}`);
+                }
+              }
+            }
+          } catch (eBf) {
+            log(`[BF] ${key} 括号成形异常，按原文发：${eBf?.message ?? eBf}`);
+          }
+        }
+        /* 2026-10-28 主人：「正常人聊天打字不会额外打句号」——现场「收下啦。」。
+         * 只兜住最明显的一类：单行、≤20 字、结尾句号；长段落和多句陈述的句号保留。
+         * 放在幂等判重之前：账本记的必须是真正发出去的那一版，否则重发会对不上。 */
+        try {
+          const trimmed = bubbleTexts.map((m) => trimCasualPeriod(m));
+          const diff = trimmed.filter((x, i) => x !== bubbleTexts[i]).length;
+          if (diff > 0) {
+            log(`[text] ${key} 去掉 ${diff} 条气泡的句尾句号`);
+            bubbleTexts = trimmed;
+          }
+        } catch { /* 清洗失败就按原文发 */ }
         /* 2026-09-16 幂等闸门 · 修「reset 之后同一条回复发了两遍」
          * 现场：14:12:34 整批 ["喵什么喵","又不是猫娘"] 因为 atUserId 传错只成功 1 条
          * （「又不是猫娘」14:12:36 真的进群了，messageId 1275818397），工具返回 ok:false；
@@ -2601,7 +2739,7 @@ export function startConsoleServer() {
          * 正常新回复（上一批是成功的）不经过这条路，不会被误杀。见 send-idempotency.js。 */
         // 注意：这里不能用本段稍后才声明的 `now`（`const now = Date.now()` 在 computeGaps 之后）：
         // 写成 `..., now)` 会在发送端点里直接 TDZ `ReferenceError`。判重窗口是分钟级，两处时钟差几毫秒无所谓。
-        const idem = filterAlreadySentBubbles(key, messages, Date.now());
+        const idem = filterAlreadySentBubbles(key, bubbleTexts, Date.now());
         if (idem.skipped.length) {
           logIdempotencyBlock(key, idem, '上一批发送部分失败，这是模型重发整批');
           appendActivity(`${key} [send] 幂等挡下重复气泡 ${idem.skipped.length} 条：${idem.skipped.map((s) => String(s.text).slice(0, 20)).join('、')}`);
@@ -2618,10 +2756,30 @@ export function startConsoleServer() {
         // 先做发送频率检查并预占额度，再解析引用目标，避免未限流的引用查询打爆 OneBot。
         const st = getSocialState(key);
         const now = Date.now();
+        /* 2026-10-28 主人反馈「她总追着别人说话」：问完一句就该等对方回答。
+         * 规则：上一批最后一条是问句、对方还没回 → questionHoldMs（默认 3 分钟）内不许再发。
+         * 对方一开口 appendSocialMessage 就清零；真需要补充就等对方回，或 qq_mark_read 收尾。
+         * 2026-10-28 二改（主人拍板）：这道闸只拦"聊天式的补充"，不拦交付——带图/带文件的批次、
+         * 或整批正文超过 questionHoldExemptChars 的（成品、说明、长答案）照发。原来的形状会把
+         * 「问一句几页 → 两分钟后交成品」这种正常流程一起挡住，提示还写着"在等他回答"，纯误伤。 */
+        const qHoldMs = Math.max(0, Number(sendCfg.questionHoldMs) || 0);
+        const qAskedAt = Number(st.awaitQuestionAt) || 0;
+        const qHoldExemptRaw = sendCfg.questionHoldExemptChars;
+        const qHoldExemptChars = (qHoldExemptRaw === undefined || qHoldExemptRaw === null || qHoldExemptRaw === '')
+          ? 200
+          : Math.max(0, Number(qHoldExemptRaw) || 0);
+        const qHoldTotalChars = messages.reduce((n, m) => n + String(m ?? '').length, 0);
+        const qHoldExempt = images.length > 0 || (qHoldExemptChars > 0 && qHoldTotalChars >= qHoldExemptChars);
+        if (req.headers['x-agent-token'] && qHoldMs > 0 && qAskedAt > 0 && now - qAskedAt < qHoldMs && !qHoldExempt) {
+          sendJson({ ok: false, error: '你刚才已经问过对方一句，还在等他回答——真人不会自己接自己的话。这条先别发：要收尾就 qq_mark_read，要补充等对方回了再说。' }, 409);
+          return;
+        }
         // 防循环回复：① 90 秒内重复发送相同/高度相似文本 → 拦截；② 60 秒内发送调用 ≥3 次 → 拦截（疑似单回合循环连发）
-        const firstSendText = Array.isArray(sendList) ? String(sendList[0] ?? '') : String(sendList ?? '');
+        /* 2026-10-29：比对**整段回复**而不是首条气泡。桥会把长句切开，首条变短后很容易成为
+         * 上一条首条的子串（isDuplicateSendText 用 includes 判定），造成误杀 + 409 结束回合、消息丢失。 */
+        const dedupText = joinBubbles(sendList);
         const prevSend = lastSendDedup.get(key);
-        if (prevSend && now - prevSend.at < 90000 && firstSendText && isDuplicateSendText(prevSend.text, firstSendText)) {
+        if (prevSend && now - prevSend.at < 90000 && dedupText && isDuplicateSendText(prevSend.text, dedupText)) {
           cancelReplyCheck(key);
           st.lastAiReplyAt = now;
           saveSocialState();
@@ -2682,20 +2840,24 @@ export function startConsoleServer() {
         try {
           const sentMessages = await sendMessages(key, sendList, delays, actualReplyToMessageId, atUserIdEffective, images);
           recordSentMessages(key, sentMessages);
+          /* 最后一条是问句 → 记下"在等回答"的时间戳，questionHoldMs 内不再允许新发送（见上面的闸）。 */
+          const lastDelivered = [...sentMessages].reverse().find((x) => x && String(x.text ?? '').trim());
+          st.awaitQuestionAt = (lastDelivered && /[？?]\s*$/.test(String(lastDelivered.text))) ? now : 0;
           // 整批成功 → 了结上一批的部分失败状态（此后不再做任何重发过滤，正常新回复畅通）。
           noteBatchOutcome(key, { attempted: sendList, delivered: sentMessages, failed: [] }, now);
           st.lastAiReplyAt = now;
           st.lastActionAt = now;
           st.wakeConfig.noActionCount = 0;
           saveSocialState();
-          if (firstSendText) lastSendDedup.set(key, { text: firstSendText, at: now });
+          if (dedupText) lastSendDedup.set(key, { text: dedupText, at: now });
           const callNow = sendCallTimes.get(key) || [];
           callNow.push(now);
           sendCallTimes.set(key, callNow.filter((t) => now - t < 60000));
           log(`[default] 工具统一发送 ${key}: 成功 ${sentMessages.length}/${sendList.length} 条`);
           appendActivity(`${key} [default] 工具统一发送：成功 ${sentMessages.length}/${sendList.length} 条`);
           if (sentMessages.length > 0) scheduleReplyCheck(key);
-          const burstHint = sendList.length >= 3 ? '你已经连发了多条，确认是必要的吗？真人很少一口气补完。' : undefined;
+          // 用模型自己给的气泡数判断"是不是连发"：拆分是桥干的，不该反过来提醒模型少说。
+          const burstHint = messages.length >= 3 ? '你已经连发了多条，确认是必要的吗？真人很少一口气补完。' : undefined;
           // 软提醒（lint）必须与发送结果隔离：消息已成功发出，lint 任何异常都不能把 ok 改写成失败，
           // 否则模型看到"发送失败"会换参数重发 → 撞重复拦截 → 用户其实已收到一条。
           let spaceWarn;
@@ -4368,6 +4530,13 @@ export function startConsoleServer() {
           || /^(global|all|\*|全局)$/i.test(uidParam);
         // 归属：显式全局优先；否则显式 uid 优先；再否则私聊记到对方头上，群聊记到账号所有者头上（群里的规矩是账号所有者的规矩）
         const uid = globalScope ? '' : (uidParam || (key.startsWith('private:') ? key.split(':')[1] : String(cfgRef?.ownerQQ ?? '')));
+        /* 2026-10-28 覆盖（主人定）：对方纠正旧事实时，把旧条目换成新条目，不要并列两条。
+         * supersedes = 旧条目 id（逗号分隔，来自 qq_memory_notes）。旧行留档只标失效，
+         * 是否允许覆盖由 memory.js 的 applySupersedes 判定：只认同 uid、全局规矩与主人自己的记忆不许被改。 */
+        const supersedesRaw = String(url.searchParams.get('supersedes') ?? '').trim();
+        const supersedes = supersedesRaw
+          ? supersedesRaw.split(/[,\s]+/).map(Number).filter((n) => Number.isFinite(n) && n > 0)
+          : [];
         const r = rememberEntry({
           uid,
           category: String(url.searchParams.get('category') ?? 'note'),
@@ -4379,6 +4548,8 @@ export function startConsoleServer() {
           convKey: key,
           tags: String(url.searchParams.get('tags') ?? ''),
           source: 'model',
+          supersedes,
+          protectUids: [String(cfgRef?.ownerQQ ?? '')],
         });
         sendJson(r, r.ok ? 200 : 500);
         return;
@@ -4476,6 +4647,66 @@ export function startConsoleServer() {
         });
         if (!r.ok) { sendJson({ ok: false, error: r.error || '读取失败' }, 500); return; }
         sendJson({ ok: true, key, total: r.total, count: r.messages.length, ranked: !!r.ranked, messages: r.messages });
+        return;
+      }
+      /* ── 聊天记录导出（2026-10-28）：一次调用把指定会话从 fromMs 到 now 的消息写成 JSON，
+       * 落在 DSH 工作区（qq_send_file 白名单内），由 qq_export_chat 直接发回。
+       * 动机：此前让模型用 subagent + memory_search 拼文件 —— 快照会漏最新消息、顺序倒置、
+       * sender 只剩 me/私聊，还要跑 PowerShell。库就在桥进程里，直接查最准。 */
+      if (req.method === 'POST' && url.pathname === '/api/social/export-chat') {
+        const body = await readBody();
+        const key = String(body.key ?? '').trim();
+        if (!key) { sendJson({ ok: false, error: 'key 不能为空' }, 400); return; }
+        if (req.headers['x-agent-token'] && !agentTokenOk(key, req.headers['x-agent-token'])) { sendJson({ ok: false, error: 'Invalid agent token' }, 403); return; }
+        if (req.headers['x-agent-token'] && !SessionAllowed(key)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+        if (req.headers['x-agent-token'] && !ToolEnabled('exportChat')) { sendJson({ ok: false, error: '工具未启用：qq_export_chat' }, 403); return; }
+        const keyMatch = /^(group|private):(\d+)$/.exec(key);
+        if (!keyMatch) { sendJson({ ok: false, error: 'key 格式应为 group:群号 或 private:QQ号' }, 400); return; }
+        const kind = keyMatch[1];
+        const id = Number(keyMatch[2]);
+        if (!Number.isFinite(id) || id <= 0 || !modeAllowed(key, kind, id, cfgRef, currentMode)) { sendJson({ ok: false, error: '目标不在当前模式允许范围内' }, 403); return; }
+        const nowMs = Date.now();
+        const bjNow = new Date(nowMs + 8 * 3600 * 1000);
+        const todayStartBj = Date.UTC(bjNow.getUTCFullYear(), bjNow.getUTCMonth(), bjNow.getUTCDate()) - 8 * 3600 * 1000;
+        const fromMs = Number(body.fromMs) > 0 ? Number(body.fromMs) : todayStartBj;
+        const toMs = Number(body.toMs) > 0 ? Math.min(Number(body.toMs), nowMs) : nowMs;
+        if (toMs < fromMs) { sendJson({ ok: false, error: '时间范围不正确：toMs 早于 fromMs' }, 400); return; }
+        const r = exportChatMessages(key, fromMs, toMs, 20000);
+        if (!r.ok) { sendJson({ ok: false, error: r.error || '导出失败' }, 500); return; }
+        /* 对方名字三层兜底：会话名缓存 → 记忆档案 → 现场问 NapCat（失败就写"对方"，不阻塞导出）。 */
+        let convName = String(getConvDisplayName(key)?.name || '').trim();
+        if (!convName) convName = String(profileDisplayName(id) || '').trim();
+        if (!convName) {
+          try { await warmConvName(key); } catch { /* 昵称拿不到不影响导出 */ }
+          convName = String(getConvDisplayName(key)?.name || '').trim();
+        }
+        const selfName = String(selfNickname || '玲結美咲');
+        const messages = r.messages.map((m) => ({
+          time: fmtBeijing(m.time),
+          ts: m.time,
+          sender: m.isSelf ? selfName : (convName || (m.senderName && m.senderName !== '私聊' ? m.senderName : '对方')),
+          isSelf: m.isSelf,
+          kind: m.kind,
+          content: m.content,
+          ...(m.recalled ? { recalled: true } : {}),
+          messageId: m.messageId,
+        }));
+        const workspaceRoot = String(cfgRef.dsh?.workspaceRoot ?? '').trim();
+        if (!workspaceRoot) { sendJson({ ok: false, error: '未配置 dsh.workspaceRoot，导出文件无处落盘' }, 503); return; }
+        const outDir = path.join(path.resolve(workspaceRoot), 'chat-export');
+        fs.mkdirSync(outDir, { recursive: true });
+        const stamp = new Date(nowMs + 8 * 3600 * 1000).toISOString().replace(/[:T]/g, '-').slice(0, 19);
+        const outFile = path.join(outDir, `misaki_chat_${key.replace(':', '_')}_${stamp}.json`);
+        const payload = {
+          exportedAt: fmtBeijing(nowMs),
+          sessionKey: key,
+          range: { from: fmtBeijing(fromMs), to: fmtBeijing(toMs), fromMs, toMs },
+          total: messages.length,
+          messages,
+        };
+        const text = JSON.stringify(payload, null, 2);
+        fs.writeFileSync(outFile, text, 'utf8');
+        sendJson({ ok: true, path: outFile, fileName: path.basename(outFile), bytes: Buffer.byteLength(text), total: messages.length, from: fmtBeijing(fromMs), to: fmtBeijing(toMs) });
         return;
       }
       if (req.method === 'POST' && url.pathname === '/api/social/chat-delete') {
@@ -5168,6 +5399,17 @@ export function startConsoleServer() {
           }
           // 无论 info 来自本地还是 OneBot，只要本地有 found 就补充转发字段，避免提示词与实现不一致。
           if (info && found) Object.assign(info, forwardFields);
+          /* 2026-10-28：把文件元数据一并报出来。否则模型只能看到正文里的 [文件:…] 标记，
+           * 旧标记一旦渲染错（未命名/未知类型），它就会误判成"上传没成"（主子 16:02 实况）。 */
+          if (info && found && Array.isArray(found.files) && found.files.length) {
+            info.files = found.files.map((f) => ({
+              name: String(f?.name || ''),
+              size: f?.size != null ? Number(f.size) : null,
+              kind: String(f?.kind || ''),
+              ext: String(f?.ext || ''),
+              marker: String(f?.marker || ''),
+            }));
+          }
           sendJson({ ok: true, key, messageId, info });
         } catch (error) {
           sendJson({ ok: false, error: `获取消息详情失败：${error?.message ?? error}` }, 500);
@@ -5189,11 +5431,49 @@ export function startConsoleServer() {
         const foundFileMsg = (stFile.recentMessages || []).find((m) => m && (String(m.seq) === messageId || (m.messageId && String(m.messageId) === messageId)));
         if (!foundFileMsg) { sendJson({ ok: false, error: '消息不存在（可能是较早的消息，超出了最近记录范围）' }, 404); return; }
         const msgFiles = Array.isArray(foundFileMsg.files) ? foundFileMsg.files : [];
-        const file = msgFiles[fileIndex] ?? msgFiles[0];
+        let file = msgFiles[fileIndex] ?? msgFiles[0];
         if (!file || (!file.fileId && !file.url)) { sendJson({ ok: false, error: '该消息没有可读取的文件' }, 404); return; }
+        /* 2026-10-28：PDF/Excel/PPT 走 document-read（文本优先、无文本层的页才识图转录）；
+         * 其余文本类/docx 仍走原来的 readFileContent。两条路都先经过 fetchFileBytes 拿字节。 */
+        const readAnyFile = async (f) => {
+          if (isComplexDocument(f?.name)) {
+            const buf = await fetchFileBytes(f, cfgRef.napcat);
+            return await readDocumentBuffer(buf, String(f?.name || ''), { maxChars: 30000, maxVisionPages: 8 });
+          }
+          return await readFileContent(f, cfgRef.napcat);
+        };
         try {
-          const result = await readFileContent(file, cfgRef.napcat);
-          sendJson({ ok: true, name: String(file.name || ''), size: result.size, ext: result.ext, text: result.text, truncated: !!result.truncated, note: result.note || null });
+          let result;
+          try {
+            result = await readAnyFile(file);
+          } catch (firstError) {
+            /* 2026-10-28：老消息/旧状态里的 files[] 可能只有文件名（历史把 d.file 当 fileId），
+             * get_file 必然 file not found。回查 OneBot 原始消息段拿真正的 file_id / file_size，
+             * 用新元数据重读一次——主子 16:02 的 docx 就靠这条不用重发。 */
+            let retried = false;
+            try {
+              const raw = await botRef.raw('get_msg', { message_id: String(foundFileMsg.messageId || messageId) });
+              const fresh = extractFilesFromSegments(raw?.message ?? []);
+              const f2 = fresh[fileIndex] ?? fresh[0];
+              if (f2 && (f2.fileId !== file.fileId || f2.url !== file.url)) {
+                file = f2;
+                result = await readAnyFile(file);
+                retried = true;
+              }
+            } catch { /* 回查失败就走原始错误 */ }
+            if (!retried) throw firstError;
+          }
+          sendJson({
+            ok: true,
+            name: String(file.name || ''),
+            size: result.size,
+            ext: String(result.ext || file.ext || ''),
+            text: result.text,
+            truncated: !!result.truncated,
+            note: result.note || null,
+            ...(result.pages != null ? { pages: result.pages, visionPages: result.visionPages ?? 0 } : {}),
+            ...(result.kind ? { docKind: result.kind } : {}),
+          });
         } catch (error) {
           sendJson({ ok: false, error: `读取文件失败：${error?.message ?? error}` }, 500);
         }

@@ -5,7 +5,10 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 export const ROOT = path.resolve(__dirname, '..', '..'); // src/lib → qq-bridge 根
-export const STATE_DIR = path.join(ROOT, 'state');
+/* 2026-10-29：测试可以 set QQB_STATE_DIR 指到临时目录，免得把假会话写进真实 state/
+ * （group-interject 那个用例造了 group:990002 就直接调 saveSocialState，污染过生产状态）。
+ * 生产不设这个变量，行为与以前完全一致。 */
+export const STATE_DIR = process.env.QQB_STATE_DIR ? path.resolve(process.env.QQB_STATE_DIR) : path.join(ROOT, 'state');
 export const STATE_FILE = path.join(STATE_DIR, 'sessions.json');
 export const ROLE_STATE_FILE = path.join(STATE_DIR, 'current-role.json');
 export const SLANG_FILE = path.join(STATE_DIR, 'slang.json');

@@ -9,7 +9,8 @@ import { getComposedPersonaStamp } from '../lib/preset-compose.js';
 import { currentMode, selfNickname, isSessionAllowedInCurrentMode } from './mode.js';
 import { state, saveState } from './config.js';
 import { createStandbySession, ensureSession } from './dsh-session.js';
-import { formatMemory, formatProfileText, formatContactsLine, recentChatMessages, fetchUnreadChatMessages, markMessagesRead, memoryDigest } from './memory.js';
+import { formatMemory, formatProfileText, formatContactsLine, recentChatMessages, fetchUnreadChatMessages, markMessagesRead, memoryDigest, dateDigest } from './memory.js';
+import { extractDateHints } from '../lib/date-memory.js';
 import { shiftNowLine } from './shift-roster.js';
 import { doingNowLine } from './activity-ledger.js';
 import { todayBlock } from './life-events.js';
@@ -18,6 +19,9 @@ import { formatGroupInfoLine, formatGroupListLine } from './group-cache.js';
 // 语音在「语音」页，表情包在桥配置页的「表情包」卡）。两边都关着/概率 0 时不会注入多余内容。
 import { voiceTurnHint } from './voice.js';
 import { memeTurnHint } from './send-dice.js';
+import { shortReplyDecision, classifyIncoming, stickerReplyDecision } from '../lib/short-reply-dice.js';
+// 2026-10-29 括号反馈：唤醒正文告知当前档位（实时/普通），发送时由桥的骰子执行
+import { bracketScene, bracketFeedbackCfg } from '../lib/bracket-feedback.js';
 // 2026-09-16 打字窗合并：对方的"正在输入"状态也用来管在途回合的注入（不只是唤醒调度）：
 // 实测的碎片化就是从这里来的 —— 连着发两条，桥在两次模型步边界各注入一次，
 // 对话窗口里就是两个独立的 [Mid-turn] 块（而不是合成一个 2 条的块）。
@@ -28,10 +32,13 @@ import { midTurnSteerGate, midTurnSteerText, STEER_IN_TURN_DEFER_MAX_MS } from '
 import {
   getSocialState, saveSocialState, social, seenForwardIds,
   cancelReplyCheck, setupSleepTimer, collectFreshWakeMedia, pickAttachableMedia, isInSleepWindow,
-  formatParticipation, isConversationBusy, scheduleWake, conversationMode, consumeStopNote,
+  formatParticipation, isConversationBusy, scheduleWake, conversationMode, consumeStopNote, consumeModeNote,
+  bubbleStyleOf,
+  // 2026-10-29 misaki@reaction：本人关掉括号反馈时，唤醒正文里不再给 [Brackets] 档位行
+  bracketReactionOf,
 } from './social-state.js';
 // 模式系统（2026-10-26）：[Mode] 行注入——她永远知道自己处于哪个模式
-import { modeLineForWake, stopNoteLine } from './companion-mode.js';
+import { modeLineForWake, stopNoteLine, modeChangedNoteLine } from './companion-mode.js';
 // 2026-09-22：在途回合注入要附图和唤醒一样取图（同一份解析器），见 steerIntoRunningTurn 顶部注释
 import { getPromptMediaResolver } from './prompt-deliver.js';
 import { buildCrossChatBlock } from './crosschat.js';
@@ -254,7 +261,7 @@ export function evaluateWakeTrigger(key, st, event, kind, textContent, plainCont
 }
 
 // 运行时「人设/发言规则」文件注入（桌面 GUI 写入 qq-bridge/persona.md 与 speech-rules.md，桥只读；
-// 缺失跳过；按 mtime 缓存，文件变更下次唤醒自动生效；上限 persona 16000 / speech 12000 字符）
+// 缺失跳过；按 mtime 缓存，文件变更下次唤醒自动生效；上限 persona 16000 / speech 16000 字符）
 // 2026-09-12 反馈：原来 persona 上限 6000 字符，而一份完整角色卡动辄 9KB+ —— 会被静默截断。
 // 2026-09-18：修「新加的规则根本没进模型」。现场证据链：
 //   ① 线上 speech-rules.md 已被桌面 GUI 追加到 6683 字符（第 49 行起是 `## OVER-FITTING BACKSTOP`
@@ -269,7 +276,11 @@ export function evaluateWakeTrigger(key, st, event, kind, textContent, plainCont
 //      （代价是上限内每轮多注入的 token；但规则文件是用户亲手写的、本就该生效，静默丢规则更贵）；
 //   ② 万一仍然超限：改成保头 + 保尾（尾段＝最新追加的规则，价值高于中段），
 //      并把"砍掉了第几到第几个字符"写进日志，让丢失可见，而不是继续静默砍尾。
-const RUNTIME_OVERRIDE_MAX = { 'persona.md': 16000, 'speech-rules.md': 12000 };
+// 2026-10-29：speech 12000 → 16000。规则文件长到 13458 字符后，12000 上限把中段
+// 第 9501~10958 字符（#32~#37 与「初识档」）静默挡在模型外面——上一轮加的规则其实一次都没进过唤醒补丁。
+// 丢规则比多注入 1.5k 字符贵得多（与 persona 上限持平）。配套 tests/runtime-override-budget.test.js
+// 守住"文件一定放得下"，以后再追加会先红，而不是先静默丢。
+export const RUNTIME_OVERRIDE_MAX = { 'persona.md': 16000, 'speech-rules.md': 16000 };
 // 超限时保证末尾这么多字符一定注入：新规则都追加在文件尾部，绝不能再被整段砍掉。
 const RUNTIME_OVERRIDE_KEEP_TAIL = 2500;
 const runtimeOverrideCache = {}; // fileName -> { statKey, text }
@@ -376,6 +387,123 @@ function wakeRefLine(key) {
     + `记录：主人配置=${ownerProb === null ? '未设置' : ownerProb}，当前生效=${curShown}，来源=${src}`
     + '；只有要本会话完全静默（普通消息别叫你）时才把 triggers.probability 设为 0，那是关闭开关、不是概率，其它数值都不参与判断。'
     + deepsleepLine(key);
+}
+
+/**
+ * 低信息量消息（owo / 表情 / 单字）的「这一轮回不回」抽签行（2026-10-28 主人定规）。
+ *
+ * 主人原话：「不回复是被允许的」——但不是"一遇表情包就一律静音"，所以桥每轮掷一次，
+ * 结果写成数据行（[Dice] SILENT / REPLY），模型照着办；跟 [Voice]/[Meme] 同一套路
+ * （模型自己"按概率感觉"从来没准过，桥掷才稳、也才验得出来）。
+ *
+ * 适用范围刻意收窄：
+ *   · 只私聊 —— 群聊的"要不要接这句"由 [WAKE TYPES] 15 交给模型判断，不掺和；
+ *   · owner 私聊默认豁免（`applyToOwner`）—— 主人这边走 OWNER_PRIVATE_ROUND「及时回」，
+ *     而且他自己喊一声就想看到回应；
+ *   · 只在对方最后一条真是低信息量时才出现，普通消息轮一点多余 token 都不加。
+ * 纯函数式掷骰（只读 st + 配置，不写状态），所以每轮重掷无副作用 —— 同一条 owo
+ * 可能这轮不回、下轮接一句，正是要的"不一定"。
+ */
+export function shortReplyDiceLine(st, key) {
+  if (!key.startsWith('private:')) return '';
+  const c = cfgRef.social?.shortReply ?? {};
+  if (c.enabled === false) return '';
+  if (c.applyToOwner !== true && cfgRef.ownerQQ && key === `private:${cfgRef.ownerQQ}`) return '';
+  const last = (() => {
+    const unread = Array.isArray(st.unread) ? st.unread : [];
+    if (unread.length) return unread[unread.length - 1];
+    const recent = Array.isArray(st.recentMessages) ? st.recentMessages : [];
+    for (let i = recent.length - 1; i >= 0; i -= 1) {
+      const m = recent[i];
+      if (m && !m.isSelf && Date.now() - Number(m.time || 0) < 10 * 60 * 1000) return m;
+    }
+    return null;
+  })();
+  if (!last) return '';
+  const kinds = Array.isArray(last.media)
+    ? last.media.map((m) => (m?.sticker === true ? 'sticker' : String(m?.kind || ''))).filter(Boolean)
+    : [];
+  const hasFile = last.hasFile === true || (Array.isArray(last.files) && last.files.length > 0);
+  const text = last.text ?? last.plain ?? '';
+  const kind = classifyIncoming({ text, hasMedia: last.hasMedia === true || kinds.length > 0, hasFile, mediaKinds: kinds });
+  /* 2026-10-29 表情包：独立五档骰子 + 冷场判定（照片/文件/有正话一律不掷，直接返回空行）。
+   * 冷场阈值按会话当前模式取（常规 15 分钟 / 陪伴 5 分钟，见 config 的 idleThresholdMs）；
+   * "热聊"和"刚聊完"不区分——两者都走同一套五档。 */
+  if (kind === 'sticker') {
+    const gapMs = prevMessageGapMs(st, last);
+    const coldMs = coldThresholdMs(st);
+    const cold = coldMs > 0 && gapMs >= coldMs;
+    const stCfg = cfgRef.social?.stickerReply ?? {};
+    const probs = {
+      echo: stCfg.echoProbability,
+      comment: stCfg.commentProbability,
+      own: stCfg.ownProbability,
+      poke: stCfg.pokeProbability,
+    };
+    const r = stickerReplyDecision({ probs, cold });
+    const gapMin = gapMs > 0 ? Math.round(gapMs / 60000) : 0;
+    const why = cold ? `，冷场（距上一条 ${gapMin} 分钟，阈值 ${Math.round(coldMs / 60000)} 分钟）` : `（距上一条 ${gapMin} 分钟）`;
+    return `[Dice] sticker roll=${r.roll.toFixed(2)}${why}: ${stickerActionText(r.action)}\n`;
+  }
+  if (kind !== 'text-low') return '';
+  const d = shortReplyDecision({
+    text,
+    hasMedia: last.hasMedia === true || kinds.length > 0,
+    hasFile,
+    mediaKinds: kinds,
+    maxChars: c.maxChars,
+    probability: c.silenceProbability,
+  });
+  if (!d.lowInfo) return '';
+  return `[Dice] low-info message (sticker / ow o / single char) roll=${d.roll.toFixed(2)} p=${d.p}: `
+    + (d.silent
+      ? 'SILENT this turn - qq_mark_read, send no bubble at all; no farewell ("那你先忙" / "不打扰了"), no explanation.\n'
+      : 'REPLY - one short line, no question, no commentary on your own last bubble.\n');
+}
+
+/** 冷场阈值（ms）：会话当前模式决定。0 表示不判冷场。 */
+function coldThresholdMs(st) {
+  const companion = String(st?.agentMode || '') === 'companion';
+  const raw = companion
+    ? cfgRef?.social?.companionMode?.idleThresholdMs
+    : cfgRef?.social?.proactive?.idleThresholdMs;
+  const n = Number(raw);
+  if (Number.isFinite(n) && n > 0) return n;
+  return companion ? 5 * 60 * 1000 : 15 * 60 * 1000;
+}
+
+/** 这条消息与"上一条消息"（任何一方）的间隔。找不到上一条时返回 0（按非冷场处理）。 */
+function prevMessageGapMs(st, last) {
+  const lastTime = Number(last?.time) || 0;
+  if (!lastTime) return 0;
+  const recent = Array.isArray(st?.recentMessages) ? st.recentMessages : [];
+  let prev = 0;
+  for (const m of recent) {
+    const t = Number(m?.time) || 0;
+    if (t > 0 && t < lastTime && t > prev) prev = t;
+  }
+  return prev ? lastTime - prev : 0;
+}
+
+/** 五档动作的落地指令（写给模型看的，指名工具）。 */
+function stickerActionText(action) {
+  switch (action) {
+    case 'ECHO':
+      return '收藏这张表情并原样发回同一张：先 qq_collect_sticker（messageId 用这条消息的 id），'
+        + '拿到收藏 id 后 qq_send_sticker 发回；收藏不可用就 qq_send_image(messageId=这条) 转发原图。不配文字。';
+    case 'COMMENT':
+      return '用一句话评价这张表情本身（画的是什么、什么情绪），不展开、不追问、不点评自己刚发的东西。';
+    case 'OWN':
+      return '发一张你自己收藏的表情包：qq_list_stickers 里挑一张贴合当前情境的，用 qq_send_sticker 发出去。不配文字。';
+    case 'POKE':
+      return '拍对方一下（qq_send_poke，私聊可省略 targetUserId），再 qq_mark_read 收尾——'
+        + '这是"已读"的信号，不带文字、不解释为什么拍。';
+    case 'COLD_REPLY':
+      return '冷场后的第一条消息：必须回一句短话（「在呢」「怎么啦」这种，按你们的关系挑口气），'
+        + '不要发自己的表情包、不要拍一拍、不要问「在吗」。';
+    default:
+      return 'qq_mark_read 收尾，一个气泡都不发；不要补「那你先忙」这类告别。';
+  }
 }
 
 /**
@@ -520,6 +648,41 @@ function pickLifeFlashback(key) {
   } catch { /* 没有日记文件不影响正常唤醒 */ return ''; }
 }
 
+/**
+ * 补投轮（投递看门狗）的未读标注（2026-10-29）。
+ *
+ * 现场：2026-10-28 23:17，23:16:20 发的「真的嘛」在"唤醒正文已定稿、回合还没收尾"的空档到达，
+ * 没进任何正文；25 秒后被投递看门狗当作"打算交付却没交出去"的消息重新投了一次。那一轮正文只有
+ * `[Unread 1] …(id:…): 真的嘛`，抬头写着 `[Now] 23:17`，没有任何时间标记——模型只能把它当成
+ * 刚发生的新消息，于是拿自己上一条「光发图不说话啊」去接它，回了「真的啊，我又不瞎」。
+ *
+ * 契约：补投轮给每条未读加 ` [HH:MM 发出 · 补投]`，正文前加一行 [Guide] 说明这一轮是补投；
+ * 其它唤醒原因一个字节都不加（不烧多余 token）。纯函数，供正文拼装与测试共用。
+ */
+export function backfillUnreadMarks(reason) {
+  const on = String(reason ?? '').split(':')[0] === 'deliveryWatchdog';
+  const hhmm = (t) => {
+    const n = Number(t) || 0;
+    if (!n) return '';
+    try {
+      return new Date(n).toLocaleTimeString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false, hour: '2-digit', minute: '2-digit' });
+    } catch { return ''; }
+  };
+  return {
+    on,
+    guide: on
+      ? '\n[Guide] 这一轮是补投（投递兜底）：下面的消息是刚才没能交到你手上的，发出时间写在每条后面。'
+        + '按它们各自的时间理解——不要当成刚发生的新话题，也不要用你上一条回复去接它；'
+        + '原来那个话题如果已经过去，就顺着原话题答一句。'
+      : '',
+    timeTag: (m) => {
+      if (!on) return '';
+      const s = hhmm(m && m.time);
+      return s ? ` [${s} 发出 · 补投]` : '';
+    },
+  };
+}
+
 export function buildWakePrompt(key, reason) {
   const st = getSocialState(key);
   // 2026-09-12：首轮也要带 `[OWNER]` 标记：persona 的 [OWNER MODE] 只认这个标记，
@@ -563,16 +726,32 @@ export function buildWakePrompt(key, reason) {
    * 换来的是"定过的规矩和相关事实永远在"——这正是"永久记忆"想要的。
    * 内容稳定（排序确定、不含随机数），所以同一批记忆下逐字节相同，不会额外扰动什么。 */
   let recallText = '';
+  let datesText = '';
   try {
     const uid = key.startsWith('private:') ? key.split(':')[1]
       : key.startsWith('group:') ? String(cfgRef?.ownerQQ ?? '') : '';
     recallText = memoryDigest({ uid, limit: 14, maxChars: 700 });
+    /* 2026-10-28 主人需求：日期型记忆每轮浮现（今天/还有 N 天由桥算好）。
+     * [Recall] 只保证永久层，窗口 700 字；生日这类 event 记忆会被挤出去，所以单独一行。 */
+    datesText = dateDigest({ uid, limit: 5 });
   } catch (error) {
     log(`[memory] 记忆摘要注入失败: ${error?.message ?? error}`);
   }
+  /* 轮换时桥扫描到的"可能没落盘"的日期句子：只提示一次，模型在下一轮用 qq_memory_remember 写。
+   * 放在这里消费（读后清空），避免每轮都催。 */
+  let rememberText = '';
+  try {
+    const hints = Array.isArray(st._rememberHints) ? st._rememberHints.filter(Boolean).slice(0, 3) : [];
+    if (hints.length) {
+      st._rememberHints = [];
+      rememberText = `[Remember] 下面这些日期/事件可能只活在聊天里、还没落盘。用 qq_memory_remember 各写一条（带日期，category=event，tier=durable）：\n${hints.map((h) => `- ${h}`).join('\n')}`;
+    }
+  } catch { /* 提示失败不影响唤醒 */ }
   const memoryLine = [
     memoryText, contactsText,
     recallText ? `[Recall] 你长期记住的事（永久层，别忘；要改就用 qq_memory_remember）\n${recallText}` : '',
+    datesText ? `[Dates] ${datesText}` : '',
+    rememberText,
     profileText ? `[Profile] ${profileText}` : '',
   ].filter(Boolean).join('\n') + '\n\n';
   const participationText = formatParticipation(st);
@@ -629,13 +808,35 @@ export function buildWakePrompt(key, reason) {
   const companionOn = cfgRef?.social?.companionInjects === true;
   // 2026-10-26 模式系统：[Mode] 行（仅私聊）——常规/陪伴两态都注入，问到模式答得出+给得出指令。
   const modeLine = key.startsWith('private:') ? modeLineForWake(conversationMode(key)) : '';
+  /* 2026-10-29：这一位联系人抱怨过被切碎（「你说话怎么这么爱分气泡断句」），桥已把这条私聊的
+   * 气泡偏好设成 single。模型侧必须知道，否则她会把"挤成一条"当成发送异常或以为桥坏了。
+   * 只注入到这一位 —— bubbleStyleOf 按会话读，别人的唤醒正文里没有这一行。 */
+  const bubbleLine = key.startsWith('private:') && bubbleStyleOf(key) === 'single'
+    ? '[Bubbles] 这位不喜欢被切成几条：整段写成一条发（桥也会并成一条，只有真超长才拆）。不用道歉，也不用解释规则。\n'
+    : '';
+  /* 2026-10-29 括号反馈（陪伴模式专属）：档位由「用户的动作性」决定，桥在发送时执行——
+   * 她只管按场景写，出现频率是桥的骰子的事。档位行让她知道这轮该往哪个方向写。 */
+  const bracketLine = key.startsWith('private:') && conversationMode(key) === 'companion'
+      && bracketFeedbackCfg(cfgRef?.social?.companionMode?.bracketFeedback).enabled
+      && bracketReactionOf(key)
+    ? (bracketScene(getSocialState(key)) === 'realtime'
+      ? '[Brackets] 高级反馈·实时档：对方刚刚对你做出了动作——你写的每个括号段都会保留，用动作回应动作。规则照旧：只写看得见、发生在自己身上、一口气说得完的，括号用半角 ()，不替对方安排动作。\n'
+      : '[Brackets] 高级反馈·普通档：当前是传递实时状态的距离——想加括号动作/表情/心理就写上，桥的骰子决定哪些出现（大概率只留零星几个），所以尽管按自然的感觉写。半角 ()，不替对方安排动作。\n')
+    : '';
   // 2026-10-26 misaki@stop：挂起的"另行说明已经被停止"标记（一次性，消费即清）。
   let stopLine = '';
   if (key.startsWith('private:')) {
     const snAt = consumeStopNote(key);
     if (snAt) stopLine = stopNoteLine(snAt);
   }
-  const base = tokenLine + nowLine + modeLine + stopLine
+  // 2026-10-26 [ModeChanged]：桥替她切模式后的一次性说明（消费即清）。切换对她原本完全不可见——
+  // 实测她据此否认桥的退场回执、自称「还在陪伴模式」并反索一次指令。
+  let modeChangedLine = '';
+  if (key.startsWith('private:')) {
+    const mn = consumeModeNote(key);
+    if (mn) modeChangedLine = modeChangedNoteLine(mn.at, mn.mode);
+  }
+  const base = tokenLine + nowLine + modeLine + bubbleLine + bracketLine + stopLine + modeChangedLine
     + (companionOn ? shiftNowLine() + doingNowLine() + todayBlock(key, cfgRef?.ownerQQ) : '')
     + statusLine + wakeLine + voiceTurnHint(key) + memeTurnHint(key) + memoryLine + participationLine + (gInfoText ? gInfoText + '\n' : '') + (groupListText ? groupListText + '\n\n' : (gInfoText ? '\n' : ''));
   // 2026-09-12 规则搬家：原 protocolNote（2,886 字符的「回合协议」：➤ 哨兵含义、读/发/收尾步骤、
@@ -698,10 +899,23 @@ export function buildWakePrompt(key, reason) {
     const idleMinC = stC?.lastIncomingAt ? Math.max(0, Math.round((Date.now() - Number(stC.lastIncomingAt)) / 60000)) : null;
     return `${baseWithProtocol}[Wake] ${key} companion care（陪伴模式·主动关心${idleMinC != null ? `，对方已安静 ${idleMinC} 分钟` : ''}）：凭记忆里的事或近况开口一句，或 qq_mark_read 不开口`;
   }
+  if (reason === 'morningGreet') {
+    // 2026-10-29 早安问候（主人定规，独立于已下线的作息仪式 morning）：每天一条、不占主动配额。
+    // 桥在派发前已拦下「今天已问过 / 对方先开口 / 静默 / 忙碌」的情况；这里只留一行数据 + 指南。
+    return `${baseWithProtocol}[Wake] ${key} morning greet（每日早安，不占主动配额；桥侧已确认今天还没搭上话）：一条短早安，自己的语气，别和昨天重样；轻轻带一句记忆里的事可以，问句最多一个、也可以不带。不想发就 qq_mark_read`;
+  }
   if (reason === 'proactiveCheck') {
     // 2026-10-25：日记闪回属陪伴注入，随 social.companionInjects 一并关闭
     const lifeLine = cfgRef?.social?.companionInjects === true ? pickLifeFlashback(key) : '';
-    return `${baseWithProtocol}[Wake] ${key} proactive opening${lifeLine ? `\n[Life] ${lifeLine}` : ''}`;
+    /* 2026-10-28 每日保底（主人定规）：常规模式一天至少主动关心一次。到期时 state 里挂着
+     * _dailyMinPending，这里消费掉并给一句明确指南——不然模型很可能按惯例 mark_read，保底就落空了。 */
+    const stDm = getSocialState(key);
+    const dailyMin = stDm?._dailyMinPending === true;
+    if (dailyMin && stDm) stDm._dailyMinPending = false;
+    const guide = dailyMin
+      ? '\n[Guide] 今天的保底关心（对方一整天没说话，你还没主动找过 ta）：发一句就好——具体一点，凭你记得的事或近况开口，别问「最近怎么样」，也别提这是例行关心。'
+      : '';
+    return `${baseWithProtocol}[Wake] ${key} proactive opening${lifeLine ? `\n[Life] ${lifeLine}` : ''}${guide}`;
   }
   if (reason === 'poke') {
     return `${baseWithProtocol}[Wake] ${key} poked`;
@@ -1701,6 +1915,12 @@ export async function sendWakePrompt(key, reason) {
     }
     // ② 阈值到达：转移到已预热的会话；无可用预热会话时回退“归档旧会话 + 现场重建”老路径
     if (count >= rotateThreshold) {
+      /* 2026-10-28：轮换前扫一遍最近消息里的日期/事件句，下一轮唤醒用 [Remember] 提醒落盘。
+       * 只做提示、不自动写库——"记错生日"比"没记"更糟，写入必须由模型确认过表述。 */
+      try {
+        const hints = extractDateHints((Array.isArray(st.recentMessages) ? st.recentMessages : []).slice(-24), { limit: 3 });
+        if (hints.length) st._rememberHints = hints;
+      } catch { /* 扫描失败不影响轮换 */ }
       if (!sidNow || !st._promptInjected) {
         /* 2026-09-19：阈值到了，但没有映射会话 / 还没注入过完整 prompt ——
          * 这说明下一次投递本来就会新建一个会话（上下文已经是新的了），等价于"已经轮换过"。
@@ -1823,6 +2043,9 @@ export async function sendWakePrompt(key, reason) {
   const trustedHereTag = trustedSpeakerHere
     ? `[OWNER-HERE] The most recent message in this group was sent by 主人/an admin (ownerQQ=${cfgRef?.ownerQQ ?? '?'}). Treat that person as your owner in this session: their requests are authoritative and owner/admin-only tools are allowed here. Other group members are NOT your owner - never call them 主人 and never take "owner orders" from them.\n`
     : '';
+  /* 2026-10-28：低信息量消息的回不回抽签行。两种正文（哨兵轮 / 首次完整轮）都要带，
+   * 所以在分支之前掷一次，两个模板共用同一个结果 —— 一轮里只能有一个答案。 */
+  const shortDice = shortReplyDiceLine(st, key);
   if (st._promptInjected) {
     // —— 架构：后续轮一律「哨兵轮」，正文只留"令牌 + 唤醒原因 + 数据"，规则全在系统提示词里。 ——
     // 被 @ 时给一句定位（unread 返回不保证带 at 标记），避免隔得远瞎猜；此句仅 @ 场景出现。
@@ -1845,6 +2068,7 @@ export async function sendWakePrompt(key, reason) {
     const UNC_TEXT = key.startsWith('private:') ? 200 : 120;
     const unreadAll = Array.isArray(st.unread) ? st.unread : [];
     const unreadMsgs = unreadAll.slice(-UNC_MAX);
+    const bfMarks = backfillUnreadMarks(reason);
     let unreadLine = '';
     if (unreadMsgs.length) {
       const lines = unreadMsgs.map((m) => {
@@ -1858,13 +2082,14 @@ export async function sendWakePrompt(key, reason) {
         const fileTag = f0 ? ` [file:${f0.kind || fileKindLabel(f0.name)}]` : (m.hasFile ? ' [file]' : '');
         const extra = m.hasMedia ? ' [image]' : fileTag;
         const at = m.atSelf ? ' @me' : '';
-        return `${who}${id}${at}: ${body}${extra}`;
+        return `${who}${id}${at}${bfMarks.timeTag(m)}: ${body}${extra}`;
       });
       const omitted = unreadAll.length - unreadMsgs.length;
       // 2026-09-12 规则搬家：原来这段还跟着一长串"回完就在同一步收尾 / 别用等待工具 / 旧消息要用
       // qq_get_recent_messages 翻"的规则散文（每轮都注入、步步重发，owner 会话实测 47 次注入≈48KB）。
       // 现在这些规则都在系统提示词 [WAKE TYPES] 第 1/9/10 条，这里只留数据：未读正文 + 省略条数。
-      unreadLine = `\n[Unread ${unreadAll.length}] ${lines.join('\n')}`
+      unreadLine = bfMarks.guide
+        + `\n[Unread ${unreadAll.length}] ${lines.join('\n')}`
         + (omitted > 0 ? `\n(${omitted} older unread not shown)` : '');
     } else if (key.startsWith('private:')) {
       unreadLine = '\n[Unread 0] nothing new to answer - close with qq_mark_read unless you deliberately want to open a topic.';
@@ -1900,8 +2125,11 @@ export async function sendWakePrompt(key, reason) {
     }
     /* 抽签行（语音/表情包）在哨兵轮里的落点：每个片段都以 '\n' 开头，这里也补一个，
      * 再把抽签行自己的尾部换行去掉，避免和 unreadLine 之间多出一个空行。
-     * 同一处还带上 [WakeRef]（用户配的插话概率）——见 wakeRefLine 的说明，它必须每轮都在。 */
-    const diceLines = voiceTurnHint(key) + memeTurnHint(key);
+     * 同一处还带上 [WakeRef]（用户配的插话概率）——见 wakeRefLine 的说明，它必须每轮都在。
+     * 2026-10-29：表情包五档骰子（shortDice 里的 [Dice] sticker）已经包含"发一张自己的表情包"这一档，
+     * 而 [Meme] 骰子是另一套独立 30% 的"发一张"。两行同时出现会让她一次发两张，所以 sticker 轮让 [Meme] 闭嘴。 */
+    const stickerTurn = String(shortDice || '').includes('[Dice] sticker');
+    const diceLines = voiceTurnHint(key) + (stickerTurn ? '' : memeTurnHint(key));
     const diceBlock = `\n${wakeRefLine(key)}${diceLines ? '\n' + diceLines.replace(/\n+$/, '') : ''}`;
     /* 2026-09-26：哨兵轮同样补 [Now]（与普通唤醒一致）。2026-09-24 曾把时间行整轮去掉、改成"纯工具现取"，
      * 实测模型常常不调 get_time 就直接猜时刻/星期，所以基准行必须每轮都在；要更准再用 get_time 取一次。
@@ -1910,13 +2138,33 @@ export async function sendWakePrompt(key, reason) {
      * 本来就不在前缀缓存里，所以不影响缓存命中。 */
     const nowSentinel = `[Now] ${fmtBeijing(Date.now())}（北京时间；这是本轮的发出时刻，若已多步工具调用请用 get_time 重取）\n`;
 
+    /* 2026-10-29 真机事故（主人小号 14:23 实测）：桥 14:22:22 已把这条私聊切进陪伴模式并替她回了
+     * 「好呀…」，她下一轮却答「还没切呢，现在是常规模式」——因为 [Mode]/[ModeChanged] 只挂在
+     * 完整 prompt 那条路径上（buildWakePrompt），而绝大多数回合走的是这条哨兵极简路径：
+     * 会话首轮之后，模式变化对她完全不可见。同类 bug 2026-10-26 修过一次，但只修在完整路径上，
+     * 等于没修。现在哨兵轮也带模式行（仅私聊，一行），切换待说明照旧一次性消费。
+     * 注意顺序：先取待消费的说明（consumeModeNote 会清零），再渲染当前模式行。 */
+    let modeSentinel = '';
+    let bracketSentinel = '';
+    if (key.startsWith('private:')) {
+      const mn = consumeModeNote(key);
+      const changed = mn ? modeChangedNoteLine(mn.at, mn.mode) : '';
+      modeSentinel = `${modeLineForWake(conversationMode(key))}${changed ? changed + '\n' : ''}`;
+      // 括号反馈档位也只在完整路径上——陪伴模式下每轮都得知道当前档位，补进哨兵轮。
+      if (conversationMode(key) === 'companion' && bracketReactionOf(key) && bracketFeedbackCfg(cfgRef?.social?.companionMode?.bracketFeedback).enabled) {
+        bracketSentinel = bracketScene(getSocialState(key)) === 'realtime'
+          ? '[Brackets] 实时档：对方刚对你做出动作，括号段都会保留；半角 ()，只写自己这侧。\n'
+          : '[Brackets] 普通档：括号出现与否由桥的骰子决定，按自然感觉写；半角 ()，只写自己这侧。\n';
+      }
+    }
+
     // 工具全关的兜底（几乎不会发生）：没有 unread 工具就回退到两行说明版，避免哨兵悬空。
     const tools = cfgRef.social?.tools;
     const hasAnyTool = !!tools && typeof tools === 'object' && Object.values(tools).some((v) => v !== false);
     if (!hasAnyTool) {
       const unread = (st.unread || []).length;
       const rMap = { private: 'private', atMention: '@', poke: 'poke', probability: 'probability', proactiveCheck: 'proactive', replyCheck: 'replyCheck' };
-      promptText = `[Token] ${st.agentToken}\n${nowSentinel}[Session] ${key}\n${currentStyleLine()}[Wake ${rMap[reason] || reason}] ${unread} unread${atLine}${typingLine}${diceBlock}${unreadLine}${nagLine}${rbNote}${autoResetNote}`;
+      promptText = `[Token] ${st.agentToken}\n${nowSentinel}[Session] ${key}\n${modeSentinel}${bracketSentinel}${currentStyleLine()}[Wake ${rMap[reason] || reason}] ${unread} unread${atLine}${typingLine}${diceBlock}${shortDice}${unreadLine}${nagLine}${rbNote}${autoResetNote}`;
     } else {
       // 哨兵轮 prompt 每轮都带当前令牌：模型不必凭记忆/跨轮次查找 token，
       // 杜绝"上下文轮换后 token 抄错 → 工具全 403 → 模型看不到消息 → 空唤醒乱回"链路。
@@ -1938,7 +2186,7 @@ export async function sendWakePrompt(key, reason) {
        * 实测（state/tool-calls.jsonl 1966 次调用）qq_send_sticker 只有 5 次（≈1/54 条消息），
        * 而配置的概率是 0.6 —— 低 15~20 倍，正是"每会话只掷一次骰"的形状。
        * 抽签函数本身是纯的（只读配置 + Math.random，不写任何状态），所以每轮都掷没有副作用。 */
-      promptText = `[Token] ${st.agentToken}\n${nowSentinel}${ownerTag}${trustedHereTag}${notOwnerTag}\n[Session] ${key}\n${currentStyleLine()}[Wake ${reasonTag}]${atLine}${typingLine}${diceBlock}${unreadLine}${nagLine}${rbNote}${autoResetNote}`;
+      promptText = `[Token] ${st.agentToken}\n${nowSentinel}${ownerTag}${trustedHereTag}${notOwnerTag}${modeSentinel}${bracketSentinel}\n[Session] ${key}\n${currentStyleLine()}[Wake ${reasonTag}]${atLine}${typingLine}${diceBlock}${shortDice}${unreadLine}${nagLine}${rbNote}${autoResetNote}`;
     }
   } else {
     // 首次唤醒（或轮换到新会话后的首个真实回合）：完整 base + 最近消息滑动窗口 + 重置提示。
@@ -1959,7 +2207,7 @@ export async function sendWakePrompt(key, reason) {
     const resetBase = Math.max(ctxBase, Number(cfgRef.social?.context?.resetWindow) || 24);
     const ctxN = justReset ? Math.min(60, resetBase) : Math.min(24, ctxBase);
     const recentBlock = formatRecentWindow(st, key, ctxN);
-    promptText = buildWakePrompt(key, reason) + recentBlock + autoResetNote;
+    promptText = buildWakePrompt(key, reason) + recentBlock + autoResetNote + shortDice;
     st._promptInjected = true;
     /* 2026-09-18：落点只认"当前映射"，不能再回退到 liveSid：轮换走"没有预热会话"的兜底路径时
      * 上面刚把 state.sessions[key] 置空（真正的会话要等投递时才现建），而 liveSid 是轮换之前取到的

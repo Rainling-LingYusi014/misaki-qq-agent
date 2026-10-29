@@ -42,6 +42,9 @@ const PASSTHROUGH_DEFAULT = [];
 // 2026-10-27 主人定版：consumption×3 合并为单条 credits；reset -1 简化为 reset（防误输入位取消），简介同步精简。
 export const ACTIONS = [
   { token: 'help', kind: 'action-help', label: '查看指令列表与用法' },
+  /* 2026-10-29 主人定规：陪伴模式括号反馈总开关，按钮式（开↔关，输一次翻一次）。
+   * help 里的文本带当前状态（当前：开/关），格式照 help 版式：指令 | 说明。 */
+  { token: 'reaction', kind: 'action-reaction', label: '陪伴模式反馈总开关' },
   { token: 'stop', kind: 'action-stop', label: '停止当前任务' },
   { token: 'credits', kind: 'action-credits', label: '查询今日额度用量' },
   // 2026-10-28（审查 P1-3 修复）：声音复刻的用户侧授权闸——用户本人发过这条才算授权，
@@ -56,7 +59,7 @@ export const ACTIONS = [
 /** misaki@help：指令一览（注册表自动生成，加新模式/动作自动出现）+ 用法规范。
  * 2026-10-28 主人定版版式：竖线分隔；用法固定四行；模式指令行按 currentModeId 标（当前），省略时不标。
  * 2026-10-28 二改：confirm（声音复刻授权）进列表，排在 reset 上方（主人指示）。 */
-export function helpText(currentModeId = null) {
+export function helpText(currentModeId = null, reactionOn = null) {
   const lines = ['当前全部指令：'];
   const help = ACTIONS.find((a) => a.kind === 'action-help');
   if (help) lines.push(`misaki@${help.token} | ${help.label}`);
@@ -68,7 +71,10 @@ export function helpText(currentModeId = null) {
   }
   for (const a of ACTIONS) {
     if (a.kind === 'action-help') continue; /* help 已置顶，不重复 */
-    lines.push(`misaki@${a.token} | ${a.label}`);
+    /* 2026-10-29：开关类指令的 help 文本带当前状态（主人定版文案「陪伴模式反馈总开关（当前：x）」）。
+     * 状态未知（调用方没传）时不硬编「开」，只留标签，免得显示一个假状态。 */
+    const state = (a.kind === 'action-reaction' && reactionOn != null) ? `（当前：${reactionOn ? '开' : '关'}）` : '';
+    lines.push(`misaki@${a.token} | ${a.label}${state}`);
   }
   lines.push('');
   lines.push('用法：');
@@ -143,15 +149,20 @@ export const COMPANION_DEFAULTS = {
   idleThresholdMs: 10 * 60 * 1000,        // 冷场阈值：对方安静 10 分钟才考虑主动
   dailyMax: 3,                            // 每日主动上限（与常规模式的 proactiveCount 分开计数）
   quietStart: '23:30',                    // 静默时段：不再"凌晨想起你"
-  quietEnd: '07:30',
+  quietEnd: '07:00',                      // 2026-10-29 主人定规：随早安问候（7 点起窗）从 07:30 提前
   unansweredWindowMs: 6 * 60 * 60 * 1000, // 主动后对方 6h 没回 = 记一次"无回应"
   unansweredStreakLimit: 2,               // 连续 2 次无回应 → 退避降档
   backoffDailyMax: 1,                     // 退避期每天至多 1 次（对方一回话立即解除）
   // 打字等待：陪伴回合绝不插话（常规模式 breakProbability=0.3，有 30% 概率抢话）
   typingHoldMaxMs: 45 * 1000,
   typingRefreshMs: 5000,
+  // 长气泡下限（2026-10-28 定规；2026-10-29 条数由骰子分配，这里只剩"墙"的作用）：
+  // 一句超过这么多字就不许整条发——至少两条；再往前（约 1.8 倍 ≈ 72 字）三条。
+  // 2026-10-29 主人把 60 调到 40：正常人聊天很少有一句超过 50 字。见 lib/bubble-split.js 的 shapeBubbles
+  splitOverChars: 40,
   // 工具白名单：陪伴回合只保留记忆/发送/表情包/看图（桥侧 companionToolBlock 强制）
-  allowedTools: ['reply', 'sendMessage', 'markRead', 'sendSticker', 'collectSticker', 'listStickers', 'getStickerImage', 'getImages', 'memoryRemember', 'memorySearch', 'memory'],
+  // 2026-10-28：加 sendPoke —— 拍一拍是社交动作、不是任务，陪伴模式下也要能回拍
+  allowedTools: ['reply', 'sendMessage', 'markRead', 'sendSticker', 'collectSticker', 'listStickers', 'getStickerImage', 'getImages', 'memoryRemember', 'memorySearch', 'memory', 'sendPoke'],
 };
 
 export function companionCfg(cfgRef) {
@@ -169,11 +180,12 @@ export function companionCfg(cfgRef) {
     backoffDailyMax: Math.max(0, num('backoffDailyMax', COMPANION_DEFAULTS.backoffDailyMax)),
     typingHoldMaxMs: Math.max(5000, num('typingHoldMaxMs', COMPANION_DEFAULTS.typingHoldMaxMs)),
     typingRefreshMs: Math.max(0, num('typingRefreshMs', COMPANION_DEFAULTS.typingRefreshMs)),
+    splitOverChars: Math.min(200, Math.max(10, num('splitOverChars', COMPANION_DEFAULTS.splitOverChars))),
     allowedTools: Array.isArray(o.allowedTools) ? o.allowedTools.map(String) : COMPANION_DEFAULTS.allowedTools.slice(),
   };
 }
 
-/** 陪伴模式静默时段（北京时间，默认 23:30–07:30，支持跨午夜）：期间不主动关心。 */
+/** 陪伴模式静默时段（北京时间，默认 23:30–07:00，支持跨午夜）：期间不主动关心。 */
 export function inCompanionQuietHours(nowMs = Date.now(), cfgRef = null) {
   const cp = companionCfg(cfgRef);
   const start = parseClockMin(cp.quietStart);

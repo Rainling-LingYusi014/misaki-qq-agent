@@ -418,6 +418,9 @@ function mcpBlock() {
   ];
   const servers = [
     { id: 'mcp-napcat', script: path.join(REPO_ROOT, 'src', 'mcp-napcat-safe.js'), toolCallTimeoutMs: 725000 },
+    /* 2026-10-28 方案 A（主人拍板）：B 站投稿/数据能力走服务器上的 bili-cli，
+     * 由本地代理 ssh 接管 stdio；白名单与「默认私有投稿」闸都在代理里，见该文件头注释。 */
+    { id: 'mcp-bili', script: path.join(REPO_ROOT, 'src', 'mcp-bili-remote.js'), toolCallTimeoutMs: 1200000 },
     { id: 'mcp-napcat-host', script: path.join(REPO_ROOT, 'src', 'mcp-host-server.js') },
     { id: 'mcp-web-search-safe', script: path.join(REPO_ROOT, 'src', 'mcp-web-search-safe.js') },
     { id: 'mcp-filesystem', script: path.join(REPO_ROOT, 'node_modules', '@modelcontextprotocol', 'server-filesystem', 'dist', 'index.js'), extraArgs: fsRoots },

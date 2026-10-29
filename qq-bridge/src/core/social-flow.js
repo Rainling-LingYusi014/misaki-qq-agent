@@ -3,10 +3,12 @@ import { redactKnownTokensOnly } from '../lib/outbound-text.js';
 import { log } from '../lib/log.js';
 import { sanitizeForwardId } from '../forward.js';
 import { persistChatMessage, recentChatMessages, rememberContactName } from './memory.js';
-import { getSocialState, saveSocialState, social, seenForwardIds } from './social-state.js';
+import { getSocialState, saveSocialState, social, seenForwardIds, bracketReactionOf } from './social-state.js';
 import { messageMediaStore } from './session-state.js';
 import { currentMode } from './mode.js';
 import { resolveReplyInfo } from './message-cache.js';
+// 括号反馈（2026-10-29 主人定规）：入站动作性检测 → 实时档（lib/bracket-feedback.js）
+import { detectActionSignal, bracketFeedbackCfg } from '../lib/bracket-feedback.js';
 
 let cfgRef = null;
 export function initSocialFlowCore(cfg) { cfgRef = cfg; }
@@ -19,6 +21,9 @@ export function appendSocialMessage(key, sender, textContent, plainContent, quot
    * 失败绝不影响消息入库，所以整段吞异常。 */
   try { if (userId != null && sender) rememberContactName(userId, sender); } catch { /* 补名字失败不影响主流程 */ }
   const st = getSocialState(key);
+  /* 2026-10-28：对方回话了 → 解除"问完在等回答"的 hold（见 console-server 发送端点的 questionHoldMs）。
+   * 真人之间的节奏就是：问一句 → 等对方回 → 再说话。 */
+  st.awaitQuestionAt = 0;
   // 2026-10-26 陪伴模式：对方真发来消息 → 无回应退避解除（awaitingReplySince / 未回应连击清零）
   if (String(key).startsWith('private:') && st.agentMode === 'companion' && st.companionMode
     && (Number(st.companionMode.awaitingReplySince) > 0 || Number(st.companionMode.unansweredStreak) > 0)) {
@@ -26,10 +31,26 @@ export function appendSocialMessage(key, sender, textContent, plainContent, quot
     st.companionMode.unansweredStreak = 0;
     log(`[companion] ${key} 对方回话了，无回应退避解除`);
   }
+  // 2026-10-29 括号反馈：用户的动作性（摸摸头/抱一下/括号动作段…）→ 会话推入实时档并续时；
+  // 保持窗内没有新动作则自然过期落回普通档（发送瞬间按此刻判定，见 lib/bracket-feedback.js）。
+  try {
+    if (String(key).startsWith('private:') && st.agentMode === 'companion'
+      && bracketFeedbackCfg(cfgRef.social?.companionMode?.bracketFeedback).enabled
+      && bracketReactionOf(key)
+      && !isOwner && detectActionSignal(textContent)) {
+      const holdMs = bracketFeedbackCfg(cfgRef.social?.companionMode?.bracketFeedback).realtimeHoldMs;
+      const until = Date.now() + holdMs;
+      if (until > (Number(st.bracketSceneUntil) || 0)) log(`[BF] ${key} 检测到动作性 → 实时反馈（${Math.round(holdMs / 60000)} 分钟或直到动作停）`);
+      st.bracketSceneUntil = Math.max(Number(st.bracketSceneUntil) || 0, until);
+    }
+  } catch (eBf) { log(`[BF] 动作性检测异常 (${key}): ${eBf?.message ?? eBf}`); }
   const recentLimit = Number(cfgRef.social?.context?.recentLimit) || 100;
   const unreadLimit = Number(cfgRef.social?.context?.unreadLimit) || 30;
+  /* kind 维持 image/face 两档（识图管线与收藏表情都按 kind==='image' 走），
+   * 另加 sticker 标记区分"表情包 vs 照片"——只给回不回的策略用（2026-10-29）。 */
   const safeMedia = Array.isArray(media) ? media.map((m) => ({
     kind: m?.kind === 'face' ? 'face' : 'image',
+    sticker: m?.sticker === true,
     file: m?.file ? String(m.file) : undefined,
     url: m?.url ? String(m.url) : undefined,
     faceId: m?.faceId ? String(m.faceId) : undefined

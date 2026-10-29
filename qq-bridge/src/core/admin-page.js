@@ -3,8 +3,19 @@
  * /api/silent-sessions、/api/token-report、/api/friend-requests（新增：审批卡）。
  * 历史注记：/api/status 的 activity 字段在服务器版是 string，本页按 Array.isArray 双形态
  * 兼容（2026-10-26 手机实机验收抓出的登录死循环根因，勿回退成 (s.activity||[]).join）。
- * 本文件整体是一个模板字符串：内部 JS 一律 '+' 拼接，禁用反引号与 ${}；换行字面量写 \\n。 */
+ * 本文件整体是一个模板字符串：内部 JS 一律 '+' 拼接，禁用反引号与 ${}；换行字面量写 \\n。
+ * 2026-10-27：计费日换日时刻动态渲染（config dayOffsetMinutes；本部署 0=北京 00:00，主人定规与额度重置统一）。 */
+import { currentDayOffsetMin } from './token-meter.js';
+
+function dayCutText() {
+  const off = Number(currentDayOffsetMin()) || 0;
+  const hh = String(Math.floor(off / 60)).padStart(2, '0');
+  const mm = String(off % 60).padStart(2, '0');
+  return `北京 ${hh}:${mm}`;
+}
+
 export function adminPageHtml() {
+  const dayCut = dayCutText();
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -68,7 +79,7 @@ export function adminPageHtml() {
   <div class="card"><h2>今日用量（计费日）</h2><div class="kv" id="tok">…</div><p class="mut" style="margin-top:6px">预算闸当前关闭（social.budget 未配置即不限额）；要开启把额度写回 config.json 即热生效。</p></div>
 
   <div class="card"><h2>好友额度（按会话 · 计费日）</h2><div id="quota">…</div>
-  <p class="mut" style="margin-top:6px">计费日 = 北京 08:00 换日（与提供方控制台同口径）；点行展开近 14 天柱状图；¥ 为按 config.tokenCost 的估算（含高峰倍率）。系统内部 = 子代理/起标题等无会话归属的消耗。</p></div>
+  <p class="mut" style="margin-top:6px">计费日 = ${dayCut} 换日（config dayOffsetMinutes）；点行展开近 14 天柱状图；¥ 为按 config.tokenCost 的估算（含高峰倍率）。系统内部 = 子代理/起标题等无会话归属的消耗。</p></div>
 
   <div class="card"><h2>看门狗</h2><div id="guard" class="mut">…</div></div>
 

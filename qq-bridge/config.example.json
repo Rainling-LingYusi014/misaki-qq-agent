@@ -156,6 +156,16 @@
       "retentionDays": 7
     }
   },
+  "imageGen": {
+    "_note": "AI 生图（OpenRouter chat/completions + modalities:image，2026-10-27 定案）。apiKey 只放 config.json（gitignored）。大陆网络必须给 proxyUrl（本地 mihomo 生图专用入站 7891，IMGEN 组：日本/新加坡/美国 url-test 择优；通用 7890 的 HK 出口会被 OpenRouter 按 IP 地域 403）。Windows 默认钉死 C:\\Windows\\System32\\curl.exe，需要换二进制时用 curlBin。dailyImageLimit 只限非 owner（owner 豁免）。",
+    "provider": "openrouter",
+    "apiKey": "CHANGE_ME_OPENROUTER_KEY",
+    "baseUrl": "https://openrouter.ai/api/v1",
+    "model": "google/gemini-3.1-flash-lite-image",
+    "proxyUrl": "",
+    "curlBin": "",
+    "dailyImageLimit": 5
+  },
   "social": {
     "enabled": true,
     "autoReplyCheckMs": 30000,
@@ -206,10 +216,11 @@
       "biliDashboard": true
     },
     "budget": {
-      "_note": "token 预算闸（审查 P2-1；owner 私聊全豁免——用量照记、永不拦截）。dailyGlobal=全局日预算（含 owner 用量）；dailyPerConv=每会话日预算；dailyNonOwnerGlobal=非主人全局池（2026-10-28 开放好友：合计时剔除 owner 会话，主人自己的消耗不吃好友的池子）。0 或缺省=该级不限额。多级并存时任一超限即拦，提示报占比最紧的一级。本部署建议口径：单好友 50 万/天、好友池=600%（300 万/天，≈ DeepSeek Flash 峰段 ¥12 上限，实际因缓存命中与闲时半价远低于此）。",
+      "_note": "token 预算闸（审查 P2-1；owner 私聊全豁免——用量照记、永不拦截）。dailyGlobal=全局日预算（含 owner 用量）；dailyPerConv=每会话日预算；dailyNonOwnerGlobal=非主人全局池（2026-10-28 开放好友：合计时剔除 owner 会话）。0 或缺省=该级不限额。多级并存时任一超限即拦，提示报占比最紧的一级。【加权计费口径 2026-10-28 主人拍板】cacheRead 按面值全额计入会把缓存命中的 ~7万/轮前置按原价记账，朋友 8 轮即烧光 50 万面值（真实成本不足一毛）；现 cacheHitWeight（缺省 0.1）只作用于判限，days/convDaySums 分项仍存面值不失真。本部署建议口径：单好友 500 万/天（≈300 轮）、好友池=600%（3000 万/天）。",
       "dailyPerConv": 0,
       "dailyGlobal": 0,
-      "dailyNonOwnerGlobal": 0
+      "dailyNonOwnerGlobal": 0,
+      "cacheHitWeight": 0.1
     },
     "friendApproval": {
       "_note": "好友申请拟人化审批（2026-10-07）：黑名单秒拒、owner/白名单秒过；其余默认随机晾 minDelayMs~maxDelayMs 再自动通过并伪消息通报 owner。autoApprove=false = 手动模式（2026-10-28 开放好友，主人亲自审批）：桥不代批不挂定时器（重启恢复也不补批），只通报 owner 去 QQ 里亲自处理——通过后记得把对方加进 allow.private 私聊白名单，否则消息进不来。",
@@ -266,15 +277,20 @@
       "maxSendPerMinute": 8,
       "maxSendPerHour": 60,
       "maxMessageChars": 500,
+      "questionHoldMs": 180000,
+      "_questionHoldNote": "2026-10-28 主人定规：最后一条气泡是问句、对方还没回时，questionHoldMs 内拒绝新的发送调用（问完就等回答）；对方任意真消息立即解除；0 = 关闭。",
+      "questionHoldExemptChars": 200,
+      "_questionHoldExemptNote": "带图片的批次、或整批正文 ≥ 这个长度的发送不受 questionHoldMs 拦截（交付成品不该被误挡）；0 = 不按长度豁免。",
       "maxGapMs": 10000,
       "recommendedHint": "单条消息不要用空格断句，中文短句用逗号/顿号或直接连写；分条时每条都要读起来完整，不要把同一句话拆到两条里；普通闲聊建议一次 1~3 条，条间 1~3 秒；讲故事/回忆可以 5~10 秒间隔；不要连续刷屏。",
       "linearEnabled": true,
-      "linearPerCharMs": 150,
-      "linearMinMs": 250,
-      "linearCapMs": 4000,
+      "linearPerCharMs": 400,
+      "linearMinMs": 1800,
+      "linearCapMs": 20000,
       "linearJitterRatio": 0.25,
       "linearResetMs": 20000,
-      "_linearNote": "打字节拍只有这一种（按字数）：同一条回复里第 1 条气泡立即发，第 2 条起等 本条字数 × linearPerCharMs 毫秒（上下浮动 linearJitterRatio，夹在 linearMinMs~linearCapMs 之间）。linearEnabled=false = 完全不等。这些项都可以在 QQ 里用自然语言让机器人改（仅 owner 私聊可用）。旧的 linearBaseMs/linearStepMs/gapBaseMs/gapPerCharMs/gapJitterRatio 已废弃，写了也不生效。",
+      "replyBaseDelayMs": 2000,
+      "_linearNote": "打字节拍只有这一种（按字数）：每条气泡发出前等 本条字数 × linearPerCharMs 毫秒（上下浮动 linearJitterRatio，夹在 linearMinMs~linearCapMs 之间）；linearCapMs=20000 表示 50 字以内按真实字数算、不被 4 秒截断。replyBaseDelayMs = 会话静默超过 linearResetMs 后，第一条气泡先「看+想」多久再打（同一批第 2 条起不再加）。linearEnabled=false = 完全不等。这些项都可以在 QQ 里用自然语言让机器人改（仅 owner 私聊可用）。旧的 linearBaseMs/linearStepMs/gapBaseMs/gapPerCharMs/gapJitterRatio 已废弃，写了也不生效。",
       "musicCardStyle": "share",
       "musicCardOnly": false,
       "neteaseUct2": "",
@@ -311,12 +327,35 @@
       "enabled": true,
       "checkIntervalMinMs": 1800000,
       "checkIntervalMaxMs": 5400000,
-      "idleThresholdMs": 900000,
+      "idleThresholdMs": 1800000,
       "probability": 0.3,
       "privateProbability": 0.7,
       "freshContextOnly": false,
       "privateDailyMax": 2,
-      "_proactiveNote20261027": "freshContextOnly=true 时只有冷场窗口里有「新话题」才主动冒泡（实测私有默认 false）；privateDailyMax 是私聊主动冒泡的每日硬上限（与 budget 分开数，0=不限）。"
+      "privateDailyMin": 1,
+      "dailyMinWindowStart": "19:00",
+      "dailyMinWindowEnd": "22:30",
+      "_proactiveNote20261027": "freshContextOnly=true 时只有冷场窗口里有「新话题」才主动冒泡（实测私有默认 false）；privateDailyMax 是私聊主动冒泡的每日硬上限（与 budget 分开数，0=不限）。",
+      "_dailyMinNote": "2026-10-28 主人定规：常规模式私聊每天至少一次主动关心（陪伴模式有自己的参数档）。privateDailyMin=每天保底主动次数（0=关闭）；dailyMinWindowStart/End=保底窗口（北京时间，默认 19:00–22:30）。到期条件：今天没主动过 + 在窗口内 + 对方今天没说过话；到期时放宽 freshContextOnly，唤醒正文带 [Guide]。idleThresholdMs（冷场阈值）2026-10-28 起为 30 分钟。"
+    },
+    "poke": {
+      "_note": "拍一拍的开口策略（2026-10-28 主人定规）：单拍不追问；doubleTapMs 内第二下算『一连两下』，或 windowMs 内累计 count 下 → 问一次；问过之后 cooldownMs 内不再问。QQ 拍一拍本身有 ≥10 秒冷却，doubleTapMs 必须明显大于 10 秒（现在 15 秒）。计数按会话+发送者分开。",
+      "doubleTapMs": 15000,
+      "windowMs": 600000,
+      "count": 3,
+      "cooldownMs": 1800000,
+      "_backNote": "被拍时的回拍（2026-10-28 主人定规）：backProbability=回拍概率（0.5）；backCooldownMs=同一个人回拍过一次后的冷却；backDelayMinMs/MaxMs=回拍前的随机等待。回拍是桥侧纯动作，不唤醒模型、不带任何文字。",
+      "backProbability": 0.5,
+      "backCooldownMs": 1800000,
+      "backDelayMinMs": 3000,
+      "backDelayMaxMs": 12000
+    },
+    "shortReply": {
+      "_note": "低信息量消息（owo / 表情 / 单字）『这一轮回不回』的抽签（2026-10-28 主人定规）：不回是被允许的，但不是一律不回——桥每轮掷一次骰，正文里出现 [Dice] SILENT/REPLY 就照它办。silenceProbability 是沉默概率（0.5 = 一半左右）；maxChars 是『有正话』的字数门槛；applyToOwner=false 时 owner 私聊不进抽签（那边走及时回）。只作用于私聊，群聊仍由模型按 [WAKE TYPES] 15 自己判断。",
+      "enabled": true,
+      "silenceProbability": 0.5,
+      "maxChars": 4,
+      "applyToOwner": false
     },
     "feedback": {
       "maxLength": 500,
@@ -382,18 +421,33 @@
       "passthroughSuffixes": []
     },
     "companionMode": {
-      "_note": "陪伴模式参数（具体数值可随时调）：checkInterval 主动关心检查间隔；idleThresholdMs 冷场阈值；dailyMax 每日主动上限（与常规模式 2 次配额分开计数）；quietStart/quietEnd 静默时段（北京时间，不主动关心）；unansweredWindowMs 主动后多久没回算无回应；unansweredStreakLimit 连续无回应几次后降档到 backoffDailyMax；typingHoldMaxMs/typingRefreshMs 打字等待；allowedTools 陪伴回合可用工具白名单（桥侧强制）。",
+      "_note": "陪伴模式参数（具体数值可随时调）：checkInterval 主动关心检查间隔；idleThresholdMs 冷场阈值；dailyMax 每日主动上限（与常规模式 2 次配额分开计数）；quietStart/quietEnd 静默时段（北京时间，不主动关心）；unansweredWindowMs 主动后多久没回算无回应；unansweredStreakLimit 连续无回应几次后降档到 backoffDailyMax；typingHoldMaxMs/typingRefreshMs 打字等待；splitOverChars 长气泡下限（超过这个字数不许整条发：至少两条，1.8 倍以上三条；条数 70/25/5 由骰子分配）；allowedTools 陪伴回合可用工具白名单（桥侧强制）。打字节拍全局统一走 social.send，这里不再单独放 linear*。",
       "checkIntervalMinMs": 2400000,
       "checkIntervalMaxMs": 5400000,
       "idleThresholdMs": 600000,
       "dailyMax": 3,
       "quietStart": "23:30",
-      "quietEnd": "07:30",
+      "quietEnd": "07:00",
+      "bracketFeedback": {
+        "_note": "高级反馈（2026-10-29 主人定规，仅陪伴模式生效）：**每位用户默认关闭**，要括号反馈必须自己发 misaki@reaction 打开（按钮式，再发一次关闭，桥直接回执，状态按会话存、模式来回切换与 misaki@reset 都不重置）。打开后她可以用括号表达动作/表情/心理（半角 ()，代码层把全角归一）。档位由「用户的动作性」自动判：对方做出动作 → 实时档 100% 保留；realtimeHoldMs 内无新动作自动落回普通档；普通档每个气泡独立掷 (normalBasePct + x)%，x 现掷 0~normalXMax。单气泡最多两段（twoSegmentPct）。心理类不降档。**动作类另有去重**：同一个动作段在最近 actionRepeatBubbles（默认 6）个气泡内不允许出现完全相同的串，命中就砍（砍光就发不带括号的版本，不替换）；表情/神态/心理活动暂不受此限。常规模式一律不出括号，与开关无关。这里的 enabled 是部署总闸（false = 全站关掉，指令也打不开）。 **实时档整句变形（2026-10-29）**：先掷动作链 chainPct=8%（命中后 2 条 chainTwoPct=67%、否则 3 条），一串动作/文字只算回应对方的一句话；链没中再掷单个纯动作反馈 singleActionPct=8%（只发一个括号段、文字省略，原话超过 actionOnlyMaxTextChars=20 字则不许代替）；都没中才逐气泡成形。普通档两个骰子都不掷。",
+        "enabled": true,
+        "realtimeHoldMs": 300000,
+        "normalBasePct": 10,
+        "normalXMax": 30,
+        "twoSegmentPct": 10,
+        "maxSegmentChars": 12,
+        "actionRepeatBubbles": 6,
+        "chainPct": 8,
+        "chainTwoPct": 67,
+        "singleActionPct": 8,
+        "actionOnlyMaxTextChars": 20
+      },
       "unansweredWindowMs": 21600000,
       "unansweredStreakLimit": 2,
       "backoffDailyMax": 1,
       "typingHoldMaxMs": 45000,
       "typingRefreshMs": 5000,
+      "splitOverChars": 40,
       "allowedTools": [
         "reply",
         "sendMessage",
@@ -405,6 +459,19 @@
         "memoryRemember",
         "memorySearch",
         "memory"
+      ]
+    },
+    "morningGreet": {
+      "_note": "早安问候（2026-10-29 主人定规）：白名单私聊每天必问一次，骰子只决定落在哪个窗口（p1=窗口1概率，窗口2=1-p1），分钟在窗内随机。不占主动配额；「对方今天已先开口/今天已问过/陪伴静默时段/免打扰」则当天跳过，不补发。privateExcludeUids（proactive 的不粘人名单）对它同样生效。enabled=false 整体关掉。",
+      "enabled": true,
+      "p1": 0.33,
+      "window1": [
+        "07:00",
+        "08:00"
+      ],
+      "window2": [
+        "08:00",
+        "09:00"
       ]
     },
     "bilibili": {

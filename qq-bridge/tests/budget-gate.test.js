@@ -94,3 +94,26 @@ test('预算闸门：非主人池 + 每会话并存时报告更紧的（2026-10-
   assert.equal(r.ok, false);
   assert.equal(r.scope, 'conv'); // 120/100(conv) > 池占比（池限额放大到不构成约束）
 });
+
+test('预算闸门：缓存命中读取按加权计费（2026-10-28 加权口径，主人拍板）', () => {
+  const dir = tmpStateDir();
+  initTokenMeter({ stateDir: dir, convKeyResolver: () => 'private:333' });
+  // 面值 100+90000+50=100150；加权(缺省 0.1)=100+round(90000*0.1)+50=9150 < 10000 → 放行
+  setTokenBudgetCfg({ dailyPerConv: 10000 });
+  meterTokenFrame({ sessionId: 'w1', type: 'usage', usage: { prompt_tokens: 100, completion_tokens: 50, cache_read_tokens: 90000 } });
+  const r = checkTokenBudget('private:333');
+  assert.equal(r.ok, true, '缓存打 1 折后不应超限（面值口径会误拦）');
+  assert.equal(r.used, 9150);
+});
+
+test('预算闸门：cacheHitWeight=1 回到面值口径，0=缓存不计费', () => {
+  const dir = tmpStateDir();
+  initTokenMeter({ stateDir: dir, convKeyResolver: () => 'private:444' });
+  meterTokenFrame({ sessionId: 'w2', type: 'usage', usage: { prompt_tokens: 100, completion_tokens: 50, cache_read_tokens: 90000 } });
+  setTokenBudgetCfg({ dailyPerConv: 10000, cacheHitWeight: 1 });
+  assert.equal(checkTokenBudget('private:444').ok, false); // 面值 100150 > 10000
+  setTokenBudgetCfg({ dailyPerConv: 10000, cacheHitWeight: 0 });
+  const r0 = checkTokenBudget('private:444');
+  assert.equal(r0.ok, true);
+  assert.equal(r0.used, 150); // 缓存免费：只剩 prompt+completion
+});

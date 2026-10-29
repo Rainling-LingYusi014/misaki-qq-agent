@@ -192,6 +192,8 @@ import {
   clearSocialTimers, clearAllSocialTimers, resetConversationKeepingLedger,
   applyMisakiCommand, setStopNote, setResetExecutor, armPendingReset, cancelPendingReset,
   conversationMode,
+  // 2026-10-29 misaki@reaction：括号反馈总开关（按会话，按钮式翻转）
+  bracketReactionOf, toggleBracketReaction,
 } from './social-state.js';
 // misaki@ 指令解析（纯函数，见 companion-mode.js）
 import { parseMisakiCommand, STOP_ACK_TEXT, NOTHING_TO_STOP_TEXT, RESET_DONE_TEXT, fmtWanTokens, helpText } from './companion-mode.js';
@@ -643,9 +645,28 @@ function isDuplicateInbound(key, messageId) {
       // 一次性动作指令（桥层直接执行，不进模型）。锁定期取消已在上面统一处理（指令也算消息）。
       if (mcmd.kind === 'action-help') {
         // 2026-10-27：help 传入当前会话模式——模式指令行据此标（当前）
-        const text = helpText(conversationMode(key));
+        // 2026-10-29：再传括号反馈开关状态——reaction 行显示（当前：开/关）
+        const text = helpText(conversationMode(key), bracketReactionOf(key));
         try { await sendToQQ(key, text, { single: true }); } catch (e) { log(`[misaki-cmd] 回执失败 ${key}: ${e?.message ?? e}`); }
         try { recordSentMessages(key, [{ text }]); } catch {}
+        return;
+      }
+      if (mcmd.kind === 'action-reaction') {
+        /* 2026-10-29 主人定规：陪伴模式括号反馈总开关。按钮式——输一次翻一次，桥直接回执零 token。
+         * 只管「加不加括号动作」，不动模式本身；常规模式下开关状态保留，切回陪伴即生效。 */
+        let on = true;
+        let text;
+        try {
+          on = toggleBracketReaction(key);
+          text = on
+            ? '陪伴模式反馈总开关：已打开（陪伴模式下她会按场景在括号里带一点动作和表情）。'
+            : '陪伴模式反馈总开关：已关闭（陪伴模式下不再加括号动作）。';
+        } catch (e) {
+          log(`[misaki-cmd] 反馈开关翻转失败 ${key}: ${e?.message ?? e}`);
+          text = '开关没翻过来（状态没存上），请再发一次 misaki@reaction 试试。';
+        }
+        try { await sendToQQ(key, text, { single: true }); } catch (e) { log(`[misaki-cmd] 开关回执失败 ${key}: ${e?.message ?? e}`); }
+        try { recordSentMessages(key, [{ text }]); } catch { /* 回执入库失败不影响主流程 */ }
         return;
       }
       if (mcmd.kind === 'action-stop') { await handleMisakiStop(key); return; }
@@ -997,7 +1018,10 @@ function isDuplicateInbound(key, messageId) {
     // 中途曾按"不读取任何消息"改成全会话静默，之后纠回"只静默群聊"，所以这里恢复原来的群聊范围。
     // 保留的只是两处"堵漏"（都只对群生效，见 events-aux.js 的拍一拍 与 console-server.js 的等待路由）：
     // 改之前拍一拍能绕过本函数的守卫直接 scheduleWake，deepsleep 期间群里被拍一下照样会醒 —— 那是漏洞，不是设计。
-    const sender = kind === 'group' ? (event.sender?.card || event.sender?.nickname || String(event.user_id)) : '私聊';
+    // 2026-10-29 修：私聊不再把 "私聊" 这个显示标签当昵称传下去——它会经 rememberContactName
+    // 写进 profiles.name，而那个人一旦有了名字就不再被覆盖（四个好友的画像全变成"私聊"，不可自愈）。
+    // 私聊事件的 sender.nickname 就是好友昵称；取不到才退回号码。
+    const sender = event.sender?.card || event.sender?.nickname || String(event.user_id ?? '');
     // 转发（合并聊天记录）自动展开：把收到的 forward 段内容就地展开成可读文本，
     // 让 AI 无需额外调用 qq_get_forward_msg 就能看到“对方转发里到底说了什么”，
     // 避免消息里只有 [转发消息 id=…] 占位符时 AI 因为读不到内容而整条忽略。
@@ -1546,6 +1570,21 @@ export async function pumpMux() {
                     stUd.pendingUndeliveredText = undelivered;
                     stUd._undeliveredAt = Date.now();
                     saveSocialState();
+                    /* 2026-10-29 自愈唤醒（真机事故 10:55 主人私聊）：模型连写四轮正文都没调发送工具，
+                     * 用户侧表现是"她突然不回了"，而下一次唤醒遥遥无期——没人再说话，草稿就一直躺着。
+                     * 25s 后补一次真实触发型唤醒（reason='private'，能带上 [Undelivered draft] 行），
+                     * 给模型一次补发机会。10 分钟内只补一次，防连环空转；真实消息照常先到先醒。 */
+                    const lastRetry = Number(stUd._undeliveredRetriedAt) || 0;
+                    if (Date.now() - lastRetry > 10 * 60 * 1000) {
+                      stUd._undeliveredRetriedAt = Date.now();
+                      if (stUd._undelivRetryTimer) clearTimeout(stUd._undelivRetryTimer);
+                      stUd._undelivRetryTimer = setTimeout(() => {
+                        stUd._undelivRetryTimer = null;
+                        try { sendWakePrompt(key, 'private').catch(() => {}); } catch { /* 自愈唤醒失败不影响主流程 */ }
+                      }, 25 * 1000);
+                      stUd._undelivRetryTimer.unref?.();
+                      log(`[selfheal] ${key} 本轮正文未走发送工具 → 25s 后补一次唤醒让她补发（10 分钟内只补一次）`);
+                    }
                   }
                 }
               } catch (eUd) { log(`[default] 暂存未发出正文失败 (${key}): ${eUd?.message ?? eUd}`); }

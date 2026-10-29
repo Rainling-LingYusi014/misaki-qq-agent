@@ -84,11 +84,14 @@ consoleSrv.startConsoleServer();
 
 const KEY = 'group:868756515';
 const TOKEN = '868756515';                    // 会话令牌 = 会话本体（群号），见 social-state.fixedTokenForKey
+/* 2026-10-28：控制台 2026-10-25 起 fail-closed（所有 /api/* 都要 x-console-token），
+ * 这个用例当时没跟上，整条 npm run check 从这里断掉。令牌由 console-server 启动时写进 state/console-token。 */
+const CONSOLE_TOKEN = fs.readFileSync(path.join(sandbox, 'state', 'console-token'), 'utf8').trim();
 const posts = [];
 const post = async (payload) => {
   const res = await fetch(`http://127.0.0.1:${consolePort}/api/social/send-message`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-agent-token': TOKEN },
+    headers: { 'content-type': 'application/json', 'x-agent-token': TOKEN, 'x-console-token': CONSOLE_TOKEN },
     body: JSON.stringify(payload),
   });
   const json = await res.json().catch(() => ({}));

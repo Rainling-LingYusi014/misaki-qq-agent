@@ -47,3 +47,22 @@ export function cleanOutboundText(text) {
   const swept = sweepMessageArtifacts(text);
   return stripImeEmoji(swept.text);
 }
+
+/**
+ * 闲聊短句的句尾句号（2026-10-28 主人：「正常人聊天打字不会额外打句号」）。
+ *
+ * 现场是「收下啦。」——一条三个字的短句还挂个句号，读起来像公文。但主人也说了
+ * 「完全禁用掉又不现实、不合适」：长段落、正式说明、多条陈述里句号是对的。
+ * 所以只在最明显的那一类上兜底：**单行、不超过 maxChars 字、结尾是「。」** 的气泡，
+ * 把最后一个句号摘掉。多句混排、带换行、带链接、以引号/括号收尾的一律不动。
+ *
+ * 说明：这是提示词之外的第二道，专防"规则写了但她偶尔照旧"；长文本的句读交给模型自己判断。
+ */
+export function trimCasualPeriod(text, { maxChars = 20 } = {}) {
+  const s = String(text ?? '');
+  if (!s || !/。$/.test(s)) return s;
+  if (s.length > Math.max(1, Number(maxChars) || 20)) return s;
+  if (/[\n\r]/.test(s)) return s;
+  if (/https?:\/\/|www\./i.test(s)) return s;
+  return s.slice(0, -1);
+}

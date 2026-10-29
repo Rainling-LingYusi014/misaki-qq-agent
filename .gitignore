@@ -12,3 +12,6 @@ node_modules/
 .runtime/
 *.bak
 *.bak-*
+
+# 测试运行时自拷的沙箱
+tests/.tmp-*

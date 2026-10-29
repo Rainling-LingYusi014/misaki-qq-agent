@@ -71,6 +71,7 @@ import { isEmojiLikeCp, stripImeEmoji } from './lib/emoji.js';
 import { singleLineForQQ, splitLongSegment } from './lib/segment.js';
 import { mimeFromBuffer, mimeFromUrl, base64FromMaybe } from './lib/media-meta.js';
 import { log, appendActivity, readActivityTail } from './lib/log.js';
+import { scheduleStateSnapshots } from './lib/state-snapshot.js';
 import { SILENT_MARKER, isSilentMarker, SEND_TOOL_RE, isSendToolName, SPACE_SPLIT_HINT, DIRECTION_HINT } from './lib/markers.js';
 import { state, loadConfig, loadState, saveState, watchConfigFile } from './core/config.js';
 import { acquireLock, releaseLock } from './core/runtime.js';
@@ -221,6 +222,8 @@ import {
   // 人设已合成进系统提示词 → 启动时给"没见过当前人设版本"的会话标记一次补注入
   markStalePersonaReinjects,
   clearSocialTimers, clearAllSocialTimers,
+  // 2026-10-29 早安问候：开机按（会话+日期）骰子重算当日时刻，幂等重排（lib/morning-greet.js）
+  scheduleAllMorningGreets,
 } from './core/social-state.js';
 import {
   loadScheduledTasks, parseScheduledAt, createScheduledTask, cancelScheduledTask, setScheduledRecorder,
@@ -353,7 +356,13 @@ async function main() {
   // NapCat 会话守护（2026-10-26 半版）：get_rkey 探针 + 报警（不自动重启；密码回退激活后开 autoHeal）。
   // 为什么需要：静默死两次亲历（2026-09-16 泠娜 / 2026-10-25 本部署）——TCP 活着、isLogin 仍 true，
   // 只有 get_rkey（真打腾讯服务器）能逮住。
-  initNapcatGuard(cfg, { callAction: (action, params) => bot.raw(action, params), send: (key, text) => sendToQQ(key, text) });
+  initNapcatGuard(cfg, {
+    callAction: (action, params) => bot.raw(action, params),
+    send: (key, text) => sendToQQ(key, text),
+    // 2026-10-28 静默探测：桥最近一条真实事件（心跳不算）。探针全绿但消息进不来的那种半死状态，
+    // 只有"桥的水位 vs NapCat 最近联系人最新消息"这个比对逮得住（见 napcat-guard.js）。
+    getLastEventAt: () => (bot && bot.lastRealEventAt) || 0,
+  });
   // 发送抽签（语音 / 表情包的概率与冷却）：桥侧掷骰后写进唤醒正文，不让模型自己猜概率
   initSendDice(cfg);
   initTokenMeter(cfg);
@@ -787,10 +796,16 @@ async function main() {
     }
   })();
   log('桥接已启动。按 Ctrl+C 退出。');
+  /* 2026-10-29 主人定：状态每日快照（保留 7 天）。启动时做一份，之后每小时检查一次；
+   * 同一天只做一次，所以重启不会刷出一堆。事故背景见 lib/state-snapshot.js 顶部。 */
+  try { scheduleStateSnapshots({ stateDir: STATE_DIR, root: ROOT, keepDays: 7, log }); }
+  catch (error) { log(`[snapshot] 启动失败: ${error?.message ?? error}`); }
   // 恢复定时发消息任务（需在所有 const 定义之后调用）
   try { loadScheduledTasks(); } catch (error) { log(`[scheduled] 恢复定时任务失败: ${error?.message ?? error}`); }
   // 恢复待审批好友申请（拟人化延迟审批；过期条目加抖动后立即补审）
   try { loadFriendRequests(); } catch (error) { log(`[friend] 恢复待审批申请失败: ${error?.message ?? error}`); }
+  // 2026-10-29 早安问候：开机为所有已知私聊重排今天的时刻（窗口已过则自动排明天，不补发）
+  try { scheduleAllMorningGreets(); } catch (error) { log(`[morning] 启动排程失败: ${error?.message ?? error}`); }
   // 2026-10-28 审查 P3-10：启动清扫崩溃残留的原子写临时文件（只删 1 小时前的 *.tmp）
   try { const swept = sweepStaleTmpFiles(STATE_DIR); if (swept) log(`[state] 启动清扫：删掉 ${swept} 个崩溃残留的 .tmp 临时文件`); } catch { /* 清扫失败不影响启动 */ }
   try { loadDocxQuota(); } catch (error) { log(`[docx] 恢复每日额度失败: ${error?.message ?? error}`); }

@@ -1176,10 +1176,24 @@ export function startTokenReconcile(intervalMs = 5 * 60 * 1000) {
  *   social.budget.dailyGlobal  全局日预算（计费输入+输出 token 数）
  *   social.budget.dailyPerConv 每会话日预算
  *   social.budget.dailyNonOwnerGlobal 非主人全局日预算（2026-10-28 开放好友：合计剔除 owner 会话）
+ *   social.budget.cacheHitWeight 缓存命中读取的计费权重（2026-10-28 主人拍板改加权口径，
+ *     缺省 0.1；0=缓存不计费，1=回到面值口径）
  * 口径与 getTokenReport 一致：billingKey（默认 UTC 日 / 北京 08:00 换日）。
- * 注意：计费输入 = 未命中prompt + cacheRead + cacheWrite（与 days 聚合的口径一致，
- * 见 addReal 注释），输出 = completion。
+ * 注意：计费输入 = 未命中prompt + cacheRead×cacheHitWeight + cacheWrite（days 聚合仍存
+ * 面值分项，加权只发生在判限这一步——原始数据不失真），输出 = completion。
  * ════════════════════════════════════════════════════════════════════════ */
+/* 加权计费（2026-10-28 主人拍板）：此前 cacheRead 按面值全额入账，而美咲每轮携带 ~7 万
+ * token 前置、缓存命中近 100%——朋友聊 8 轮就"烧光"50 万面值额度（真实成本不足一毛钱），
+ * 计量表把打折价的东西按原价记账。现改为：缓存命中读取按 cacheHitWeight 折算（DeepSeek
+ * 命中价约为原价 1/10），prompt/completion/cacheWrite 权重不变。 */
+function budgetCacheHitWeight() {
+  const w = Number(meter.budgetCfg && meter.budgetCfg.cacheHitWeight);
+  return Number.isFinite(w) && w >= 0 && w <= 1 ? w : 0.1;
+}
+function billWeighted(v) {
+  if (!v) return 0;
+  return (v.prompt || 0) + (v.completion || 0) + Math.round((v.cacheRead || 0) * budgetCacheHitWeight()) + (v.cacheWrite || 0);
+}
 export function checkTokenBudget(convKey, opts = {}) {
   ensureInit();
   const budget = meter.budgetCfg || {};
@@ -1199,13 +1213,13 @@ export function checkTokenBudget(convKey, opts = {}) {
   if (!gLimit && !cLimit && !noLimit) return { ok: true, used: 0, limit: 0, scope: null };
   const nowTs = opts.nowMs != null ? Number(opts.nowMs) : Date.now();
   const todayKey = billingKey(nowTs);
-  const bill = (v) => v ? (v.prompt + v.completion + v.cacheRead + v.cacheWrite) : 0;
+  /* 加权计费口径（cacheRead×cacheHitWeight），days/convDaySums 分项仍是面值 */
+  const bill = billWeighted;
   /* 多级都配时：任一超限都拦；报告"占比最紧的那个"。与原两级判据同语义，统一成比较式。 */
   const cands = [];
   if (gLimit) {
     const agg = meter.days.get(todayKey);
-    // days 聚合存的是 prompt/completion/cacheRead/cacheWrite 分项（addReal），与 bill 口径一致
-    cands.push({ used: agg ? (agg.prompt + agg.completion + agg.cacheRead + agg.cacheWrite) : 0, limit: gLimit, scope: 'global' });
+    cands.push({ used: billWeighted(agg), limit: gLimit, scope: 'global' });
   }
   if (noLimit) {
     let noUsed = 0;
@@ -1239,10 +1253,10 @@ export function currentDayOffsetMin() {
 }
 
 /** 今日（计费日，由 config dayOffsetMinutes 定换日时刻；本部署=北京自然日 00:00）全局用量与换日键：
- * misaki@credits 显示用，与 checkTokenBudget 的全局分支同口径（prompt+completion+cacheRead+cacheWrite）。 */
+ * misaki@credits 显示用，与 checkTokenBudget 的全局分支同口径（加权计费：cacheRead×cacheHitWeight）。 */
 export function todayBillingUsage() {
   ensureInit();
   const key = billingKey(Date.now());
   const agg = meter.days.get(key);
-  return { todayKey: key, used: agg ? (agg.prompt + agg.completion + agg.cacheRead + agg.cacheWrite) : 0 };
+  return { todayKey: key, used: billWeighted(agg) };
 }

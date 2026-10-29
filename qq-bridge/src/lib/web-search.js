@@ -553,7 +553,9 @@ async function stackSearch(query) {
 
 /** B 站视频搜索（官方 JSON API；"这首/这个视频"类问题直接给视频而不是网页） */
 async function bilibiliPlatformSearch(query) {
-  const { videoSearch: biliVideoSearch } = await import('./core/video.js');
+  // 2026-10-28：路径曾是 ./core/video.js（解析成 src/lib/core/video.js，永远 Cannot find module），
+  // 每次搜索都白报一条 bilibili 失败；video.js 在 src/core 下。
+  const { videoSearch: biliVideoSearch } = await import('../core/video.js');
   const r = await biliVideoSearch(query, { limit: 8 });
   return (r.results || []).map((v) => ({
     title: v.title,

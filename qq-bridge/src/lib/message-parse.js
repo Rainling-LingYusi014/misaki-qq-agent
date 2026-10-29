@@ -38,10 +38,14 @@ export async function segmentsToText(segments, options = {}) {
         out.push(fname ? `[表情:${fname}(${fid})]` : `[表情${fid}]`);
         break;
       }
-      case 'image': out.push('[图片]'); break;
+      /* 图片段按 QQ 给的类型分开渲染：表情包写成 [动画表情]，照片写 [图片]。
+       * 光写 [图片] 会让模型（和低信息量骰子）把一张美食照和一张贴纸当成同一种东西。 */
+      case 'image': out.push(imageKindOf(d) === 'sticker' ? '[动画表情]' : '[图片]'); break;
       case 'record': out.push('[语音]'); break;
       case 'video': out.push('[视频]'); break;
-      case 'file': out.push(fileMarker(d.name, d.size)); break;
+      /* OneBot v11 文件段的标准字段是 file / file_id / file_size，没有 name；
+       * 2026-10-28 主子私聊实测：只读 d.name 会把每个收到的文件都渲染成「未命名文件 · 未知类型」。 */
+      case 'file': out.push(fileMarker(d.name ?? d.file_name ?? d.file, d.size ?? d.file_size)); break;
       case 'reply': {
         // 引用/回复段：默认解析成「被引用人 + 原文」，让 AI 能判断这句话是对谁说的；
         // includeReply=false 时跳过该段，得到“当前消息自己的文字”（用于指令/指向性判断）。
@@ -336,17 +340,39 @@ export function parseJsonCardText(jsonData) {
 
 // 从 OneBot 消息段中提取图片/表情元数据（不下载字节，仅记录定位信息）。
 // 供一代自动内联、default按需工具、控制台/日志使用。
+/* 2026-10-29 「表情包 vs 照片」：以前这里读 `d.subType`（驼峰），而 NapCat 收到消息时给的是
+ * `sub_type`（下划线，见 NapCat 的 createValidSendPicElement 反向映射），所以永远读到空串；
+ * 结果照片和表情包在桥里长得一模一样，骰子只能一视同仁。现在两种写法都认，并且优先信 summary：
+ *   summary='[图片]'      → 普通图片
+ *   summary='[动画表情]'  → 动画表情（QQ 的 picSubType≠0）
+ *   其它非空 summary      → 商城表情（summary 是那个表情的名字）
+ * 判不出来才退回 sub_type 数字。 */
+export function imageKindOf(data = {}) {
+  const d = data || {};
+  const summary = String(d.summary ?? '').trim();
+  if (summary) return summary === '[图片]' ? 'image' : 'sticker';
+  const sub = d.sub_type != null ? d.sub_type : d.subType;
+  if (sub != null && String(sub).trim() !== '' && String(sub).trim() !== '0') return 'sticker';
+  return 'image';
+}
+
 export function extractMediaFromSegments(segments) {
   const media = [];
   for (const seg of segments ?? []) {
     if (!seg || typeof seg !== 'object') continue;
     const d = seg.data ?? {};
     if (seg.type === 'image') {
+      const sub = d.sub_type != null ? d.sub_type : d.subType;
+      const isSticker = imageKindOf(d) === 'sticker';
       media.push({
+        /* kind 仍然是 'image' —— 识图管线（core/media-pipe.js）和收藏表情（core/sticker.js）
+         * 都靠 `kind === 'image'` 决定要不要处理这张图，改 kind 会把表情包直接排除在外。
+         * 新增的 `sticker` 标记只给"回不回"的判定用。 */
         kind: 'image',
+        sticker: isSticker,
         file: String(d.file ?? ''),
         url: String(d.url ?? ''),
-        subType: d.subType != null ? String(d.subType) : '',
+        subType: sub != null ? String(sub) : '',
         summary: String(d.summary ?? '')
       });
     } else if (seg.type === 'face') {
@@ -409,23 +435,28 @@ export function fileMarker(name, size) {
 
 // 从 OneBot 消息段中提取文件段元数据（md/txt/word 等），供“读取文件内容”能力使用。
 // 不下载字节，只记录定位信息：file=OneBot 文件标识（用于 get_file）、url=直链、name=文件名。
+// 2026-10-28 修正字段口径：OneBot v11 私聊文件段是 {file, file_id, file_size}，
+// 没有 name；把 file 当 file_id 会让 get_file 永远 file not found（主子 16:02 的 docx 实测）。
 export function extractFilesFromSegments(segments) {
   const files = [];
   for (const seg of segments ?? []) {
     if (!seg || typeof seg !== 'object') continue;
     if (seg.type !== 'file') continue;
     const d = seg.data ?? {};
-    const name = String(d.name ?? d.file ?? '');
+    const name = String(d.name ?? d.file_name ?? d.file ?? '');
+    const rawSize = d.size ?? d.file_size;
+    const size = rawSize != null && Number.isFinite(Number(rawSize)) ? Number(rawSize) : null;
     files.push({
       name,
-      fileId: String(d.file ?? ''),
+      /* file_id 才是 get_file 的入参；没有 file_id 的老段/上游实现退回 file（可能本身就是 id）。 */
+      fileId: String(d.file_id ?? d.file ?? ''),
       url: String(d.url ?? ''),
-      size: d.size != null ? Number(d.size) : null,
+      size,
       /* 2026-09-22：类型也随消息一起记下来：唤醒正文的 `[file:…]` 标记要用它，
        * 免得模型把"发过来的一个 PDF"当成图片（kind/ext 都在这里，老状态里没有时按名字现算）。 */
       ext: (/\.([A-Za-z0-9]{1,8})$/.exec(name)?.[1] || '').toLowerCase(),
       kind: fileKindLabel(name),
-      marker: fileMarker(name, d.size)
+      marker: fileMarker(name, size)
     });
   }
   return files;
@@ -496,7 +527,20 @@ export async function parseFileBuffer(buf, name) {
   return { text: truncated ? text.slice(0, 20000) + `\n…（内容过长已截断，共 ${text.length} 字符）` : text, truncated };
 }
 
-// 下载文件字节：优先直链 url，否则 OneBot get_file 拿容器路径再 docker exec 读取。
+// 下载文件字节：优先直链 url；否则 OneBot get_file。三种返回形态都认：
+//   ① data.base64（NapCat 私聊文件实测会带）—— 不依赖路径与容器，最稳
+//   ② data.file 是本机绝对路径（Windows 原生 NapCat）—— 直接 fs 读
+//   ③ data.file 是容器内 POSIX 路径（服务器 Docker）—— docker exec napcat cat
+// 2026-10-28 之前只走 ③，且把文件名当 file_id：本地部署收文件必失败（主子 docx 实测）。
+const MAX_FILE_BYTES = 20 * 1024 * 1024;
+
+function looksLocalAbsolute(p) {
+  if (!p) return false;
+  if (/^[A-Za-z]:[\\/]/.test(p)) return true;   // C:\... / C:/...
+  if (/^\\\\[^\\]/.test(p)) return true;        // UNC \\server\share
+  return false;
+}
+
 export async function fetchFileBytes(file, napcatCfg) {
   const url = String(file.url || '');
   if (url && /^https?:\/\//i.test(url)) {
@@ -504,23 +548,45 @@ export async function fetchFileBytes(file, napcatCfg) {
     if (result && result.buffer && result.buffer.length > 0) return result.buffer;
   }
   const fileId = String(file.fileId || '');
-  if (fileId) {
-    const httpBase = String(napcatCfg?.httpUrl || 'http://127.0.0.1:3000');
-    const token = String(napcatCfg?.accessToken || napcatCfg?.wsAccessToken || '');
-    const headers = token ? { Authorization: `Bearer ${token}` } : {};
-    const resp = await fetch(`${httpBase}/get_file?file=${encodeURIComponent(fileId)}`, { headers, signal: AbortSignal.timeout(20000) });
-    if (resp.ok) {
-      const data = await resp.json();
-      const containerPath = data?.data?.file;
-      if (containerPath && /^[\/\w.\- ]+$/.test(String(containerPath))) {
-        const buf = await execFileBuffer('docker', ['exec', 'napcat', 'cat', String(containerPath)], 10 * 1024 * 1024);
-        if (buf && buf.length > 0) return buf;
-      }
-      throw new Error(`get_file 未返回可用路径（${data?.message ?? '未知错误'}）`);
-    }
-    throw new Error(`get_file 请求失败（HTTP ${resp.status}）`);
+  if (!fileId) throw new Error('文件缺少直链与 fileId，无法获取');
+  const httpBase = String(napcatCfg?.httpUrl || 'http://127.0.0.1:3000');
+  const token = String(napcatCfg?.accessToken || napcatCfg?.wsAccessToken || '');
+  const headers = token ? { Authorization: `Bearer ${token}` } : {};
+  const resp = await fetch(`${httpBase}/get_file?file=${encodeURIComponent(fileId)}`, { headers, signal: AbortSignal.timeout(20000) });
+  if (!resp.ok) throw new Error(`get_file 请求失败（HTTP ${resp.status}）`);
+  const data = await resp.json().catch(() => ({}));
+  if (Number(data?.retcode) > 0) throw new Error(`get_file 失败：${data?.message ?? `retcode ${data.retcode}`}`);
+  const d = data?.data ?? {};
+  if (typeof d.base64 === 'string' && d.base64.length > 0) {
+    const buf = Buffer.from(d.base64, 'base64');
+    if (buf.length > MAX_FILE_BYTES) throw new Error('文件超过 20MB 上限');
+    if (buf.length > 0) return buf;
   }
-  throw new Error('文件缺少直链与 fileId，无法获取');
+  const p = String(d.file ?? d.url ?? '');
+  const readLocal = () => {
+    const st = fs.statSync(p);
+    if (st.size > MAX_FILE_BYTES) throw new Error('文件超过 20MB 上限');
+    return fs.readFileSync(p);
+  };
+  const readDocker = async () => {
+    const buf = await execFileBuffer('docker', ['exec', 'napcat', 'cat', p], MAX_FILE_BYTES);
+    if (buf && buf.length > 0) return buf;
+    throw new Error('docker exec 未读到文件');
+  };
+  // Windows 原生 NapCat：get_file 给的是本机路径（含中文/反斜杠），直接读，别再套 docker。
+  if (process.platform === 'win32') {
+    if (looksLocalAbsolute(p) && fs.existsSync(p)) return readLocal();
+    if (/^\/[\w./-]+$/.test(p)) {
+      try { return await readDocker(); } catch { /* 落到下面的统一报错 */ }
+    }
+    throw new Error(`get_file 返回的路径本机不可读（${p || data?.message || '空'}）`);
+  }
+  // Linux（服务器）：容器路径优先 docker exec；本机绝对路径再兜底。
+  if (p && /^\/[\w./-]+$/.test(p)) {
+    try { return await readDocker(); } catch { /* 继续试本机路径 */ }
+  }
+  if (p && path.isAbsolute(p) && fs.existsSync(p)) return readLocal();
+  throw new Error(`get_file 未返回可读路径（${p || data?.message || '空'}）`);
 }
 
 // 统一入口：读取一个文件的文本内容。

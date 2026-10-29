@@ -36,6 +36,7 @@ import { ROOT } from '../lib/paths.js';
 import { beijingTs } from '../lib/time.js';
 import { log } from '../lib/log.js';
 import { ftsUsable, ftsQueryOf } from '../lib/fts.js';
+import { dateDigestItem } from '../lib/date-memory.js';
 // 聊天记录库（state/chat.db）：本模块只用到"总量计数 + 索引重建 + 状态"这几件事，
 // 其余聊天函数通过下面的 re-export 透出给调用方。
 import { chatCounters, chatDbStats, rebuildChatFts } from './chat-db.js';
@@ -112,6 +113,10 @@ export function ensureMemoryIndex(db = memDb) {
     ['source', "TEXT DEFAULT ''"],
     ['tier', "TEXT DEFAULT ''"],
     ['updated_at', 'INTEGER DEFAULT 0'],
+    /* 2026-10-28 覆盖语义：旧事实被新事实取代时，旧行不删，只打上"被谁取代"（新条目 id）。
+     * 检索与摘要默认排除这些行（见 listMemoryEntries / memoryDigest），对使用者来说效果等于
+     * "直接覆盖"，但判断错了一次还能找回原文。0 = 仍然有效。 */
+    ['superseded_by', 'INTEGER DEFAULT 0'],
   ];
   for (const [name, decl] of cols) {
     if (tableHasColumn(db, 'memory_entries', name)) continue;
@@ -128,6 +133,7 @@ export function ensureMemoryIndex(db = memDb) {
     'CREATE INDEX IF NOT EXISTS idx_mem_tier ON memory_entries(tier, uid, pinned)',
     'CREATE INDEX IF NOT EXISTS idx_mem_conv ON memory_entries(conv_key, created_at)',
     'CREATE INDEX IF NOT EXISTS idx_mem_expire ON memory_entries(expires_at)',
+    'CREATE INDEX IF NOT EXISTS idx_mem_superseded ON memory_entries(superseded_by, uid)',
   ]) { try { db.exec(sql); } catch (e) { log(`[memory] 索引创建失败 ${sql}: ${e?.message ?? e}`); } }
 
   // ③ FTS5 trigram 全文索引（外部内容表 + 触发器同步）。
@@ -232,7 +238,7 @@ export function getProfile(uid) {
   }
 }
 
-/** misaki@reset -1（清空认知，2026-10-26）：把一个人在记忆库里的痕迹全部删除，还原到"没认识过"。
+/** misaki@reset（清空认知，2026-10-26）：把一个人在记忆库里的痕迹全部删除，还原到"没认识过"。
  * 范围：profiles 该 uid 一行 + memory_entries 里按 uid / conv_key 命中的全部条目（各层级含 permanent）。
  * 不可逆；只影响传入的这个人/这个会话，不动其他会话与全局资源。
  * FTS 由删除触发器自动同步（见 ensureMemoryIndex 的 mem_fts 触发器），无需手工重建。 */
@@ -269,12 +275,16 @@ export function forgetPersonCognition(uid, convKey = '') {
  * 但那些名字从来没有被写进 profiles —— 模型看得到号码，通讯录里却查无此人。
  * 写入时机就是每条入站消息：桥手上已经有 `event.sender.card || nickname` 与 QQ 号，
  * 顺手补一行即可，不必等画像学习跑到那个人（学习是抽样、覆盖不全，这才是根因）。 */
+/** 会话类型 / 占位标签：不是昵称，写进通讯录只会让模型把好友叫成「私聊」。 */
+const PLACEHOLDER_NAMES = new Set(['私聊', '群聊', '好友', '陌生人', '未知', '对方', '未知用户', '文件传输助手', '临时会话']);
+
 export function rememberContactName(uid, name) {
   const u = String(uid ?? '').trim();
   const n = String(name ?? '').trim();
   if (!u || !n) return false;
   if (!/^\d{5,12}$/.test(u)) return false;   // 只认 QQ 号
   if (/^\d+$/.test(n)) return false;         // "名字"本身就是号码 → 没有信息量
+  if (PLACEHOLDER_NAMES.has(n)) return false; // 会话类型标签不是昵称（2026-10-29：四个好友曾被写成"私聊"）
   if (n.length > 64) return false;           // 群名片不会这么长，多半是误传的正文
   const db = initMemoryDb();
   if (!db) return false;
@@ -563,13 +573,17 @@ function rowToMemoryEntry(r) {
     convKey: r.conv_key || '',
     tags: r.tags || '',
     source: r.source || '',
+    supersededBy: Number(r.superseded_by) || 0,
   };
 }
 
 /**
  * 写一条记忆（幂等去重：同 uid+category+content 只留一条，重复写只累加 hits / 刷新时间）。
  * @param {{uid?:string, category?:string, content:string, tier?:string, pinned?:boolean,
- *          importance?:number, ttlMs?:number, convKey?:string, tags?:string, source?:string}} o
+ *          importance?:number, ttlMs?:number, convKey?:string, tags?:string, source?:string,
+ *          supersedes?:number|number[], protectUids?:string[]}} o
+ *   supersedes：要覆盖掉的旧条目 id（对方纠正旧事实时用）。旧行不删，只标 superseded_by。
+ *   protectUids：这些 uid 的条目不允许被覆盖（主人自己的记忆 / 全局规矩）。
  */
 export function rememberEntry(o = {}) {
   const db = initMemoryDb();
@@ -609,17 +623,45 @@ export function rememberEntry(o = {}) {
                           ELSE MAX(expires_at, ?) END
         WHERE id = ?`)
         .run(now, now, row.tier, row.tier, row.pinned, row.importance, row.tier, row.expiresAt, row.expiresAt, Number(hit.id));
-      return { ok: true, id: Number(hit.id), deduped: true, tier: row.tier };
+      /* 命中去重（同一句话再说一次）：没有新行可建，但仍要把这次点名要覆盖的旧条目记到这条 id 名下，
+       * 否则"再说一遍 + 顺手纠正旧事实"就只剩前半句生效。 */
+      const out = applySupersedes(db, Number(hit.id), row.uid, o.supersedes, now, o.protectUids);
+      if (out.note) return { ok: true, id: Number(hit.id), deduped: true, tier: row.tier, supersedeNote: out.note };
+      return { ok: true, id: Number(hit.id), deduped: true, tier: row.tier, superseded: out.applied };
     }
     const info = db.prepare(`INSERT INTO memory_entries
       (uid, category, content, created_at, updated_at, tier, pinned, importance, expires_at, conv_key, tags, source)
       VALUES (?,?,?,?,?,?,?,?,?,?,?,?)`)
       .run(row.uid, row.category, row.content, now, now, row.tier, row.pinned, row.importance, row.expiresAt, row.convKey, row.tags, row.source);
-    return { ok: true, id: Number(info.lastInsertRowid), deduped: false, tier: row.tier };
+    const newId = Number(info.lastInsertRowid);
+    const out = applySupersedes(db, newId, row.uid, o.supersedes, now, o.protectUids);
+    if (out.note) return { ok: true, id: newId, deduped: false, tier: row.tier, supersedeNote: out.note };
+    return { ok: true, id: newId, deduped: false, tier: row.tier, superseded: out.applied };
   } catch (error) {
     log(`[memory] 写记忆失败: ${error?.message ?? error}`);
     return { ok: false, error: error?.message ?? String(error) };
   }
+}
+
+/**
+ * 覆盖：把旧条目标成"已被 newId 取代"（2026-10-28 主人定：纠正旧事实时用覆盖，不要并列两条）。
+ * 只认同一个 uid 的条目 —— 换个人的同一句话不许被顺手冲掉；已失效的不重复处理（幂等）。
+ * uid 为空（全局规矩）或新条目本身就是全局 → 不覆盖：那是主人定的规矩，模型不许改写。
+ */
+function applySupersedes(db, newId, uid, rawIds, now, protectUids = []) {
+  const ids = (Array.isArray(rawIds) ? rawIds : [rawIds])
+    .map(Number).filter((n) => Number.isFinite(n) && n > 0 && n !== newId);
+  if (!ids.length) return { applied: [] };
+  if (!uid) return { applied: [], note: '这条是全局规矩（scope=global），不做自动覆盖：要改它得主人自己发话' };
+  const blocked = new Set((Array.isArray(protectUids) ? protectUids : [protectUids]).map((u) => String(u ?? '')));
+  if (blocked.has(String(uid))) return { applied: [], note: '这是主人自己的记忆，不做自动覆盖' };
+  const st = db.prepare('UPDATE memory_entries SET superseded_by = ?, updated_at = ? WHERE id = ? AND uid = ? AND superseded_by = 0');
+  const applied = [];
+  for (const id of ids) {
+    try { if (Number(st.run(newId, now, id, uid).changes) > 0) applied.push(id); } catch { /* 单条失败不影响其余 */ }
+  }
+  if (applied.length) log(`[memory] #${newId} 取代旧记忆 ${applied.map((i) => '#' + i).join(', ')}（uid=${uid}）`);
+  return { applied };
 }
 
 /** 置顶/取消置顶（置顶 = permanent 层：永不过期，且进每轮摘要） */
@@ -654,6 +696,9 @@ export function listMemoryEntries(opts = {}) {
   if (opts.convKey) { where.push('conv_key = ?'); params.push(String(opts.convKey)); }
   if (opts.tier) { where.push('tier = ?'); params.push(String(opts.tier)); }
   if (!opts.includeExpired) { where.push('(expires_at = 0 OR expires_at > ?)'); params.push(Date.now()); }
+  /* 被覆盖的旧事实默认不返回（2026-10-28 覆盖语义）：对使用者来说等于"已被新事实替换"。
+   * 管理端/排障要看历史时才传 includeSuperseded。 */
+  if (!opts.includeSuperseded) where.push('superseded_by = 0');
   const ftsQ = opts.query ? ftsQueryOf(opts.query) : '';
   try {
     if (ftsQ && ftsUsable(db, 'mem_fts')) {
@@ -734,6 +779,7 @@ export function memoryDigest(o = {}) {
     const rows = db.prepare(`
       SELECT * FROM memory_entries
       WHERE (pinned = 1 OR tier = 'permanent' OR category IN ('rule','owner','identity','persona'))
+        AND superseded_by = 0
         AND (expires_at = 0 OR expires_at > ?)
         AND (uid = ? OR uid = '' OR ? = '')
       ORDER BY pinned DESC, importance DESC, COALESCE(updated_at, created_at) DESC
@@ -741,6 +787,7 @@ export function memoryDigest(o = {}) {
     const others = db.prepare(`
       SELECT * FROM memory_entries
       WHERE pinned = 0 AND tier != 'permanent' AND category NOT IN ('rule','owner','identity','persona')
+        AND superseded_by = 0
         AND (expires_at = 0 OR expires_at > ?) AND (uid = ? OR uid = '' OR ? = '')
       ORDER BY importance DESC, COALESCE(updated_at, created_at) DESC LIMIT ?`)
       .all(now, String(o.uid ?? ''), String(o.uid ?? ''), limit);
@@ -767,8 +814,55 @@ export function memoryDigest(o = {}) {
   }
 }
 
-/** 记忆库规模/索引状态（诊断与管理端展示用） */
-export function memoryStats() {
+/**
+ * 日期型记忆的"近期浮现"（2026-10-28 主人需求：三天内的事不许忘、生日当天要答得出）。
+ *
+ * 与 memoryDigest 的分工：那个是"永久层永远在"；这个只挑**日期落在近期窗口**的条目，
+ * 由桥算好"今天/还有 N 天"再交给模型——不让模型自己算日期，也不依赖它主动检索。
+ * 窗口默认 [-1, +7] 天：昨天（怕它昨天生日我没接住）+ 未来一周（提前有心理准备）。
+ * @param {{uid?:string, now?:number, daysAhead?:number, daysBack?:number, limit?:number}} o
+ */
+export function dateDigest(o = {}) {
+  const db = initMemoryDb();
+  if (!db) return '';
+  const now = Number(o.now) || Date.now();
+  const uid = String(o.uid ?? '');
+  const daysAhead = Math.max(0, Math.min(60, Number(o.daysAhead) || 7));
+  const daysBack = Math.max(0, Math.min(7, Number(o.daysBack) || 1));
+  const limit = Math.max(1, Math.min(12, Number(o.limit) || 5));
+  try {
+    const rows = db.prepare(`
+      SELECT content, category, tags FROM memory_entries
+      WHERE (expires_at = 0 OR expires_at > ?)
+        AND (uid = ? OR uid = '' OR ? = '')
+      ORDER BY COALESCE(updated_at, created_at) DESC LIMIT 500`)
+      .all(now, uid, uid);
+    const items = [];
+    const seen = new Set();
+    for (const r of rows) {
+      const it = dateDigestItem(r.content, { tags: r.tags, category: r.category, now, daysAhead, daysBack });
+      if (!it) continue;
+      const key = `${it.dateText}|${String(r.content).replace(/\s+/g, ' ').slice(0, 40)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      items.push(it);
+      if (items.length >= limit * 3) break;
+    }
+    if (!items.length) return '';
+    items.sort((a, b) => a.daysUntil - b.daysUntil);
+    const bj = new Date(now + 8 * 3600 * 1000);
+    const pad = (n) => String(n).padStart(2, '0');
+    const week = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'][bj.getUTCDay()];
+    const todayText = `今天 ${bj.getUTCFullYear()}-${pad(bj.getUTCMonth() + 1)}-${pad(bj.getUTCDate())} ${week}`;
+    const lines = items.slice(0, limit).map((it) => `${it.dateText}（${it.tip}）· ${it.text}`);
+    return `${todayText}。近期日子：${lines.join('；')}`;
+  } catch (error) {
+    log(`[memory] 日期记忆摘要失败: ${error?.message ?? error}`);
+    return '';
+  }
+}
+
+/** 记忆库规模/索引状态（诊断与管理端展示用） */export function memoryStats() {
   const db = initMemoryDb();
   if (!db) return { ok: false };
   const one = (sql, ...p) => { try { return Number(db.prepare(sql).get(...p)?.c || 0); } catch { return 0; } };
@@ -778,6 +872,7 @@ export function memoryStats() {
     profiles: one('SELECT COUNT(*) AS c FROM profiles'),
     entries: one('SELECT COUNT(*) AS c FROM memory_entries'),
     permanent: one("SELECT COUNT(*) AS c FROM memory_entries WHERE pinned = 1 OR tier = 'permanent'"),
+    superseded: one('SELECT COUNT(*) AS c FROM memory_entries WHERE superseded_by > 0'),
     // 聊天记录在 state/chat.db：条数与索引状态都从那边取（本库里已经没有那张表了）
     chat: Number(chatCounters()?.total) || 0,
     ftsChat: (() => { const cs = chatDbStats(); return cs?.fts?.ok ? Number(cs.fts.indexed) : -1; })(),

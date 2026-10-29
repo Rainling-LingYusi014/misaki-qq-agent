@@ -198,21 +198,26 @@ export function loadConfig() {
       send: {
         burstEnabled: true,
         burstMaxMessages: 8,
-        // —— 打字节拍：只保留"按字数"一种（2026-09-15 定稿）——
-        // 批内首条秒回；第 2 条起 = 本条字数 × linearPerCharMs，±linearJitterRatio 抖动，
-        // 夹在 [linearMinMs, linearCapMs]。linearEnabled=false = 完全不延迟。
+        // —— 打字节拍：只保留"按字数"一种（2026-09-15 定稿；2026-10-28 主人定全局 400ms/字）——
+        // 每条气泡 = 本条字数 × linearPerCharMs，±linearJitterRatio 抖动，夹在 [linearMinMs, linearCapMs]；
+        // replyBaseDelayMs = 会话静默超过 linearResetMs 后，第一条气泡先"看+想"多久再打。
+        // linearEnabled=false = 完全不延迟。
         linearEnabled: true,
-        linearPerCharMs: 150,
-        linearMinMs: 250,
-        linearCapMs: 4000,
+        linearPerCharMs: 400,
+        linearMinMs: 1800,
+        linearCapMs: 20000,
         linearJitterRatio: 0.25,
         linearResetMs: 60000,
+        replyBaseDelayMs: 2000,
         longGapProbability: 0.25,
         longGapMinMs: 8000,
         longGapMaxMs: 18000,
         maxSendPerMinute: 8,
         maxSendPerHour: 60,
         maxMessageChars: 500,
+        // 2026-10-28：最后一条是问句、对方没回 → 这段时间内不再开口（问完就等）。
+        questionHoldMs: 180000,
+        questionHoldExemptChars: 200,
         maxGapMs: 15000,
         recommendedHint: 'Normal chat: 1-4 bubbles per reply, 1.2-4 s between bubbles like typing; occasionally (25%) pause 8-20 s like thinking; never spam.',
       },
@@ -272,8 +277,32 @@ export function loadConfig() {
         enabled: true,
         checkIntervalMinMs: 30 * 60 * 1000,
         checkIntervalMaxMs: 90 * 60 * 1000,
-        idleThresholdMs: 15 * 60 * 1000,
-        probability: 0.3
+        idleThresholdMs: 30 * 60 * 1000,   // 2026-10-28 主人定：冷场阈值 30 分钟
+        probability: 0.3,
+        // 2026-10-28 主人定规：常规模式私聊每天至少一次主动关心（19:00–22:30 窗口，对方今天没说话才补）
+        privateDailyMin: 1,
+        dailyMinWindowStart: '19:00',
+        dailyMinWindowEnd: '22:30'
+      },
+      poke: {
+        // 2026-10-28：拍一拍降敏。QQ 拍一拍有 ≥10 秒冷却，双拍窗口必须明显大于它（15 秒）。
+        doubleTapMs: 15000,
+        windowMs: 10 * 60 * 1000,
+        count: 3,
+        cooldownMs: 30 * 60 * 1000,
+        // 2026-10-28 主人定规：被拍时有一半概率回拍一次（纯动作、不带文字、不解释）。
+        backProbability: 0.5,
+        backCooldownMs: 30 * 60 * 1000,
+        backDelayMinMs: 3000,
+        backDelayMaxMs: 12000
+      },
+      shortReply: {
+        // 2026-10-28 主人定规：对方只回 owo / 表情 / 单字时，回不回都正常，不回是被允许的；
+        // 沉默概率由桥掷骰决定（[Dice] 行），不是一律不回、也不是每条都接。
+        enabled: true,
+        silenceProbability: 0.5,
+        maxChars: 4,
+        applyToOwner: false   // owner 私聊走「及时回」，默认不进抽签
       },
       feedback: {
         maxLength: 500,

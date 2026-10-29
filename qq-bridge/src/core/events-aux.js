@@ -7,11 +7,18 @@ import { currentMode, modeAllowed } from './mode.js';
 import { pending } from './session-state.js';
 import { getSocialState, saveSocialState, social, scheduleWake, PEER_TYPING_HOLD_MAX_MS } from './social-state.js';
 import { sendWakePrompt } from './wake-send.js';
-import { sendToQQ } from './qq-send.js';
+import { sendToQQ, sendPokeQQ } from './qq-send.js';
 import { resolveGroupMemberName } from './message-cache.js';
 import { appendSocialPoke } from './social-flow.js';
+import { pokeAskDecision, pokeBackDecision } from '../lib/poke-policy.js';
 
 export const PEER_TYPING_EXPIRE_MS = 3000; // 没有新的输入状态事件时的过期时间（原 8000：一次输入事件就能把等待顶到 8 秒后）
+
+/* 拍一拍的历史只活在内存里：重启后重新累计即可（跨重启还坚持"十分钟三下"没有意义），
+ * 也避免往 social-state 里加会膨胀的字段。按「会话 + 发送者」分开，群里不同人拍不叠加。 */
+const pokeHistory = new Map();   // trackKey -> number[]（最近 10 分钟的拍一拍时间戳）
+const pokeAskedAt = new Map();   // trackKey -> 上次开口询问的时间戳
+const pokeBackAt = new Map();    // trackKey -> 上次自动回拍的时间戳（回拍冷却用）
 
 let cfgRef = null;
 let apiRef = null;
@@ -163,7 +170,57 @@ export async function handlePokeNotice(event) {
     saveSocialState();
     scheduleWake(key, 'bootstrap');
   } else if (st.wakeConfig?.triggers?.poke) {
-    scheduleWake(key, 'poke');
+    /* 2026-10-28 主人定规：不要每次被拍都追问（"仿佛 misaki 很敏感不好接触"）。
+     * 单拍不开口；只有「一连拍两下」或「10 分钟内三下」才问一次，问完冷却 30 分钟。
+     * "一连两下"按 15 秒算 —— QQ 拍一拍本身有 ≥10 秒冷却，6 秒窗口永远不可能命中。
+     * 判定在 lib/poke-policy.js（纯函数，有单测）。 */
+    const trackKey = `${key}|${senderId || ''}`;
+    const now = Date.now();
+    const cfgPoke = cfgRef.social?.poke ?? {};
+    const windowMs = Math.max(60000, Number(cfgPoke.windowMs) || 10 * 60 * 1000);
+    const history = (pokeHistory.get(trackKey) || []).filter((t) => now - t <= windowMs);
+    history.push(now);
+    pokeHistory.set(trackKey, history);
+    const d = pokeAskDecision({
+      history, now, lastAskedAt: pokeAskedAt.get(trackKey) || 0,
+      doubleTapMs: cfgPoke.doubleTapMs, windowMs: cfgPoke.windowMs,
+      count: cfgPoke.count, cooldownMs: cfgPoke.cooldownMs,
+    });
+    if (d.ask) {
+      pokeAskedAt.set(trackKey, now);
+      appendActivity(`${key} 拍一拍：${d.why} → 唤醒问一次`);
+      scheduleWake(key, 'poke');
+    } else {
+      /* 2026-10-28 主人定规：被拍一拍有 50% 的概率回拍一次（纯动作、不带一个字、不需要解释）。
+       * 放在这里而不是让模型决定：单拍按策略不唤醒模型，模型没有回合可用。
+       * 只在"这一下是拍我"时才回（群里别人互拍不掺和），回拍过一次后冷却半小时。 */
+      const cfgBack = cfgRef.social?.poke ?? {};
+      const aimedAtMe = kind === 'private' || targetIsSelf;
+      const back = pokeBackDecision({
+        now,
+        lastBackAt: pokeBackAt.get(trackKey) || 0,
+        probability: cfgBack.backProbability,
+        cooldownMs: cfgBack.backCooldownMs,
+      });
+      if (!aimedAtMe || !back.back) {
+        appendActivity(`${key} 拍一拍：${d.why} → 不追问；回拍 ${aimedAtMe ? back.why : 'not-aimed-at-me'}`);
+        return;
+      }
+      pokeBackAt.set(trackKey, now);
+      const minD = Math.max(0, Number(cfgBack.backDelayMinMs) || 0);
+      const maxD = Math.max(minD, Number(cfgBack.backDelayMaxMs) || minD);
+      const waitMs = minD + Math.round(Math.random() * (maxD - minD));
+      appendActivity(`${key} 拍一拍：${d.why} → 不追问；${waitMs}ms 后回拍（p=${back.p} roll=${back.roll.toFixed(2)}）`);
+      const timer = setTimeout(() => {
+        sendPokeQQ(key, kind === 'group' ? senderId : '')
+          .then(() => {
+            st.lastActionAt = Date.now();
+            appendActivity(`${key} 拍一拍：已回拍 ${sender || senderId}`);
+          })
+          .catch((e) => appendActivity(`${key} 拍一拍：回拍失败 ${e?.message ?? e}`));
+      }, waitMs);
+      try { timer.unref?.(); } catch { /* 定时器不阻塞进程 */ }
+    }
   }
 }
 

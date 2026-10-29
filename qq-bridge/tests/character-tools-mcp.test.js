@@ -121,6 +121,18 @@ try {
   await check('真调用：list 包清单 / list 单个包的文件 / 穿越被拒 / 不存在名 → not-found / pack 读到真包 / search 正常', async () => {
     const list = await callText(srv, 'qq_character_list', { limit: 10 });
     assert.notEqual(list.res.result?.isError, true);
+    /* 2026-10-29 开源适配：characters/ 角色库不随 git 分发（第三方提示词，授权不明不入库）。
+     * 本机无库时只验证工具面本身（穿越拒收 + not-found 文案），包内容断言整段跳过；
+     * 有库的环境（主仓/装了角色包的用户）行为与原来完全一致。 */
+    if (/does not exist on this machine/.test(list.text)) {
+      /* 无库时目录检查先于穿越检查（characterReadText 对 directory-not-found 直接短路），
+       * 所以这里只断言「工具面正常返回文本、不崩」；穿越/not-found 文案已由 character-library.test.js
+       * 的临时库夹具覆盖，包内容断言留给有库环境（主仓/装了角色包的用户）。 */
+      const trav = await callText(srv, 'qq_character_read', { character: '..\\..\\Windows' });
+      assert.notEqual(trav.res.result?.isError, true, '无库时也应正常返回文本（不是 isError）');
+      console.log('      本机无角色库（characters/ 不随 git 分发）→ 跳过包内容断言，只验证工具面响应');
+      return;
+    }
     assert.ok(/character pack\(s\).*file\(s\) on disk/.test(list.text), list.text.split('\n')[1] ?? '');
     assert.ok(list.text.includes('(loose file)'), '库根散装文件要标出来');
     const packNames = list.text.split('\n').filter((l) => /\/ \| \d+ file\(s\)/.test(l));

@@ -20,12 +20,20 @@
  */
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const SRC = path.join(HERE, '..', 'src');
 const mod = (rel) => pathToFileURL(path.join(SRC, rel)).href;
+
+/* 2026-10-29：本用例会造一个只含 wakeConfig 的假会话再触发 saveSocialState()。
+ * 以前它写进真实 state/social-state.json（外加抛 slice 错误）；现在先把 STATE_DIR 指到临时目录
+ * （paths.js 认 QQB_STATE_DIR），真实 state 全程只读。必须在下面所有动态 import 之前设置。 */
+const TMP_STATE = fs.mkdtempSync(path.join(os.tmpdir(), 'qqb-state-'));
+process.env.QQB_STATE_DIR = TMP_STATE;
+process.on('exit', () => { try { fs.rmSync(TMP_STATE, { recursive: true, force: true }); } catch {} });
 
 let pass = 0;
 const failures = [];
@@ -129,9 +137,11 @@ console.log('\n=== ③ 老配置兼容：缺 recommendedProbability 不能被当
 /* 本节的 applyOwner… 会走到 saveSocialState()：这里用的是内存里的假会话（没有 recentMessages 等数组），
  * 保存会在拼对象时抛错并 return —— 也就是说**真实 state/social-state.json 绝不会被写**。
  * 这既是"不要拿测试去污染真机状态"的护栏，下面也把它当断言钉住（文件 mtime+大小前后一致）。 */
-const { SOCIAL_STATE_FILE } = await import(mod('lib/paths.js'));
+/* 护栏盯的是**真实** state 文件：本测试已把 STATE_DIR 重定向到临时目录，
+ * 所以这里不能用 paths.js 的 SOCIAL_STATE_FILE（那会指向临时文件、断言变成空壳）。 */
+const REAL_STATE_FILE = path.join(HERE, '..', 'state', 'social-state.json');
 const stateStat = () => {
-  try { const s = fs.statSync(SOCIAL_STATE_FILE); return `${s.size}:${s.mtimeMs}`; } catch { return 'missing'; }
+  try { const s = fs.statSync(REAL_STATE_FILE); return `${s.size}:${s.mtimeMs}`; } catch { return 'missing'; }
 };
 const stateBefore = stateStat();
 check('defaultWakeConfig：配置缺 recommendedProbability → probability 不是 0', () => {
@@ -205,16 +215,11 @@ check('social-state.js 的 proactive 定时器里没有掷骰判定 / 概率系�
   const end = src.indexOf('export function proactiveGate');
   assert.ok(start > 0 && end > start, '找不到 proactive 定时器段');
   let body = src.slice(start, end);
-  /* 2026-10-07 契约更新（主人新指令，晚于 2026-09-30 的去概率化）：
-   *   「每天必定找我一次，第二次看骰子 50%」→ 私聊配额路径里第 2 次必须掷 50% 骰子
-   *   （proactiveRolled / Math.random() < 0.5），第 1 次无条件开口。它不是"要不要回消息"
-   *   的骰子，而是"第二次要不要主动找主人"的每日定夺 —— 群聊与真实消息路径仍然零概率。
-   *   所以这里把配额段（quota / proactiveRolled 那段）从检查体里挖掉，其余照旧守卫。 */
-  const qStart = body.indexOf('let quotaBlock');
-  const qEnd = body.indexOf('if (gate.fire && !quotaBlock)');
-  if (qStart > 0 && qEnd > qStart) body = body.slice(0, qStart) + body.slice(qEnd);
-  assert.ok(!/Math\.random\(\)\s*</.test(body), 'proactive 里又出现了掷骰判定（配额骰子段之外）');
-  assert.ok(/Math\.random\(\)\s*<\s*0\.5/.test(src.slice(start, end)), '第 2 次的五五开骰子不见了（主人的要求）');
+  /* 2026-10-07 契约曾是「第 1 次无条件、第 2 次掷 50% 骰子」；**2026-10-11 主人改了口径**：
+   * 主动开口不再掷骰，改成硬配额（privateDailyMax），所以那颗 `Math.random() < 0.5` 已被删除。
+   * 2026-10-29 config 把 privateDailyMax 显式钉成 1，第 2 次根本不会发生。
+   * 本断言随之更新：整段 proactive 定时器里不许再有任何掷骰，配额必须有。 */
+  assert.ok(!/Math\.random\(\)\s*</.test(src.slice(start, end)), 'proactive 里又出现了掷骰判定（主动开口应为硬配额）');
   assert.ok(/privateDailyMax|proactiveCount/.test(src.slice(start, end)), '每日私聊硬配额不见了（主人不超过 2 次的要求）');
   assert.ok(!/prob\s*\*=/.test(src), 'proactive 里又出现了概率系数（prob *= …）');
   assert.ok(/proactiveGate\(/.test(body), '定时器没有走 proactiveGate 判定');
@@ -261,6 +266,13 @@ check('发送路径按 length 用一条消息（无 split/index===2 之类的固
 console.log('\n=== ⑥ 端到端（进程内真跑一遍）：群消息 → 唤醒理由 → 真唤醒正文 ===');
 /* 前面几节是"判定函数"层面的；这一节用真配置（loadConfig，只读）+ 真 group 事件，
  * 把 evaluateWakeTrigger → buildWakePrompt 整条链跑一遍，钉住模型**真的**收到了新语义。 */
+/* 2026-10-29 开源适配：本节**故意**依赖真 config.json（部署机常态）。
+ * 开源新克隆没有 config.json（gitignored）——loadConfig 会直接抛错。
+ * 没有它就跳过本节（①~⑤ 是纯源码/判定函数断言，已经全过），部署机上行为不变。 */
+if (!fs.existsSync(path.join(HERE, '..', 'config.json'))) {
+  console.log('      本机没有 config.json（开源新克隆的正常状态）→ 跳过端到端段（①~⑤ 已全过）');
+  process.exit(0);
+}
 const { loadConfig } = await import(mod('core/config.js'));
 const fullCfg = loadConfig(); // 只读 config.json，不写盘（既有测试同样用法）
 socialMod.initSocialCore(fullCfg);

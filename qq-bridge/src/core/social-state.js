@@ -23,7 +23,10 @@ import {
 import { isDirectedAtAi } from '../lib/social-timeline.js';
 import { looksLikeUnfinished } from '../wait.js';
 import { readRoleState } from '../lib/role-access.js';
-import { bjMinutes, parseClockMin } from '../lib/time.js';
+import { bjMinutes, parseClockMin, beijingDateKey, beijingTs } from '../lib/time.js';
+import { dailyMinCfg, dailyMinDue } from '../lib/proactive-window.js';
+// 早安问候（2026-10-29 主人定规）：确定性骰子排程 + 到点判定（纯函数见 lib/morning-greet.js）
+import { morningGreetPlan, morningGreetDecision, morningGreetCfg } from '../lib/morning-greet.js';
 // 会话重置时"必须跨着重置活下来"的已回复账本（真机事故见本文件 resetConversationKeepingLedger 注释）
 import { carryReplyLedger } from './send-idempotency.js';
 
@@ -380,15 +383,23 @@ export function saveSocialState() {
     for (const [key, st] of social.conversations) {
       obj.conversations[key] = {
         wakeConfig: st.wakeConfig,
-        recentMessages: st.recentMessages.slice(-200),
-        unread: st.unread.slice(-100),
+        bubbleStyle: st.bubbleStyle === 'single' ? 'single' : 'auto',
+        morningGreetDay: String(st.morningGreetDay ?? ''),
+        bracketSceneUntil: Number(st.bracketSceneUntil) || 0,
+        bracketReaction: st.bracketReaction === true,
+        bubbleSeq: Number(st.bubbleSeq) || 0,
+        bracketActions: Array.isArray(st.bracketActions)
+          ? st.bracketActions.slice(-60).map((a) => ({ seg: String(a?.seg ?? ''), seq: Number(a?.seq) || 0 })).filter((a) => a.seg)
+          : [],
+        recentMessages: (Array.isArray(st.recentMessages) ? st.recentMessages : []).slice(-200),
+        unread: (Array.isArray(st.unread) ? st.unread : []).slice(-100),
         lastWakeReason: st.lastWakeReason,
         lastAiReplyAt: st.lastAiReplyAt,
         lastActionAt: st.lastActionAt,
         agentToken: st.agentToken,
         bootstrapSent: st.bootstrapSent,
-        wakeTimes: st.wakeTimes.slice(-200),
-        sendTimes: st.sendTimes.slice(-500),
+        wakeTimes: (Array.isArray(st.wakeTimes) ? st.wakeTimes : []).slice(-200),
+        sendTimes: (Array.isArray(st.sendTimes) ? st.sendTimes : []).slice(-500),
         stickerCollectTimes: Array.isArray(st.stickerCollectTimes) ? st.stickerCollectTimes.slice(-500) : [],
         lastIncomingAt: st.lastIncomingAt || 0,
         lastAiSeenAt: Number(st.lastAiSeenAt) || 0,
@@ -571,6 +582,28 @@ export function getSocialState(key) {
       bootstrapSent: false,
       // 2026-10-26 模式系统：regular=常规模式（默认）| companion=陪伴模式；陪伴计数器独立于常规 proactive 配额
       agentMode: 'regular',
+      /* 2026-10-29：单个联系人抱怨"你怎么这么爱分气泡"时，只对这一位改成整段发（auto=默认按骰子 70/25/5；
+       * single=拼成一条，超长才拆）。按会话存，所以一个用户的偏好不会传染给其他人。 */
+      bubbleStyle: 'auto',
+      /* 2026-10-29 早安问候：今天是否已问过（北京日期键）。派发即记账，防唤醒在途时重启双发；
+       * 定时器不落盘——时刻按（会话+日期）骰子重算（lib/morning-greet.js），重启重排幂等。 */
+      morningGreetDay: '',
+      morningGreetTimer: null,
+      morningGreetAtMs: 0,
+      /* 2026-10-29 括号反馈场景：用户的动作性（摸摸头/抱一下…）把会话推入实时档到该时刻，
+       * 超时无新动作自动落回普通档（发送瞬间读，见 lib/bracket-feedback.js）。落盘防重启丢沉浸。
+       * 永远不可能是「一次识别=永久」：最坏影响 = 一个保持窗的时长。 */
+      bracketSceneUntil: 0,
+      /* 2026-10-29 misaki@reaction：陪伴模式括号反馈总开关（按钮式，按会话存）。
+       * **默认关闭**（主人定规：不发指令就没有括号反馈）——true 只可能来自本人发过 misaki@reaction。
+       * 关着时发送侧整段成形直接跳过：不是把骰子调到 0，而是连剥带留都不做。 */
+      bracketReaction: false,
+      /* 2026-10-29 动作类去重（主人定规：动作类每 6 个气泡不允许完全相同；表情/心理不限）：
+       *   bubbleSeq  —— 这个会话已经发出去的气泡序号（只增，跨重启保留）
+       *   bracketActions —— 最近发出去的动作段 [{ seg, seq }]，上限 60 条
+       * 窗口按气泡序号算（不是墙钟）：沉默一天但只隔两条，也算「6 个气泡内」。 */
+      bubbleSeq: 0,
+      bracketActions: [],
       companionMode: { proactiveDay: '', proactiveCount: 0, unansweredStreak: 0, awaitingReplySince: 0 },
       // misaki@stop 的"另行说明"挂起标记：下一轮唤醒注入 [Stopped] 行时消费（落盘防重启丢失）
       stopNoteAt: 0,
@@ -607,6 +640,7 @@ export function getSocialState(key) {
     KNOWN_AGENT_TOKENS.add(st.agentToken);
     social.conversations.set(key, st);
     scheduleProactiveCheck(key);
+    try { scheduleMorningGreet(key); } catch { /* 早安排程失败不影响建会话 */ }
     setupSleepTimer(key);
   }
   return st;
@@ -637,10 +671,23 @@ export function resetConversationKeepingLedger(key) {
   const prev = social.conversations.get(canonical) || null;
   social.conversations.delete(canonical);
   if (!prev) return null;
+  /* 2026-10-29 主人定规：偏好不是认知——清空过往认知（misaki@reset）不该把「说话方式」的偏好
+   * 一起抹掉。这里保住两项按会话的偏好：
+   *   bubbleStyle      —— 对方抱怨过被切碎 → 整段发
+   *   bracketReaction  —— 括号反馈总开关（misaki@reaction）
+   * 模式切换（setConversationMode）本来就不碰它们；这条只是补上 reset 这条遗漏路径。 */
+  const prefs = {
+    bubbleStyle: prev.bubbleStyle === 'single' ? 'single' : 'auto',
+    bracketReaction: prev.bracketReaction === true,
+    // 动作去重的窗口与历史也属于「怎么说话」，reset 认知不该把它清零
+    bubbleSeq: Number(prev.bubbleSeq) || 0,
+    bracketActions: Array.isArray(prev.bracketActions) ? prev.bracketActions.slice(-60) : [],
+  };
   const carried = carryReplyLedger(prev);
-  if (!carried || !carried.carried.length) return null;
-  // 重建一份干净的会话状态，只把账本写回去（其余 wakeConfig/unread/令牌全部按全新会话走）。
   const st = getSocialState(canonical);
+  Object.assign(st, prefs);
+  if (!carried || !carried.carried.length) { saveSocialState(); return null; }
+  // 重建一份干净的会话状态，只把账本写回去（其余 wakeConfig/unread/令牌全部按全新会话走）。
   Object.assign(st, carried.patch);
   saveSocialState();
   log(`[reset] ${canonical} 会话已重置，保留已回复账本（${carried.carried.join('、')}）`
@@ -716,6 +763,14 @@ export function loadSocialState() {
           // 2026-10-26 模式系统：读回来也要认这两个字段，否则重启后模式丢失
           // 2026-10-27 三模式：白名单必须列全，否则 interactive 重启后被静默折叠回 regular
           agentMode: (val.agentMode === 'companion' || val.agentMode === 'interactive') ? val.agentMode : 'regular',
+          bubbleStyle: val.bubbleStyle === 'single' ? 'single' : 'auto',
+          morningGreetDay: String(val.morningGreetDay ?? ''),
+          bracketSceneUntil: Number(val.bracketSceneUntil) || 0,
+          bracketReaction: val.bracketReaction === true,
+          bubbleSeq: Number(val.bubbleSeq) || 0,
+          bracketActions: Array.isArray(val.bracketActions)
+            ? val.bracketActions.slice(-60).map((a) => ({ seg: String(a?.seg ?? ''), seq: Number(a?.seq) || 0 })).filter((a) => a.seg)
+            : [],
           companionMode: {
             proactiveDay: String(val.companionMode?.proactiveDay ?? ''),
             proactiveCount: Number(val.companionMode?.proactiveCount) || 0,
@@ -869,6 +924,28 @@ export function conversationMode(key) {
   return stAgentMode(st);
 }
 export function isCompanionActive(key) { return conversationMode(key) === 'companion'; }
+
+/** 该会话的气泡偏好（2026-10-29）：'single' = 整段发（只对抱怨过被切碎的那位），'auto' = 默认 70/25/5。
+ *  只读；按会话存，所以一个人的偏好不会影响别人。 */
+export function bubbleStyleOf(key) {
+  const st = social.conversations.get(canonicalKey(key));
+  return st?.bubbleStyle === 'single' ? 'single' : 'auto';
+}
+
+/** 该会话的括号反馈总开关（2026-10-29 misaki@reaction）：**默认关**，只有本人发指令打开才为 true。
+ *  只读；按会话存。发送侧与唤醒正文都读它——关掉 = 连骰子都不掷，直接不加括号。 */
+export function bracketReactionOf(key) {
+  const st = social.conversations.get(canonicalKey(key));
+  return st?.bracketReaction === true;
+}
+
+/** 按钮式翻转（misaki@reaction）：返回翻转后的状态。会话不存在则先建。 */
+export function toggleBracketReaction(key) {
+  const st = getSocialState(key);
+  st.bracketReaction = st.bracketReaction !== true;
+  saveSocialState();
+  return st.bracketReaction;
+}
 
 /**
  * 陪伴模式工具闸口（console-server 各工具端点调用）：陪伴会话白名单外的工具返回拒绝话术。
@@ -1064,6 +1141,8 @@ export function scheduleProactiveCheck(key) {
     if (cfgRef.social?.deepsleep || silentGroups.includes(gpId)) return;
   }
   const st = getSocialState(key);
+  // 早安问候捎带重排：幂等（同一时刻不重设），配置/模式变了会在这里的一刻钟内跟上
+  try { scheduleMorningGreet(key); } catch { /* 早安排程不打扰主动链 */ }
   if (st.proactiveTimer) return;
   const p = cfgRef.social?.proactive ?? {};
   // 私聊用独立更主动的参数（privateCheckIntervalMinMs/MaxMs/privateProbability），群聊用常规参数。
@@ -1081,7 +1160,7 @@ export function scheduleProactiveCheck(key) {
     const cmOn = isPrivate && stAgentMode(st) === 'companion';
     const cp = cmOn ? companionCfg(cfgRef) : null;
     if (cmOn && inCompanionQuietHours(Date.now(), cfgRef)) {
-      scheduleProactiveCheck(key); // 静默时段（默认 23:30–07:30）：不评估不唤醒，到点重排下一轮
+      scheduleProactiveCheck(key); // 静默时段（默认 23:30–07:00，2026-10-29 随早安窗口提前）：不评估不唤醒，到点重排下一轮
       return;
     }
     if (cmOn) {
@@ -1102,10 +1181,28 @@ export function scheduleProactiveCheck(key) {
     const fresh = (Array.isArray(st.unread) && st.unread.length > 0)
       || pendingThoughts > 0
       || (Array.isArray(st.recentMessages) ? st.recentMessages : []).some((m) => m && !m.isSelf && Date.now() - Number(m.time || 0) < 2 * 60 * 60 * 1000);
+    /* 2026-10-28 主人定规：常规模式私聊「每天至少一次主动关心」，陪伴模式不变。
+     * 到期条件见 lib/proactive-window.js：今天没主动过 + 在保底窗口内 + 对方今天没说过话。
+     * 到期时放宽 freshOnly（允许凭记忆/近况开口），但"开不开口"仍交给模型；唤醒正文会带 [Guide]。 */
+    let dailyMin = false;
+    if (isPrivate && !cmOn) {
+      const todayKey = new Date().toLocaleDateString('en-US', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' });
+      const dm = dailyMinCfg(p);
+      dailyMin = dailyMinDue({
+        usedToday: st.proactiveDay === todayKey ? (Number(st.proactiveCount) || 0) : 0,
+        nowMin: bjMinutes(),
+        windowStartMin: dm.windowStartMin,
+        windowEndMin: dm.windowEndMin,
+        lastIncomingAt: st.lastIncomingAt || 0,
+        todayStartMs: Date.parse(beijingDateKey() + 'T00:00:00+08:00'),
+        dailyMin: dm.dailyMin,
+      });
+    }
+    st._dailyMinPending = false;
     const gate = proactiveGate({
       probCfg: isPrivate ? p.privateProbability : p.probability,
-      // 陪伴模式允许"无话题开口"（凭记忆里的事主动关心），其余维持 freshContextOnly 判定
-      freshOnly: cmOn ? false : (cfgRef.social?.proactive?.freshContextOnly !== false),
+      // 陪伴模式允许"无话题开口"（凭记忆里的事主动关心）；常规模式只有"每日保底"这一轮放宽
+      freshOnly: cmOn ? false : (dailyMin ? false : (cfgRef.social?.proactive?.freshContextOnly !== false)),
       fresh,
       idleMs: idle,
       idleThresholdMs: idleThreshold,
@@ -1151,6 +1248,8 @@ export function scheduleProactiveCheck(key) {
       if (cmOn) st._companionPending = true; else st._proactivePending = true;
     }
     if (gate.fire && !quotaBlock) {
+      // 保底这一轮在唤醒正文里带 [Guide]（见 wake-send.js）；只在本轮生效，下一轮评估会先清零。
+      if (dailyMin) { st._dailyMinPending = true; log(`[default] ${key} 今日保底主动关心到期（今天还没主动过，对方今天没说话）`); }
       void dispatchWake(key, cmOn ? 'companionCare' : 'proactiveCheck').catch((error) => log(`[default] proactive 唤醒异常 ${key}:`, error?.message ?? error));
     } else {
       log(`[default] proactive 本轮不开口(${gate.why}) ${key}`);
@@ -1159,6 +1258,90 @@ export function scheduleProactiveCheck(key) {
   }, delay);
   st.proactiveTimer.unref?.();
   log(`[default] 已安排主动机会检查 ${key}，约 ${Math.round(delay / 60000)}min 后`);
+}
+
+// ── 早安问候（2026-10-29 主人定规）────────────────────────────────────────────
+// 每天必问一次：骰子只决定 7~8（33%）还是 8~9（67%），分钟在窗内再掷（lib/morning-greet.js）。
+// 不占主动配额（proactiveCount / companionMode.proactiveCount 都不动，也不被它们封口）。
+// 「对方今天已经先开口（比如他先问了早安）→ 不再补发」是主人点名的场景，见 morningGreetDecision。
+// 与已下线的作息仪式（reason='morning'，social.companionInjects 门控）是两回事，互不复用。
+function morningGreetEnabled() {
+  const o = cfgRef.social?.morningGreet;
+  return !(o && typeof o === 'object' && o.enabled === false);
+}
+
+function morningGreetExcluded(key) {
+  // 「不粘人」名单对早安同样生效：连主动冒泡都关了的人，不该每天被早安敲一遍
+  const exclUid = String(key).split(':')[1] || '';
+  const exclList = Array.isArray(cfgRef.social?.proactive?.privateExcludeUids) ? cfgRef.social.proactive.privateExcludeUids.map(String) : [];
+  return exclList.includes(exclUid);
+}
+
+export function scheduleMorningGreet(key) {
+  if (!String(key).startsWith('private:')) return;
+  if (social.paused) return;
+  if (!morningGreetEnabled() || morningGreetExcluded(key)) return;
+  const st = social.conversations.get(key);
+  if (!st || !isSessionAllowedInCurrentMode(key)) return;
+  const mg = morningGreetCfg(cfgRef.social?.morningGreet);
+  const dateKey = beijingDateKey();
+  const plan = morningGreetPlan({ key, dateKey, p1: mg.p1, window1: mg.window1, window2: mg.window2 });
+  if (!plan) return;
+  let atMs = plan.atMs;
+  if (atMs <= Date.now()) {
+    // 今天的窗口已经过去（开机晚于 9 点 / 到点已过）：不补发（中午的早安比不发更糟），直接排明天
+    const tomorrow = beijingDateKey(Date.now() + 24 * 3600 * 1000);
+    const tPlan = morningGreetPlan({ key, dateKey: tomorrow, p1: mg.p1, window1: mg.window1, window2: mg.window2 });
+    if (!tPlan) return;
+    atMs = tPlan.atMs;
+  }
+  // 幂等闸：同一时刻已在排就不动；配置/模式变了（atMs 变）才拆了重排
+  if (st.morningGreetTimer && st.morningGreetAtMs === atMs) return;
+  if (st.morningGreetTimer) { clearTimeout(st.morningGreetTimer); st.morningGreetTimer = null; }
+  st.morningGreetAtMs = atMs;
+  const delay = Math.max(1000, atMs - Date.now());
+  st.morningGreetTimer = setTimeout(() => {
+    st.morningGreetTimer = null;
+    try {
+      const todayKey = beijingDateKey();
+      const todayPlan = morningGreetPlan({ key, dateKey: todayKey, p1: mg.p1, window1: mg.window1, window2: mg.window2 });
+      if (morningGreetEnabled() && !morningGreetExcluded(key) && isSessionAllowedInCurrentMode(key) && !inDndWindow()) {
+        if (inCompanionQuietHours(Date.now(), cfgRef)) {
+          log(`[morning] ${key} 早安落在陪伴静默时段，今天不发`);
+        } else {
+          const stF = getSocialState(key);
+          const decision = morningGreetDecision({
+            dateKey: todayKey,
+            greetedDay: stF.morningGreetDay,
+            lastIncomingAt: stF.lastIncomingAt,
+            dayStartMs: Date.parse(`${todayKey}T00:00:00+08:00`),
+            busy: isConversationBusy(key, stF),
+          });
+          if (decision.fire) {
+            stF.morningGreetDay = todayKey; // 派发即记账：唤醒在途时重启也不会双发
+            void dispatchWake(key, 'morningGreet').catch((error) => log(`[morning] 唤醒异常 ${key}:`, error?.message ?? error));
+            log(`[morning] ${key} 早安问候已派发（窗口${todayPlan?.windowIndex ?? '?'}）`);
+          } else {
+            log(`[morning] ${key} 早安跳过：${decision.why}`);
+          }
+        }
+      }
+    } catch (error) {
+      log(`[morning] ${key} 早安判定异常: ${error?.message ?? error}`);
+    }
+    scheduleMorningGreet(key); // 无论发没发，接着排明天
+  }, delay);
+  st.morningGreetTimer.unref?.();
+  log(`[morning] 已排早安问候 ${key}，北京 ${beijingTs(atMs)}`);
+}
+
+/** 开机全量恢复：loadSocialState 之后调用，把所有已知私聊会话的早安时刻重算重排。 */
+export function scheduleAllMorningGreets() {
+  for (const key of social.conversations.keys()) {
+    if (String(key).startsWith('private:')) {
+      try { scheduleMorningGreet(key); } catch { /* 单会话失败不拖垮启动 */ }
+    }
+  }
 }
 
 /**
@@ -1208,7 +1391,7 @@ export function scheduleWake(key, reason) {
   // 免打扰时段拦截内部低价值唤醒（reason 可能带 ':分组' 后缀，取冒号前基名）；
   // timeout/@/提问/私聊/拍一拍/点名等真实触发不拦（免打扰≠失联，被直接叫到仍回）。
   const baseReason = String(reason ?? '').split(':')[0];
-  if (inDndWindow() && /^(proactiveCheck|replyCheck|probability|anyMessage|keyword|companionCare)$/.test(baseReason)) {
+  if (inDndWindow() && /^(proactiveCheck|replyCheck|probability|anyMessage|keyword|companionCare|morningGreet)$/.test(baseReason)) {
     log(`[default] 免打扰窗口，跳过内部唤醒 ${key}（${reason}）`);
     return;
   }
@@ -1645,6 +1828,14 @@ export function clearSocialTimers(key) {
   if (st.proactiveTimer) {
     clearTimeout(st.proactiveTimer);
     st.proactiveTimer = null;
+  }
+  if (st.morningGreetTimer) {
+    clearTimeout(st.morningGreetTimer);
+    st.morningGreetTimer = null;
+  }
+  if (st._undelivRetryTimer) {
+    clearTimeout(st._undelivRetryTimer);
+    st._undelivRetryTimer = null;
   }
   if (Array.isArray(st.pendingWakeReasons)) st.pendingWakeReasons.length = 0;
 }

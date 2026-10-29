@@ -35,6 +35,7 @@ const t = (name, fn) => {
 
 const KEY = 'private:100001';
 const setup = (cfg) => {
+  chain.setCompanionPaceHooks(null, null);
   chain.resetSendPace(KEY);
   chain.setSendLinearCfgReader(() => cfg);
 };
@@ -128,6 +129,55 @@ t('send-gaps 的 byLength 也用同一组参数（不再有 gapPerCharMs）', ()
   assert.equal(d.length, 1);
   // 上一条 3 个字 × 100ms = 300ms（夹在 [200, 5000] 内）
   assert.equal(d[0], 300);
+});
+
+console.log('== qq_send_message 用的 typingDelayMs（2026-10-28 修）==');
+
+t('typingDelayMs：单条气泡按自己的字数等（不传 key 时不会平白加基线）', () => {
+  setup({ ...cfgBase, replyBaseDelayMs: 2000 });
+  assert.equal(chain.typingDelayMs(10), 1500);
+});
+
+t('冷启动停顿：静默后的第一条气泡加 replyBaseDelayMs', () => {
+  setup({ ...cfgBase, replyBaseDelayMs: 2000 });
+  assert.equal(chain.typingDelayMs(10, KEY), 3500, '冷会话第一条 = 打字 1500 + 看/想 2000');
+});
+
+t('同一批第 2 条起不再加冷启动停顿（不叠加）', () => {
+  setup({ ...cfgBase, replyBaseDelayMs: 2000 });
+  chain.markSendDelivered(KEY, 10);
+  assert.equal(chain.typingDelayMs(10, KEY), 1500);
+});
+
+t('静默超过 resetMs → 停顿重新出现', () => {
+  setup({ ...cfgBase, linearResetMs: 1, replyBaseDelayMs: 2000 });
+  chain.markSendDelivered(KEY, 10);
+  const until = Date.now() + 5;
+  while (Date.now() < until) { /* 跨过 reset 窗 */ }
+  assert.equal(chain.typingDelayMs(10, KEY), 3500);
+});
+
+t('陪伴会话的 social.companionMode 覆盖对 typingDelayMs 也生效（10-26 的洞）', () => {
+  setup(cfgBase);
+  chain.setCompanionPaceHooks((k) => k === KEY, () => ({ linearPerCharMs: 100, linearMinMs: 0, linearCapMs: 9999, linearJitterRatio: 0, replyBaseDelayMs: 0 }));
+  assert.equal(chain.typingDelayMs(7, KEY), 700, '陪伴档 100ms/字 应压过全局 150ms/字');
+});
+
+t('非陪伴会话不受陪伴档影响', () => {
+  setup(cfgBase);
+  chain.setCompanionPaceHooks(() => false, () => ({ linearPerCharMs: 100, linearJitterRatio: 0 }));
+  assert.equal(chain.typingDelayMs(7, KEY), 1050);
+});
+
+t('关掉节拍（linearEnabled=false）→ typingDelayMs 返回 null，连基线也不等', () => {
+  setup({ ...cfgBase, linearEnabled: false, replyBaseDelayMs: 2000 });
+  assert.equal(chain.typingDelayMs(10, KEY), null);
+});
+
+t('400ms/字 + cap 20000：55 字 = 22000ms 不再被 4 秒截断', () => {
+  setup({ linearEnabled: true, linearPerCharMs: 400, linearMinMs: 1800, linearCapMs: 20000, linearJitterRatio: 0, replyBaseDelayMs: 0 });
+  assert.equal(chain.typingDelayMs(55, KEY), 20000, '55×400=22000，封顶 20000');
+  assert.equal(chain.typingDelayMs(18, KEY), 7200, '18 字按真实字数算，不封顶');
 });
 
 fs.rmSync(sandbox, { recursive: true, force: true });

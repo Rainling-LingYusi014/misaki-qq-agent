@@ -56,6 +56,10 @@ export class OneBotWsClient extends EventEmitter {
     this._reconnectTimer = null;
     this._watchdog = null;
     this._lastActivityAt = 0;
+    /* 最近一条"真实事件"的时间（message / notice / request，心跳不算）。
+     * 2026-10-28 起因：NapCat 进入"能发、能查、收不到新消息"的半死状态时，心跳与探针全绿，
+     * 只有比对 NapCat 侧最新消息时间才能发现——见 core/napcat-guard.js 的静默探测。 */
+    this.lastRealEventAt = 0;
     this._outbox = [];
     this._reconnectAttempts = 0;
     this._reconnects = 0;                 // 累计成功重连次数（诊断用）
@@ -165,6 +169,8 @@ export class OneBotWsClient extends EventEmitter {
         this._reconnectAttempts = 0;
         if (this._everOpened) this._reconnects += 1;   // 只统计"重连成功"，首次不算
         this._lastActivityAt = Date.now();
+        // 事件水位从"连上那一刻"起算：连上后一直没事件，也能被静默探测发现
+        this.lastRealEventAt = Date.now();
         if (!this._everOpened) {
           this._everOpened = true;
           this.emit('open');
@@ -215,6 +221,10 @@ export class OneBotWsClient extends EventEmitter {
     }
     const post = msg.post_type;
     if (!post) return;
+    /* 2026-10-28：真实事件水位（心跳不算）。收包通道半死时 NapCat 的心跳照样每 5 秒来一次、
+     * get_login_info 也照样回，所以"连接活着"证明不了"消息在进来"——napcat-guard 的静默探测
+     * 拿这个水位当基准，比对 NapCat 侧最近联系人的最新消息时间，就能当场逮住那种状态。 */
+    if (post !== 'meta_event') this.lastRealEventAt = Date.now();
     if (post === 'meta_event') return; // heartbeat/lifecycle：仅刷新活动时间
     if (post === 'message') {
       const kind = msg.message_type === 'private' ? 'private' : (msg.message_type === 'group' ? 'group' : null);

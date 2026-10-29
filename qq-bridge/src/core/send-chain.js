@@ -107,11 +107,12 @@ export function sendChainInFlight() { return inFlight; }
 // 非文本投递（表情/图/戳一戳等，各自独立 enqueueSend）不经过本计数，不计入、也不受节拍约束。
 const LINEAR_DEFAULTS = {
   enabled: true,        // social.send.linearEnabled（false = 不做任何打字延迟）
-  perCharMs: 150,       // social.send.linearPerCharMs（每个字的打字时间，主参数）
-  minMs: 250,           // social.send.linearMinMs（下限：太短的气泡也别贴脸连发）
-  capMs: 4000,          // social.send.linearCapMs（上限：超长句也不会等到天荒地老）
+  perCharMs: 400,       // social.send.linearPerCharMs（每个字的打字时间，主参数；2026-10-28 主人定全局 400）
+  minMs: 1800,          // social.send.linearMinMs（下限：太短的气泡也别贴脸连发）
+  capMs: 20000,         // social.send.linearCapMs（上限：50 字以内按真实字数算，再长才封顶）
   jitterRatio: 0.25,    // social.send.linearJitterRatio（每条的随机抖动比例，真人不会每条一样快）
-  resetMs: 60000        // social.send.linearResetMs（静默这么久后计数归零，下一条重新秒回）
+  resetMs: 60000,       // social.send.linearResetMs（静默这么久后计数归零）
+  baseMs: 0             // social.send.replyBaseDelayMs（冷启动停顿：静默 resetMs 后第一条气泡额外等这么久）
 };
 const linearCounts = new Map(); // chainKey -> { n: 连续成功投递数, lastAt: 最近成功时间, lastLen: 最近一条字数 }
 let linearCfgReader = null;     // qq-send.initQqSendCore 注册：每次取当前 social.send（可变对象，热调即时生效）
@@ -125,6 +126,24 @@ export function setSendLinearCfgReader(fn) { linearCfgReader = fn; }
 let companionPaceProbe = null;      // key => boolean（该会话是否陪伴模式），qq-send.initQqSendCore 注册
 let companionPaceCfgReader = null;  // () => social.companionMode 对象
 export function setCompanionPaceHooks(probe, cfgReader) { companionPaceProbe = probe; companionPaceCfgReader = cfgReader; }
+
+/** 陪伴会话的节拍覆盖（nextSendPaceMs 与 typingDelayMs 共用这一个入口）。
+ *  2026-10-28：上一版只有 nextSendPaceMs 接了它，模型回复走的 typingDelayMs 从来没读过 ——
+ *  于是 10-26 配的陪伴档对聊天回复等于不存在。两条路现在共用，改一处两处都变。 */
+function companionPaceCfg(cfg, key) {
+  if (!key) return cfg;
+  try {
+    if (!companionPaceProbe || !companionPaceCfgReader || !companionPaceProbe(String(key))) return cfg;
+    const cm = companionPaceCfgReader();
+    if (!cm || typeof cm !== 'object') return cfg;
+    const out = { ...cfg };
+    const alias = { linearPerCharMs: 'perCharMs', linearMinMs: 'minMs', linearCapMs: 'capMs', linearJitterRatio: 'jitterRatio', replyBaseDelayMs: 'baseMs' };
+    for (const [ck, outKey] of Object.entries(alias)) {
+      if (cm[ck] !== undefined) out[outKey] = cm[ck];
+    }
+    return out;
+  } catch { return cfg; }
+}
 
 function linearCfgNow() {
   let user = null;
@@ -146,6 +165,7 @@ function linearCfgNow() {
     if (user.capMs === undefined && user.linearCapMs !== undefined) merged.capMs = user.linearCapMs;
     if (user.resetMs === undefined && user.linearResetMs !== undefined) merged.resetMs = user.linearResetMs;
     if (user.jitterRatio === undefined && user.linearJitterRatio !== undefined) merged.jitterRatio = user.linearJitterRatio;
+    if (user.baseMs === undefined && user.replyBaseDelayMs !== undefined) merged.baseMs = user.replyBaseDelayMs;
   }
   return merged;
 }
@@ -187,20 +207,7 @@ export function resetSendPace(key) {
  *  模型走的 qq_send_message 是一次调用一条气泡 → 用下面的 typingDelayMs，别用这个。 */
 export function nextSendPaceMs(key, textLen) {
   if (key == null || String(key) === '') return null;
-  let cfg = linearCfgNow();
-  // 陪伴会话：social.companionMode 的 linear* 平铺键覆盖全局节拍（只覆盖显式写出的键）
-  try {
-    if (companionPaceProbe && companionPaceCfgReader && companionPaceProbe(String(key))) {
-      const cm = companionPaceCfgReader();
-      if (cm && typeof cm === 'object') {
-        cfg = { ...cfg };
-        const alias = { linearPerCharMs: 'perCharMs', linearMinMs: 'minMs', linearCapMs: 'capMs', linearJitterRatio: 'jitterRatio' };
-        for (const [ck, out] of Object.entries(alias)) {
-          if (cm[ck] !== undefined) cfg[out] = cm[ck];
-        }
-      }
-    }
-  } catch { /* 探测失败按全局节拍走 */ }
+  const cfg = companionPaceCfg(linearCfgNow(), key);
   if (cfg.enabled === false) return null;
   const cap = Math.max(0, Number(cfg.capMs) || 0);
   const perChar = Math.max(0, Number(cfg.perCharMs) || 0);
@@ -225,23 +232,39 @@ export function nextSendPaceMs(key, textLen) {
  *  模型每次工具调用只发一条气泡，所以延迟必须挂在"这条气泡"上，而不是"批内第几条"上 ——
  *  否则每条都被当成批内首条，节拍恒为 0（真实调用形态：342 次调用 / 0 次一次带多条）。
  *
- *  返回值：linearEnabled=false 或 字数/每字毫秒非正 → null（调用方不延迟，节奏交回调用方）；
- *          否则 clamp(字数 × perCharMs × (1 ± jitterRatio), minMs, capMs)。
- *  与 nextSendPaceMs 共用同一套参数与同一个 clamp，改配置两处一起变。 */
-export function typingDelayMs(textLen) {
-  const cfg = linearCfgNow();
+ *  2026-10-28 修两个洞：
+ *   ① 以前没有 key 参数、也从不读 social.companionMode —— 10-26 配的"陪伴模式独立打字节拍"
+ *      只接了桥自己发通知的 nextSendPaceMs，模型回复这条路一直用的是全局档（等于陪伴档不存在）。
+ *   ② 长气泡被 linearCapMs 一刀切（55 字本该 11 秒，实际 4 秒就甩出去），越长的句子越像机器。
+ *      现在 cap 提高到 20000，并加 replyBaseDelayMs：静默 resetMs 之后的第一条气泡先"看+想"再打。
+ *
+ *  返回值：linearEnabled=false，或既没有字速也没有冷启动停顿 → null（调用方不延迟，节奏交回调用方）；
+ *          否则 clamp(字数 × perCharMs × (1 ± jitterRatio), minMs, capMs) + 冷启动停顿。 */
+export function typingDelayMs(textLen, key = null) {
+  const k = key == null ? '' : String(key);
+  const cfg = companionPaceCfg(linearCfgNow(), k);
   if (cfg.enabled === false) return null;
   const perChar = Math.max(0, Number(cfg.perCharMs) || 0);
-  if (!(perChar > 0)) return null;
   const len = Math.round(Number(textLen) || 0);
-  if (!(len > 0)) return null;
   const cap = Math.max(0, Number(cfg.capMs) || 0);
   const minMs = Math.max(0, Number(cfg.minMs) || 0);
-  const rawJitter = Number(cfg.jitterRatio);
-  const jitter = Number.isFinite(rawJitter) ? Math.min(0.9, Math.max(0, rawJitter)) : 0;
-  const factor = jitter > 0 ? (1 - jitter + Math.random() * jitter * 2) : 1;
-  const typing = Math.round(len * perChar * factor);
-  return Math.max(Math.min(minMs, cap), Math.min(cap, typing));
+  let ms = null;
+  if (perChar > 0 && len > 0) {
+    const rawJitter = Number(cfg.jitterRatio);
+    const jitter = Number.isFinite(rawJitter) ? Math.min(0.9, Math.max(0, rawJitter)) : 0;
+    const factor = jitter > 0 ? (1 - jitter + Math.random() * jitter * 2) : 1;
+    const typing = Math.round(len * perChar * factor);
+    ms = Math.max(Math.min(minMs, cap), Math.min(cap, typing));
+  }
+  // 冷启动停顿：会话静默超过 resetMs（没有投递记录 = 从来没发过）→ 第一条气泡额外等这么久。
+  // 同一批里第 2 条起已经有记录，不会重复加。
+  const base = Math.max(0, Number(cfg.baseMs) || 0);
+  const idle = base > 0 && k !== '' && (() => {
+    const rec = linearCounts.get(k);
+    return !rec || Date.now() - Number(rec.lastAt) > Number(cfg.resetMs);
+  })();
+  if (ms == null && !idle) return null;
+  return (ms ?? 0) + (idle ? base : 0);
 }
 
 /** 投递成功后调用（textLen = 本条实际字数，供"下一次算间隔"用）。只有投递成功才推进计数。 */

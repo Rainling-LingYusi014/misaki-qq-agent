@@ -126,6 +126,12 @@ export function buildCrossChatBlock(key) {
      * 没有新鲜内容就完全不注入、绝不注入别的会话全文。
      * 明确不做的事：不改回复台账（台账仍严格按会话区分，否则会把 A 里回过的话在 B 里当成"已回过"而漏回）；
      * 不引入迁移逻辑（老的 digests 被忽略，见文件头）。 */
+    /* 2026-10-28 隐私闸：只给 owner 本人的私聊会话注入"别处发生了什么"的正文。
+     * 实测漏洞：泠岚的唤醒 prompt 里出现过 owner 的私聊原话（「今天到现在的，从0点开始即可」），
+     * 反向 owner 的 prompt 里也有泠岚的原文。名字脱敏了、正文没有，对朋友开放后就是串号。
+     * owner 是管理员，保留这份感知；非 owner 只看 [Mail]（那是别人主动转达的留言，属于预期通道）。 */
+    const isOwnerSession = !!cfgRef?.ownerQQ && String(key) === `private:${String(cfgRef.ownerQQ)}`;
+    if (!isOwnerSession) return parts.length ? '\n' + parts.join('\n') : '';
     for (const r of recentMessagesAcrossSessions(key, { windowMs: CROSS_HOUR_MS, limit: 2 })) {
       const label = safeSlice(describeCrossKey(r.key), CROSS_LABEL_MAX);
       const who = (r.isSelf ? 'you' : safeSlice(String(r.sender || '').trim(), CROSS_WHO_MAX)) || r.key;

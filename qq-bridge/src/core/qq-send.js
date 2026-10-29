@@ -42,9 +42,25 @@ export function setQqSendBot(bot) {
   botRef = bot;
 }
 
+/**
+ * 发一个拍一拍（2026-10-28 主人定规：被拍 50% 回拍，纯动作、不带任何文字）。
+ * 私聊 send_poke 自动路由到当前对象；群聊必须给 targetUserId。
+ * 与模型侧的 qq_send_poke 同一套 NapCat 调用，区别只是这条路不需要模型回合。
+ */
+export async function sendPokeQQ(key, targetUserId = '') {
+  const [kind, id] = String(key ?? '').split(':');
+  if (!kind || !id) throw new Error(`拍一拍：会话 key 非法 ${key}`);
+  if (!botRef) throw new Error('拍一拍：NapCat 未就绪');
+  if (kind === 'group') {
+    if (!/^[1-9]\d*$/.test(String(targetUserId || ''))) throw new Error('拍一拍：群聊必须给 targetUserId');
+    return withTimeout(botRef.raw('group_poke', { group_id: Number(id), user_id: Number(targetUserId) }), SEND_TIMEOUT_MS, `拍一拍 ${key}`);
+  }
+  return withTimeout(botRef.raw('send_poke', { user_id: Number(id) }), SEND_TIMEOUT_MS, `拍一拍 ${key}`);
+}
+
 // 发送单条文本（按 QQ 分条），入发送链。
 // opts.single = true：强制整条一个气泡（内部 \n 由 QQ 原生换行渲染，绝不按长度切分）——
-// misaki@ 固定语句（help/consumption）用：列表类回复必须保持一个气泡内的多行版式。
+// misaki@ 固定语句（help/credits）用：列表类回复必须保持一个气泡内的多行版式。
 export function sendToQQ(key, msg, opts = {}) {
   const rawText = String(msg ?? '');
   const swept = sweepMessageArtifacts(rawText);
@@ -472,7 +488,7 @@ export function sendMessages(key, messages, delays, replyToMessageId, atUserId =
        * 在真实调用形态下都等于完全不延迟（342 次调用 / 0 次一次带多条）。
        * linearEnabled=false（或 perChar=0）→ typingDelayMs 返回 null → 不延迟，节奏交回调用方。 */
       const paceLen = String(msg || '').length;
-      const pace = typingDelayMs(paceLen);
+      const pace = typingDelayMs(paceLen, key);
       if (pace != null && pace > 0) log(`[pace] ${key} ${paceLen} 字 → 等 ${pace}ms 再发`);
       if (pace != null && pace > 0) await sleep(pace);
       try {
