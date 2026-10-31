@@ -9,6 +9,8 @@ import { currentMode } from './mode.js';
 import { resolveReplyInfo } from './message-cache.js';
 // 括号反馈（2026-10-29 主人定规）：入站动作性检测 → 实时档（lib/bracket-feedback.js）
 import { detectActionSignal, bracketFeedbackCfg } from '../lib/bracket-feedback.js';
+// 早安问候（2026-10-30 主人改口）：对方主动道早安才拦补发，记账按凌晨 4 点的问候日（lib/morning-greet.js）
+import { isPeerMorningGreeting, greetDayKey } from '../lib/morning-greet.js';
 
 let cfgRef = null;
 export function initSocialFlowCore(cfg) { cfgRef = cfg; }
@@ -98,6 +100,13 @@ export function appendSocialMessage(key, sender, textContent, plainContent, quot
   };
   st.lastUnreadSeq = msg.seq;
   st.lastIncomingAt = Date.now();
+  // 2026-10-30 主人改口：对方**主动道过早安**才拦当天早安补发（说了别的话不算，见 lib/morning-greet.js）。
+  // 日界凌晨 4 点：凌晨发的「早安」算前一夜，不拦当天的。仅私聊记账；识别失败不影响消息流。
+  try {
+    if (String(key).startsWith('private:') && isPeerMorningGreeting(plainContent ?? textContent)) {
+      st.peerGreetDay = greetDayKey(Date.now());
+    }
+  } catch { /* 早安记账失败不影响主流程 */ }
   // 2026-09-15 需求「不停打字发消息，打字状态应该是不断的」
   // QQ 的 input_status 事件并不可靠（有时只在开始/结束各来一次，中间一直打字也不重发），
   // 所以这里用"消息本身"续上打字窗口：收到对方一条消息 = ta 刚才在打字，很可能还在接着打。
@@ -356,6 +365,17 @@ export function recordSentMessages(key, messages) {
     cm.awaitingReplySince = Date.now();
     st._companionPending = false;
     log(`[companion] 陪伴主动落账 ${key}: 今日第 ${cm.proactiveCount} 次`);
+  }
+  // 2026-10-30 早安原话捕获：morningGreet 唤醒后模型发出的第一条消息 = 今天的问好原话。
+  // 存进 morningGreetLast，下次早安唤醒写进「不得与最近一次原话相同」。10 分钟窗口兜底：
+  // 超时未发（模型 mark_read 了）就作废，别把隔了半天的普通回复错记成问好。
+  if (st.morningGreetArmedAt && now - st.morningGreetArmedAt < 10 * 60 * 1000) {
+    const firstText = list.map((it) => String((it && typeof it === 'object') ? it.text ?? '' : it ?? '')).find((t) => t && t.trim());
+    if (firstText) {
+      st.morningGreetLast = firstText.trim().slice(0, 24);
+      log(`[morning] ${key} 早安原话已记：${st.morningGreetLast}`);
+    }
+    st.morningGreetArmedAt = 0;
   }
   for (let i = 0; i < list.length; i++) {
     const item = list[i];

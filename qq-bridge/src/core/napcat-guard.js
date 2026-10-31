@@ -22,7 +22,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 import { STATE_DIR } from '../lib/paths.js';
 import { readJsonSafe, atomicWriteJson } from '../lib/json-fs.js';
@@ -49,6 +49,11 @@ const DEFAULTS = {
   recoverWaitMs: 150000,
   qrWaitMs: 180000,
   serviceName: 'qq-agent-napcat',
+  /* 2026-10-29 Windows 本地栈自愈（两次被踢实证：systemd 命令在 win32 上全是白跑）。
+   * 假死半死态（二维码陈旧、不出新码）时：杀 NapCatWinBootMain 进程树 + 补刀占 3000 的孤儿
+   * → 用这个 launcher 重新拉起 NapCat 进扫码流程。注意绝不能按镜像名杀 QQ.exe（主人的个人 QQ 同名），
+   * 只准杀 boot main 树和占 3000 端口的那个 PID。服务器（linux）走 systemd，本键忽略。 */
+  winLauncherPath: '',
   /* 2026-10-28 静默探测（主人：「这种情况要避免，不然半天排查不出来」）：
    * 现场——NapCat 报 online/good、HTTP 探针全过、心跳每 5 秒照来、bot 还能往外发，
    * 但手机发来的私聊一条都进不来（19:24 之后 29 分钟零事件）。所有现有探针都判健康。
@@ -192,6 +197,46 @@ export function decideHeal({ state, cfg, now = Date.now(), qrAge = Infinity } = 
 async function restartService(g) {
   const started = Date.now();
   try {
+    if (process.platform === 'win32') {
+      /* Windows 本地栈：没有 systemd。等价动作 = 杀 boot main 进程树（含它拉起的 QQ）
+       * → 3000 若仍被孤儿 QQ 占着就按 PID 精确补一刀 → 用 launcher 重新拉起进扫码流程。
+       * launcher 未配置时明确失败，绝不假装成功（那样预算被白白消耗还无人知晓）。 */
+      const lp = String(g.winLauncherPath || '').trim();
+      if (!lp) return { ok: false, ms: Date.now() - started, error: 'win32 未配置 guard.winLauncherPath（launcher-bot.bat 路径），无法自动重启' };
+      /* 2026-10-30 两条加固（当日掉线事故）：
+       * ① 僵尸持锁：旧 QQ 主进程（--user-data-dir=<bot 数据目录>）没死透会握着数据目录锁，
+       *    之后每次新实例都静默起不来——实测看门狗连打 3 次全失败、手动重启也失败。
+       *    从 launcher 自身解析数据目录，只杀命令行含该目录的 QQ.exe（绝不碰主人个人 QQ）。
+       * ② 隐藏启动：优先用同目录的 launcher-bot-hidden.vbs，不弹黑色 cmd 窗口——
+       *    主人关掉那个窗口会连带杀死整棵 QQ 进程树，等于"刚修好又掉线"。 */
+      try {
+        const batText = fs.readFileSync(lp, 'utf8');
+        const mDir = /--user-data-dir=([^\s"]+)/.exec(batText);
+        const botDir = mDir ? mDir[1].trim() : '';
+        if (botDir) {
+          const psDir = botDir.replace(/'/g, "''");
+          await execFileAsync('powershell', ['-NoProfile', '-Command',
+            `$d='${psDir}'; Get-CimInstance Win32_Process -Filter "Name='QQ.exe'" | Where-Object { $_.CommandLine -and $_.CommandLine.Contains($d) } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }`
+          ], { timeout: 25000 }).catch(() => {});
+          await sleep(1500);
+        }
+      } catch { /* 解析/清理失败不阻塞后续重启 */ }
+      await execFileAsync('taskkill', ['/F', '/IM', 'NapCatWinBootMain.exe', '/T'], { timeout: 15000 }).catch(() => {});
+      await sleep(2000);
+      const out = await execFileAsync('cmd.exe', ['/d', '/s', '/c', 'netstat -ano | findstr ":3000 .*LISTENING"'], { timeout: 10000 }).catch(() => ({ stdout: '' }));
+      const pid = String(out.stdout ?? '').trim().split(/\r?\n/)[0]?.trim().split(/\s+/).pop();
+      if (/^\d+$/.test(pid ?? '')) {
+        await execFileAsync('taskkill', ['/F', '/PID', pid, '/T'], { timeout: 15000 }).catch(() => {});
+        await sleep(1000);
+      }
+      const hiddenVbs = path.join(path.dirname(lp), 'launcher-bot-hidden.vbs');
+      if (fs.existsSync(hiddenVbs)) {
+        spawn('wscript.exe', [hiddenVbs], { cwd: path.dirname(lp), detached: true, stdio: 'ignore', windowsHide: true }).unref();
+      } else {
+        spawn(lp, [], { cwd: path.dirname(lp), detached: true, stdio: 'ignore', windowsHide: true, shell: true }).unref();
+      }
+      return { ok: true, ms: Date.now() - started };
+    }
     await execFileAsync('sudo', ['-n', 'systemctl', 'restart', g.serviceName], { timeout: 30000 });
     return { ok: true, ms: Date.now() - started };
   } catch (e) {

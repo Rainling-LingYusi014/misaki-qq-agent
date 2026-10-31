@@ -182,5 +182,89 @@ t('单条偏好遇到超长文本仍然按上限切（不会发出 500 字以上
   assert.ok(r.count >= 3);
 });
 
+// ── 2026-10-31 气泡卫生：人类不用换行/空格分句 ──────────────────────────
+t('两侧都是汉字的空格 → 逗号（「别说话了 闭眼」不是人类习惯）', () => {
+  const r = shapeBubbles(['那就枕着我，别说话了 闭眼'], { odds: [1, 0, 0] });
+  assert.equal(r.bubbles.join(''), '那就枕着我，别说话了，闭眼');
+  const r2 = shapeBubbles(['在的，早上好啊主人 有什么事直接说'], { odds: [1, 0, 0] });
+  assert.equal(r2.bubbles.join(''), '在的，早上好啊主人，有什么事直接说');
+});
+
+t('挨着英文/数字的空格是排版，保留不动（两侧都不是汉字才留）', () => {
+  const r = shapeBubbles(['发你 1080P 的版本'], { odds: [1, 0, 0] });
+  assert.equal(r.bubbles.join(''), '发你 1080P 的版本');
+  // 汉字夹着的空格照转：「60帧 被」「B站 锁」两侧都是汉字 → 逗号
+  const r2 = shapeBubbles(['60帧 被 B站 锁成大会员'], { odds: [1, 0, 0] });
+  assert.equal(r2.bubbles.join(''), '60帧，被 B站，锁成大会员');
+});
+
+t('单个换行 = 两个话题：各成一个气泡，换行消失（V5 实案）', () => {
+  const r = shapeBubbles(['我连游戏都进不去，哪带得动你啊，手都没有\n不过你要材料清单、掉落地图、还差多少这种，我能给你算清楚'], { odds: [1, 0, 0] });
+  assert.equal(r.count, 2, `应两条，实得 ${JSON.stringify(r.bubbles)}`);
+  for (const b of r.bubbles) assert.ok(!b.includes('\n'), `气泡里不该有换行：${JSON.stringify(b)}`);
+  assert.equal(r.bubbles.join(''), '我连游戏都进不去，哪带得动你啊，手都没有不过你要材料清单、掉落地图、还差多少这种，我能给你算清楚');
+});
+
+t('≥2 个换行（歌词/help 回执）仍原样放行——诗歌豁免', () => {
+  const verse = ['晚风轻轻吹过河面', '月光洒在你的窗前', '你说睡吧睡吧', '梦里什么都有'].join('\n');
+  const r = shapeBubbles([verse]);
+  assert.deepEqual(r.bubbles, [verse]);
+  assert.ok(r.bubbles[0].includes('\n'));
+});
+
+t('代码块里的空格/换行一字不动（先于卫生层判定）', () => {
+  const code = ['给你写好了：', '```js', 'const a = 1, b = 2;', '```'];
+  const r = shapeBubbles(code);
+  assert.deepEqual(r.bubbles, code);
+});
+
+t('单条偏好会话：单个换行不拆条，就地换成逗号', () => {
+  const r = shapeBubbles(['在的\n你说吧'], { mode: 'single' });
+  assert.equal(r.count, 1);
+  assert.equal(r.bubbles[0], '在的，你说吧');
+});
+
+t('行尾换行不产生空话题段', () => {
+  const r = shapeBubbles(['好呀\n'], { odds: [1, 0, 0] });
+  assert.deepEqual(r.bubbles, ['好呀']);
+});
+
+t('两个话题各自骰切后总条数破 3 → 退回逗号拼回再骰切（仍 ≤3）', () => {
+  const u1 = '第一句话在这里。第二句话在那里。第三句话在别处';
+  const u2 = '第四句话补在后面。第五句也说完。第六句收尾';
+  const r = shapeBubbles([`${u1}\n${u2}`], { odds: [0, 0, 1] });
+  assert.ok(r.count <= 3, `总条数超 3：${r.count}`);
+  for (const b of r.bubbles) assert.ok(!b.includes('\n'));
+});
+
+// ── 2026-10-31 审查复核（P2-4/P2-5）：无标点长句过墙强切 + 卫生口径扩展 ──
+t('无标点长句过墙：按字数硬补切点，不再整条放行（P2-4）', () => {
+  const long = '这是一个完全没有任何标点的超长句子用来测试长句墙是否真的会把无标点的内容切开而不是原样放行发出一大坨';
+  assert.ok(long.length > 40);
+  const r = shapeBubbles([long], { odds: [1, 0, 0] });
+  assert.ok(r.count >= 2, `过墙无标点应至少两条，实得 ${r.count}`);
+  assert.equal(r.bubbles.join(''), long, '拼回必须等于原句');
+  const r2 = shapeBubbles([long], { odds: [1, 0, 0] });
+  assert.deepEqual(r2.bubbles, r.bubbles, '同输入必须同切法（幂等）');
+});
+
+t('60 字无标点串也至少两条（评审实锤案例）', () => {
+  const s = '说'.repeat(60);
+  const r = shapeBubbles([s], { odds: [1, 0, 0] });
+  assert.ok(r.count >= 2, `应至少两条，实得 ${r.count}`);
+  assert.equal(r.bubbles.join(''), s);
+});
+
+t('假名两侧的空格也转逗号（P2-5 口径扩展）', () => {
+  const r = shapeBubbles(['今日 ね 行くよ'], { odds: [1, 0, 0] });
+  assert.equal(r.bubbles.join(''), '今日，ね，行くよ');
+});
+
+t('孤 \\r 也按换行处理（P2-5）', () => {
+  const r = shapeBubbles(['今天好累\r明天再聊'], { odds: [1, 0, 0] });
+  assert.equal(r.count, 2, `孤 \\r 应拆两条，实得 ${JSON.stringify(r.bubbles)}`);
+  assert.ok(!r.bubbles.some((b) => b.includes('\r')));
+});
+
 console.log(`\n${fail === 0 ? 'ALL PASS' : 'FAILED'}  pass=${pass} fail=${fail}`);
 process.exit(fail === 0 ? 0 : 1);

@@ -107,7 +107,7 @@ export async function resolveReplyInfo(kind, convId, messageId, selfId = null) {
           });
           const senderUserId = raw.sender?.user_id ?? raw.user_id ?? null;
           /* 2026-10-28（主人拍板）：引用预览 200→2000 字，且截断时显式标注——
-           * 原来静默切片，模型只能靠猜（"断在 misaki@re"），还可能把截断当原文句尾。
+           * 原来静默切片，模型只能靠猜（"断在 msk@re"），还可能把截断当原文句尾。
            * 同日审查 P3-6：按码点截断（[...x]），不在 emoji 代理对中间切半个乱码。 */
           const quoteRaw = String(text ?? '');
           const quoteCut = [...quoteRaw].slice(0, 2000).join('');

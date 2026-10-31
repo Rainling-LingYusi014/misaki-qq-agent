@@ -60,7 +60,7 @@ export async function sendPokeQQ(key, targetUserId = '') {
 
 // 发送单条文本（按 QQ 分条），入发送链。
 // opts.single = true：强制整条一个气泡（内部 \n 由 QQ 原生换行渲染，绝不按长度切分）——
-// misaki@ 固定语句（help/credits）用：列表类回复必须保持一个气泡内的多行版式。
+// msk@ 固定语句（help/credits）用：列表类回复必须保持一个气泡内的多行版式。
 export function sendToQQ(key, msg, opts = {}) {
   const rawText = String(msg ?? '');
   const swept = sweepMessageArtifacts(rawText);

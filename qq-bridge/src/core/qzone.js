@@ -92,17 +92,22 @@ export async function postRandomQzone() {
 }
 
 /* ══════════════════════════════════════════════════════════════════════════
- * 自动点赞巡航（2026-10-26，用户需求「QQ空间自动点赞」）
+ * 自动点赞巡航（2026-10-26 首版名单制；2026-10-31 主人改定：固定四窗 + 摆动）
  *
- * 设计：名单制——只巡 config social.qzone.autoLike.uids 里的人（默认空=不巡任何人），
- * 每轮逐人拉最新动态，对「没赞过的新 tid」点赞。去重与当日计数落 state/qzone-liked.json。
+ * 主人 2026-10-31 定规：「于每天 8 时、12 时、18 时、22 时自动刷空间并点赞。
+ * 不可次次准点，应当加入正负 30 分钟的摆动。更高频地刷空间——不然好友的动态
+ * 她半天都不去点赞。」
  *
- * 为什么名单制而不是「好友动态流」：①QZone 的好友聚合流接口没有稳定封装，逐人
- * msglist 是 qq_qzone_view 同款现役路径；②新号行为风控敏感，点赞对象明确可控
- * （只赞主人指定的人）比「巡到谁赞谁」安全得多。
- *
- * 保守默认（可配）：120 分钟一轮、每轮每人最多 1 条 / 总共 3 条、每天上限 12 赞、
- * 深夜（北京 1-6 点）不巡。autoLike.enabled 默认 false——新号养几天再开。
+ * 设计：
+ *   · 四个北京时间锚点（social.qzone.autoLike.times，默认 8/12/18/22），每个锚点
+ *     独立掷 ±jitterMinMs（默认 30 分钟）的摆动；每次重排重掷——不可次次准点；
+ *   · 名单制保留：uids 显式配置优先；**名单为空则自动拉 QQ 好友列表**（上限 40 人）
+ *     ——「好友的动态」不再需要手工维护名单；
+ *   · 轮转起点（cursor 落 qzone-liked.json）：每窗从上窗停的位置继续巡，配合
+ *     maxPerRun 限额，四窗换着人赞——不再永远是名单前几名拿到赞；
+ *   · 每人每窗只赞最新一条没赞过的（逐人 msglist，qq_qzone_view 同款现役路径；
+ *     好友聚合流没有稳定封装，不碰）；去重与当日计数落 state/qzone-liked.json；
+ *   · 深夜（北京 1-6 点）双保险不巡；dailyCap 仍封顶。
  * ══════════════════════════════════════════════════════════════════════════ */
 
 const LIKED_FILE = path.join(STATE_DIR, 'qzone-liked.json');
@@ -165,27 +170,43 @@ async function qzoneDoLike(auth, hostUid, tid) {
 
 function likedState() {
   const s = readJsonSafe(LIKED_FILE, null);
-  return { day: '', tids: [], todayCount: 0, ...(s && typeof s === 'object' ? s : {}) };
+  return { day: '', tids: [], todayCount: 0, cursor: 0, ...(s && typeof s === 'object' ? s : {}) };
+}
+
+/** 巡对象：uids 显式配置优先；为空自动拉 QQ 好友列表（主人 10-31 定规「好友的动态」，
+ * 不再手工维护名单；上限 40 人防超大好友列表把单窗拉得过长）。 */
+async function autoLikeTargets(a) {
+  const manual = Array.isArray(a.uids) ? a.uids.map(String).filter(Boolean) : [];
+  if (manual.length) return manual;
+  try {
+    const j = await napcatOnebot('get_friend_list', {});
+    const fl = Array.isArray(j?.data) ? j.data : (Array.isArray(j?.friends) ? j.friends : []);
+    return fl.map((f) => String(f.user_id ?? '')).filter(Boolean).slice(0, 40);
+  } catch (e) { log(`[qzone-autolike] 拉好友列表失败：${e?.message ?? e}`); return []; }
 }
 
 async function autoLikeRound() {
   const a = cfgRef?.social?.qzone?.autoLike ?? {};
-  const uids = Array.isArray(a.uids) ? a.uids.map(String).filter(Boolean) : [];
-  if (!uids.length) return;
   const bjHour = new Date(Date.now() + 8 * 3600 * 1000).getUTCHours();
   if (bjHour >= 1 && bjHour < 6) { log('[qzone-autolike] 深夜不巡'); return; }
   const st = likedState();
   const today = new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
   if (st.day !== today) { st.day = today; st.todayCount = 0; }
-  const maxPerRun = Math.max(1, Number(a.maxPerRun) || 3);
-  const dailyCap = Math.max(1, Number(a.dailyCap) || 12);
+  const maxPerRun = Math.max(1, Number(a.maxPerRun) || 5);
+  const dailyCap = Math.max(1, Number(a.dailyCap) || 24);
   if (st.todayCount >= dailyCap) { log(`[qzone-autolike] 今日已达上限 ${dailyCap}`); return; }
+  const uids = await autoLikeTargets(a);
+  if (!uids.length) { log('[qzone-autolike] 没有可巡对象（名单空且好友列表拉不到）'); return; }
   let auth;
   try { auth = await qzoneAuth(); } catch (e) { log(`[qzone-autolike] ${e.message}`); return; }
   const seen = new Set(st.tids);
   let did = 0;
-  for (const uid of uids) {
-    if (did >= maxPerRun || st.todayCount >= dailyCap) break;
+  let visited = 0;
+  // 轮转起点：接上窗停的位置继续——四窗换着人赞，不再永远名单前几名拿到赞
+  const start = ((Number(st.cursor) || 0) % uids.length + uids.length) % uids.length;
+  for (let i = 0; i < uids.length && did < maxPerRun && st.todayCount < dailyCap; i++) {
+    const uid = uids[(start + i) % uids.length];
+    visited += 1;
     try {
       const feed = await qzoneFeedLatest(auth, uid, 10);
       // 从新到旧找第一条没赞过的
@@ -195,27 +216,52 @@ async function autoLikeRound() {
         const ok = await qzoneDoLike(auth, uid, tid);
         seen.add(tid); st.tids.push(tid); did += 1; st.todayCount += 1;
         log(`[qzone-autolike] ${ok ? '已赞' : '赞失败'} ${uid} 的 tid=${tid}`);
-        break; // 每人每轮只赞最新一条
+        break; // 每人每窗只赞最新一条
       }
     } catch (e) { log(`[qzone-autolike] 巡 ${uid} 失败: ${e.message}`); }
   }
+  st.cursor = (start + visited) % uids.length;
   if (st.tids.length > 2000) st.tids = st.tids.slice(-1500);
   try { atomicWriteJson(LIKED_FILE, st); } catch {}
-  if (did) log(`[qzone-autolike] 本轮赞了 ${did} 条（今日 ${st.todayCount}/${dailyCap}）`);
+  log(`[qzone-autolike] 本轮巡 ${visited} 人、赞 ${did} 条（今日 ${st.todayCount}/${dailyCap}；下窗从第 ${st.cursor + 1} 位续）`);
 }
 
 let autoLikeTimer = null;
+/** 下一窗时刻：北京 times 锚点 + ±jitter 摆动（每次重排重掷——不可次次准点），只回未来。 */
+export function nextAutoLikeAt(a) {
+  const times = (Array.isArray(a.times) && a.times.length ? a.times : [8, 12, 18, 22])
+    .map(Number).filter((h) => Number.isFinite(h) && h >= 0 && h <= 23).sort((x, y) => x - y);
+  if (!times.length) return 0;
+  const jitterMs = Math.max(0, Number(a.jitterMinMs ?? 30 * 60 * 1000));
+  const now = Date.now();
+  const bj = new Date(now + 8 * 3600 * 1000);
+  const bjMidnight = Date.UTC(bj.getUTCFullYear(), bj.getUTCMonth(), bj.getUTCDate()) - 8 * 3600 * 1000;
+  for (let day = 0; day < 2; day++) {
+    for (const h of times) {
+      const anchor = bjMidnight + day * 86400e3 + h * 3600e3;
+      const at = anchor + (jitterMs ? Math.round((Math.random() * 2 - 1) * jitterMs) : 0);
+      if (at > now + 30 * 1000) return at;
+    }
+  }
+  return 0;
+}
+
 export function startQzoneAutoLike() {
-  if (autoLikeTimer) { clearInterval(autoLikeTimer); autoLikeTimer = null; }
+  if (autoLikeTimer) { clearTimeout(autoLikeTimer); autoLikeTimer = null; }
   const a = cfgRef?.social?.qzone?.autoLike ?? {};
   if (a.enabled !== true) { log('[qzone-autolike] 未启用（social.qzone.autoLike.enabled !== true）'); return; }
-  if (!Array.isArray(a.uids) || !a.uids.length) { log('[qzone-autolike] 名单为空，不巡'); return; }
-  const intervalMs = Math.max(30 * 60 * 1000, Number(a.intervalMinMs) || 120 * 60 * 1000);
-  autoLikeTimer = setInterval(() => { autoLikeRound().catch(() => {}); }, intervalMs);
-  autoLikeTimer.unref?.();
-  // 启动后先歇半个周期再首轮（避开启动风暴）
-  setTimeout(() => { autoLikeRound().catch(() => {}); }, Math.min(intervalMs / 2, 10 * 60 * 1000)).unref?.();
-  log(`[qzone-autolike] 巡航已启动：每 ${Math.round(intervalMs / 60000)} 分钟一轮，名单 ${a.uids.length} 人，每轮最多 ${Number(a.maxPerRun) || 3} 赞，每日上限 ${Number(a.dailyCap) || 12}`);
+  const scheduleNext = () => {
+    const at = nextAutoLikeAt(a);
+    if (!at) { log('[qzone-autolike] 排不出下一窗（times 配置异常），30 分钟后重试'); autoLikeTimer = setTimeout(scheduleNext, 30 * 60 * 1000); autoLikeTimer.unref?.(); return; }
+    const hhmm = new Date(at + 8 * 3600 * 1000).toISOString().slice(11, 16);
+    const mins = Math.max(1, Math.round((at - Date.now()) / 60000));
+    autoLikeTimer = setTimeout(() => {
+      autoLikeRound().catch((e) => log(`[qzone-autolike] 本窗异常: ${e?.message ?? e}`)).finally(scheduleNext);
+    }, Math.max(1000, at - Date.now()));
+    autoLikeTimer.unref?.();
+    log(`[qzone-autolike] 下一窗已排：北京 ${hhmm} 前后（约 ${mins} 分钟后；四窗 ${JSON.stringify(a.times ?? [8, 12, 18, 22])} ±${Math.round(Number(a.jitterMinMs ?? 30 * 60 * 1000) / 60000)}min 摆动）`);
+  };
+  scheduleNext();
 }
 
 /* ══════════════════════════════════════════════════════════════════════════

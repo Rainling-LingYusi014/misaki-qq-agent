@@ -3,12 +3,14 @@
 // 规则原话：「每天7~8点，8~9点主动向列表内的好友用户问早安。这两个时间段的概率分别为33%和67%，
 // 然而时间段内的具体某一时刻则随机」+「每天必然问早安」+「如果已经有人先一步发起了询问早安，
 // 后来再发一次就会显得相当奇怪」+「把静默窗口也跟随调整，调到7点」。
+// 2026-10-30 主人改口两条：「已先开口」只指**主动道过早安**，今天说了别的话不拦（照发不误）；
+// 「今天」的日界从 0 点改到**凌晨 4 点**（熬到凌晨的对话算前一夜）。
 //
 // 守六件事：
 //   ① 确定性 —— 同 会话+日期 永远同一时刻（重启重算一致 = 不重发不漏账的根基）；
 //   ② 窗口边界 —— 时刻落在自己被掷中的窗口内（北京时间）；
 //   ③ 33/67 分布 —— 大样本下窗口1占比贴 0.33；
-//   ④ 到点判定 —— 问过/对方先开口/正聊着 都不发，干净才发；
+//   ④ 到点判定 —— 问过/对方先道过早安/正聊着 都不发，干净才发（④b 问候识别、④c 日界）；
 //   ⑤ 跨日翻篇 —— 明天的时刻严格晚于今天，且换日换骰；
 //   ⑥ 静默窗 —— 陪伴静默默认提前到 07:00 后，07:05 已可主动、06:55 仍静默。
 //
@@ -70,14 +72,29 @@ check('③b 概率可配：p1=0 恒落窗口2，p1=1 恒落窗口1', () => {
   }
 });
 
-check('④ 到点判定：问过/对方先开口/正聊着都不发，干净才发', () => {
-  const dayStart = Date.parse('2026-10-29T00:00:00+08:00');
-  const base = { dateKey: '2026-10-29', dayStartMs: dayStart };
+check('④ 到点判定：问过/对方先道过早安/正聊着都不发，干净才发', () => {
+  const base = { dateKey: '2026-10-29' };
   assert.equal(lib.morningGreetDecision({ ...base, greetedDay: '2026-10-29' }).fire, false);
-  assert.equal(lib.morningGreetDecision({ ...base, lastIncomingAt: dayStart - 1 }).fire, true, '昨天说的话不算今天搭上话');
-  assert.equal(lib.morningGreetDecision({ ...base, lastIncomingAt: dayStart + 60000 }).fire, false, '今天先开口 → 不补发');
+  assert.equal(lib.morningGreetDecision({ ...base, peerGreetedDay: '2026-10-29' }).fire, false, '对方先道过早安 → 不补发');
+  assert.equal(lib.morningGreetDecision({ ...base, peerGreetedDay: '2026-10-28' }).fire, true, '昨天的早安不拦今天');
   assert.equal(lib.morningGreetDecision({ ...base, busy: true }).fire, false);
   assert.equal(lib.morningGreetDecision(base).fire, true);
+});
+
+check('④b 问候识别（2026-10-30 改口）：纯问候算，别的话不算', () => {
+  for (const yes of ['早', '早安', '早上好', '早呀！', '早啊~', '早安，昨晚睡得怎么样', '早[表情:太阳]', 'Good Morning']) {
+    assert.equal(lib.isPeerMorningGreeting(yes), true, `应认作问候: ${yes}`);
+  }
+  for (const no of ['', '晚安', '早点睡吧', '早上再说', '早自习取消了吗', '今天早点来', '早安' + '啊'.repeat(30)]) {
+    assert.equal(lib.isPeerMorningGreeting(no), false, `不应认作问候: ${no}`);
+  }
+});
+
+check('④c 问候日界凌晨 4 点（2026-10-30 定规）：03:59 仍算前一日，04:00 起算新一日', () => {
+  assert.equal(lib.greetDayKey(Date.parse('2026-10-31T00:30:00+08:00')), '2026-10-30', '凌晨 0 点半算前一夜');
+  assert.equal(lib.greetDayKey(Date.parse('2026-10-31T03:59:00+08:00')), '2026-10-30');
+  assert.equal(lib.greetDayKey(Date.parse('2026-10-31T04:00:00+08:00')), '2026-10-31');
+  assert.equal(lib.greetDayKey(Date.parse('2026-10-31T08:00:00+08:00')), '2026-10-31');
 });
 
 check('⑤ 跨日翻篇：明天的时刻严格晚于今天 +12h，且换日换骰', () => {

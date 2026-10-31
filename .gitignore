@@ -1,17 +1,64 @@
-# 机密与实例数据——永不入库
-config.json
+# 实例数据与机密——永不入库
 state/
-*.log
-
-# 登录二维码与本地杂记
-deploy/qrcode.png
-命名备注.md
+config.json
+凭据_*.md
+# 2026-10-26: persona/speech-rules 升格为核心资产入库（玲結美咲人设，走审稿流程）；
+# 备份残骸仍不入库（*.bak* 见下方历史规则）
+persona.md.bak*
+speech-rules.md.bak*
 
 # 运行时产物
 node_modules/
 .runtime/
+*.log
+logs/
+
+# 历史备份残骸
 *.bak
 *.bak-*
+deploy/qrcode.png
 
-# 测试运行时自拷的沙箱
-tests/.tmp-*
+# 会话工作文件与个人文件（不入库）
+tmp-*.cjs
+tmp-*.mjs
+命名备注.md
+*交接文档*.md
+*对接报告*.md
+陪伴模式审查报告.md
+聊天节奏参数表.xlsx
+
+# 2026-10-27（审查 P2-4）：诊断工作目录（含整个浏览器 profile，114MB）——绝不能被 git add -A 带进历史
+tmp-diag/
+
+# QQ 线本地栈与迁移快照（含密钥/凭据，永不入库）
+本地栈/
+迁移备份*/
+# DSH 本地安装与数据目录（node_modules 大、数据目录含模型会话与令牌）
+dsh-local/
+dsh-home/
+
+# 2026-10-31 公共库净化（push 前清扫）：
+# 旧状态备份目录（个人聊天/会话数据）绝不入库
+state-dev-old-*/
+qq-bridge/state-dev-old-*/
+# 登录恢复二维码（个人文件）
+QQ扫码恢复_*.png
+qq-bridge/QQ扫码恢复_*.png
+# 服务器运维内档（含服务器 IP / SSH 细节，只留本地）
+TG资源管线_设计_*.md
+TG资源管线_交接_*.md
+B站自动化运营_进度与契约_*.md
+审计报告_随档_*.md
+bili-login.mjs
+bili-pwd-login.mjs
+# 大二进制与调试残留不入库
+qq-bridge/bin/
+misaki-*.mp4
+qq-bridge/state_spawn-test.mjs
+qq-bridge/test-dsh-v2-wait.mjs
+# TG 侧车运行环境（venv 巨大且远端标准不含 tg-line，整目录不入库）
+tg-line/
+/python/
+*审查报告*.md
+misaki_自我认知与邮箱_*.md
+内部_*.md

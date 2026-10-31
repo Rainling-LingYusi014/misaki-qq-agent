@@ -1,4 +1,4 @@
-// 回归测试：misaki@reaction（陪伴模式括号反馈总开关，2026-10-29 主人定规）
+// 回归测试：msk@reaction（陪伴模式括号反馈总开关，2026-10-29 主人定规）
 //
 // 规格原话要点：
 //   · 只有开/关两种状态，像按按钮——开启状态下输入指令默认关闭，反之开启；
@@ -9,8 +9,8 @@
 //   ① 默认开；翻转一次变关、再翻一次回开（按钮语义）；
 //   ② 按会话独立（一人关掉不牵连别人）；
 //   ③ 落盘 + 重启读回（脏值回落开）；
-//   ④ help 行格式精确：`misaki@reaction | 陪伴模式反馈总开关（当前：开）`；
-//   ⑤ 解析器认得 misaki@reaction（含结尾标点容错）；
+//   ④ help 行格式精确：`msk@reaction | 陪伴模式反馈总开关（当前：开）`；
+//   ⑤ 解析器认得 msk@reaction（含结尾标点容错）；
 //   ⑥ 三条执行路径都读这个开关（发送成形 / 唤醒档位行 / 入站动作检测），源码级接线断言。
 // 用法：node tests/reaction-switch.test.js
 import assert from 'node:assert/strict';
@@ -31,8 +31,8 @@ const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), 'qbh-reaction-'));
 fs.cpSync(path.join(repo, 'src'), path.join(sandbox, 'src'), { recursive: true });
 fs.writeFileSync(path.join(sandbox, 'package.json'), JSON.stringify({ name: 'qb-reaction', private: true, type: 'module' }));
 fs.mkdirSync(path.join(sandbox, 'state'), { recursive: true });
-fs.writeFileSync(path.join(sandbox, 'config.json'), JSON.stringify({ ownerQQ: '1000000001', allowAllWhenEmpty: true }));
-const cfg = { ownerQQ: '1000000001', allowAllWhenEmpty: true, allow: {}, deny: {}, social: {} };
+fs.writeFileSync(path.join(sandbox, 'config.json'), JSON.stringify({ ownerQQ: '1736784911', allowAllWhenEmpty: true }));
+const cfg = { ownerQQ: '1736784911', allowAllWhenEmpty: true, allow: {}, deny: {}, social: {} };
 const modUrl = (p, v) => pathToFileURL(path.join(sandbox, 'src', p)).href + (v ? `?v=${v}` : '');
 for (const p of ['core/mode.js', 'core/qq-send.js', 'core/social-flow.js']) {
   try { const m = await import(modUrl(p)); (m.initModeCore || m.initQqSendCore || m.initSocialFlowCore)?.(cfg); } catch { /* 可选 */ }
@@ -41,8 +41,8 @@ const social = await import(modUrl('core/social-state.js'));
 social.initSocialCore(cfg);
 const companion = await import(modUrl('core/companion-mode.js'));
 
-const A = 'private:1000000002';
-const B = 'private:1000000003';
+const A = 'private:1832746340';
+const B = 'private:1265046372';
 social.getSocialState(A);
 social.getSocialState(B);
 
@@ -72,24 +72,24 @@ check('③ 落盘 + 重启读回；脏值回落关', () => {
   assert.equal(raw2.conversations[B]?.bracketReaction, false, '关闭状态同样要落盘');
 });
 
-check('④ help 行格式：misaki@reaction | 陪伴模式反馈总开关（当前：开/关）', () => {
+check('④ help 行格式：msk@reaction | 陪伴模式反馈总开关（当前：开/关）', () => {
   const on = companion.helpText('companion', true);
   const off = companion.helpText('companion', false);
-  assert.ok(on.includes('misaki@reaction | 陪伴模式反馈总开关（当前：开）'), `开态行不对：\n${on}`);
-  assert.ok(off.includes('misaki@reaction | 陪伴模式反馈总开关（当前：关）'), `关态行不对：\n${off}`);
-  assert.match(on, /misaki@reaction \| /, '指令与文本之间必须是「空格 竖线 空格」');
-  assert.ok(!on.includes('misaki@reaction|'), '不能少了空格');
+  assert.ok(on.includes('msk@reaction | 陪伴模式反馈总开关（当前：开）'), `开态行不对：\n${on}`);
+  assert.ok(off.includes('msk@reaction | 陪伴模式反馈总开关（当前：关）'), `关态行不对：\n${off}`);
+  assert.match(on, /msk@reaction \| /, '指令与文本之间必须是「空格 竖线 空格」');
+  assert.ok(!on.includes('msk@reaction|'), '不能少了空格');
   const unknown = companion.helpText('companion', null);
-  assert.ok(unknown.includes('misaki@reaction | 陪伴模式反馈总开关'), '状态未知时不硬编开/关');
+  assert.ok(unknown.includes('msk@reaction | 陪伴模式反馈总开关'), '状态未知时不硬编开/关');
   assert.ok(!unknown.includes('当前：'), '状态未知就不该显示「当前：」');
 });
 
-check('⑤ 解析器认得 misaki@reaction（结尾标点容错，正文带尾巴不算指令）', () => {
-  assert.equal(companion.parseMisakiCommand('misaki@reaction')?.kind, 'action-reaction');
-  assert.equal(companion.parseMisakiCommand('misaki@reaction。')?.kind, 'action-reaction');
+check('⑤ 解析器认得 msk@reaction（结尾标点容错，正文带尾巴不算指令）', () => {
+  assert.equal(companion.parseMisakiCommand('msk@reaction')?.kind, 'action-reaction');
+  assert.equal(companion.parseMisakiCommand('msk@reaction。')?.kind, 'action-reaction');
   assert.equal(companion.parseMisakiCommand('MISAKI@REACTION')?.kind, 'action-reaction', '大小写不敏感');
-  assert.equal(companion.parseMisakiCommand('misaki@reaction 开吗'), null, '带尾巴的话按普通聊天放行');
-  assert.equal(companion.parseMisakiCommand('随便说说 misaki@reaction'), null, '句中提及不触发');
+  assert.equal(companion.parseMisakiCommand('msk@reaction 开吗'), null, '带尾巴的话按普通聊天放行');
+  assert.equal(companion.parseMisakiCommand('随便说说 msk@reaction'), null, '句中提及不触发');
 });
 
 check('⑥ 三条执行路径都读这个开关（源码级接线断言）', () => {
@@ -114,8 +114,8 @@ check('⑦ 常规模式一律不出括号，跟开关状态无关（源码级：
   assert.ok(gate >= 2, `两条唤醒路径都必须先判陪伴模式，实际 ${gate} 处`);
 });
 
-check('⑧ 模式来回切换不重置开关；misaki@reset 也只清认知、不动这项偏好', () => {
-  const K = 'private:1000000002';
+check('⑧ 模式来回切换不重置开关；msk@reset 也只清认知、不动这项偏好', () => {
+  const K = 'private:1832746340';
   social.setConversationMode(K, 'companion');
   assert.equal(social.bracketReactionOf(K), false, '默认关');
   assert.equal(social.toggleBracketReaction(K), true, '本人打开');

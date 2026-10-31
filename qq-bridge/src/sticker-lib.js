@@ -66,7 +66,13 @@ export function saveStickerStore(file, entries) {
 // 把 NapCat 返回的 QQ 收藏表情详情合并进本地库。
 // 保留本地 AI 认知字段（localNote/tags/usage/useCount/lastUsedAt/lastContext），
 // 只更新 QQ 侧字段（id/resId/url/md5/desc）。
-export function mergeStickerLibrary(existing, fetched) {
+// 2026-10-30 两处加固（主人 QQ 备注整库丢失的事故复盘）：
+//   ① desc 只在新值非空时覆盖——回退路径（纯 URL 列表）拿不到 desc，空串 ?? 语义会把
+//      QQ 备注整库冲成空（`'' ?? old` 命中 ''，不会落到 old）；
+//   ② allowPrune=false 时跳过「QQ 端已删除」清理——NapCat 缓存未热会返回**部分**列表，
+//      清理规则（以 fetch 到的为准）会把缺席条目当已删除推平整库（2026-10-30 全部 26 条
+//      createdAt 同日重建即此伤）。生产侧由 sticker.js 连续两轮同一缺席集才放行清理。
+export function mergeStickerLibrary(existing, fetched, opts = {}) {
   const out = existing.map(normalizeStickerEntry).filter(Boolean);
   const byId = new Map(out.map((e) => [e.id, e]));
   const fetchedIds = new Set();
@@ -85,7 +91,7 @@ export function mergeStickerLibrary(existing, fetched) {
       resId: String(item.resId || item.emoji_id || id).trim(),
       url: String(item.url || old?.url || '').trim(),
       md5: String(item.md5 || old?.md5 || '').trim().toUpperCase(),
-      desc: String(item.desc ?? old?.desc ?? '').trim(),
+      desc: String(item.desc ?? '').trim() || old?.desc || '',
       localNote: old?.localNote || '',
       tags: old?.tags || [],
       usage: old?.usage || '',
@@ -105,7 +111,9 @@ export function mergeStickerLibrary(existing, fetched) {
       if (idx >= 0) out[idx] = merged;
     }
   }
-  // 清理已被 QQ 端删除的收藏表情（保留手动/本地新增的非 qq 来源条目）。
+  // 清理已被 QQ 端删除的收藏表情（保留手动/本地新增的非 qq 来源条目）；
+  // allowPrune=false 时不清理（部分列表防误杀，见函数头注释）。
+  if (opts.allowPrune === false) return out;
   return out.filter((e) => e.source !== 'qq' || fetchedIds.has(e.id));
 }
 
@@ -179,22 +187,16 @@ export function buildStickerContext(entries, max = 8) {
 
 // default模式下的“真人发表情包”策略提示。
 // 这是软策略：AI 仍自主判断是否使用，桥接不强制。
-// rate（可选 0~1）：配置里的“表情频率”——用于把下面的频率档位文案改成实际档。
-export function buildStickerStrategyHint(rate) {
-  let freqLine = '- 频率：普通闲聊大约每 2~3 轮就可以来一张；接梗、被夸、怼人、赞同、无语、赢了/输了、别人发了图这些场合尽量跟一张，热闹/玩梗时可以更密，只要别连续刷屏。';
-  const r = Number(rate);
-  if (Number.isFinite(r) && r >= 0 && r <= 1) {
-    const band = r < 0.15 ? '低' : r <= 0.45 ? '中' : '高';
-    const pace = r < 0.15 ? '大约每 8~12 轮才来一张，宁缺毋滥' : r <= 0.45 ? '大约每 2~4 轮来一张，穿插在接梗/赞同/无语/输了赢了等场合' : '大约每 1~2 轮就可以来一张，气氛热闹时更密';
-    freqLine = `- 频率（主人设为「${band}」档 ≈ ${Math.round(r * 100)}%）：${pace}；但别连续刷屏，一条消息只能一张。`;
-  }
+// 2026-10-30 主人定调：概率（rate 参数）退役——频率只描述两个硬闸（30s 间隔 + 窗口限额），
+// 机会每轮都在（桥的 [Meme] 行轮轮在场）；rate 参数保留仅为调用方兼容，不再参与文案。
+export function buildStickerStrategyHint(_rate) {
+  const freqLine = '- 频率：每一轮都有机会发；硬性限制是两张表情最短隔 30 秒、5 分钟内最多 5 张（桥的 [Meme] 行会实时报额度）。发不看运气看语境：接梗、被夸、怼人、赞同、自嘲、无语、赢了/输了、别人发了图，该跟就跟；正式/低沉的话题不硬塞，也别凑着额度硬发。';
   return [
     '[表情包策略：像真人一样用，不刷屏]',
     '- 表情优先级：① 收藏表情包（qq_list_stickers/qq_send_sticker）和 QQ 原生表情（qq_face_list/qq_send_qq_face，含动态大表情）同级第一，哪个更贴语境用哪个；② 颜文字比较少用（情绪到位时才来一个），要用就优先冷脸萌风格（ᗜ - ᗜ 这类 ᗜ 眼的死鱼脸但可爱）；③ 输入法 emoji 最后（直接写在文字里，QQ 会正常显示）。',
     '- 合适时机：被戳中笑点/槽点、接梗、怼人、赞同、自嘲、安慰、无语、赢了/输了、告别/晚安、别人发了表情时回一张，都可以自然用。',
     // 2026-09-19：这里原来还有一条硬编码的"- 频率：普通闲聊大约每 2~3 轮就可以来一张…"，
-    // 与下面按配置生成的 freqLine 直接打架（设 5% 时它还在说"每 2~3 轮一张"）。
-    // 频率只留 freqLine 一条真话：它由 social.sticker.sendProbability 算出来。
+    // 与下面按配置生成的 freqLine 直接打架。频率只留 freqLine 一条真话（2026-10-30 起描述硬闸）。
     freqLine,
     '- 选择：优先用备注（desc）和你的记忆（localNote/tags）能准确对上语境的；没有备注/不确定的表情，先 qq_get_sticker_image 看图再决定，不要瞎发。',
     '- 发送：用 qq_send_sticker；一条消息只能是一张表情，不能在同一气泡里附带文字；想说的话先用 qq_send_message / qq_reply 作为单独气泡发出，再单独发表情。需要引用/点名时传 replyToMessageId / atUserId（群聊）。',

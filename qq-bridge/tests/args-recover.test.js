@@ -94,7 +94,7 @@ await t('⑦ 频率类失败 → 等 2.5s 重试一次，第二次成功就算�
     return { status: 200, json: async () => ({ ok: true, sent: 1 }) };
   };
   const r = await recoverUnquotedSend({
-    key: 'private:1000000001',
+    key: 'private:1736784911',
     stash: { raw: SITE, tool: 'mcp__napcat__qq_send_message' },
     post: { url: 'http://127.0.0.1:3100/x', fetch: impl },
   });
@@ -105,19 +105,19 @@ await t('⑦ 频率类失败 → 等 2.5s 重试一次，第二次成功就算�
 await t('⑧ 幻觉 key 防线：修复后的 key ≠ 当前会话且未声明 crossSession → 改发当前会话', async () => {
   const { calls, impl } = stubFetch();
   const r = await recoverUnquotedSend({
-    key: 'private:1000000001',
+    key: 'private:1736784911',
     stash: { raw: '{"key":"private:1736784911","messages": 就知道会这样, "token":"t1"}', tool: 'mcp__napcat__qq_send_message' },
     post: { url: 'http://127.0.0.1:3100/x', fetch: impl },
   });
   assert.equal(r.ok, true);
-  assert.equal(r.key, 'private:1000000001', '必须落到当前会话，绝不发去猜出来的号');
-  assert.equal(calls[0].body.key, 'private:1000000001');
+  assert.equal(r.key, 'private:1736784911', '必须落到当前会话，绝不发去猜出来的号');
+  assert.equal(calls[0].body.key, 'private:1736784911');
 });
 
 await t('⑨ 显式 crossSession:true → 尊重原目标（端点白名单仍会把关）', async () => {
   const { calls, impl } = stubFetch();
   const r = await recoverUnquotedSend({
-    key: 'private:1000000001',
+    key: 'private:1736784911',
     stash: { raw: '{"key":"private:3763302862","crossSession":true,"messages": 帮你带句话, "token":"t1"}', tool: 'mcp__napcat__qq_send_message' },
     post: { url: 'http://127.0.0.1:3100/x', fetch: impl },
   });
@@ -129,7 +129,7 @@ await t('⑩ 控制台 fail-closed → 请求必须带 x-console-token', async (
   const seen = [];
   const impl = async (url, init) => { seen.push(init); return { status: 200, json: async () => ({ ok: true, sent: 1 }) }; };
   await recoverUnquotedSend({
-    key: 'private:1000000001',
+    key: 'private:1736784911',
     cfg: { consolePort: 3100, consoleToken: 'ct-token-123' },
     stash: { raw: SITE, tool: 'mcp__napcat__qq_send_message' },
     post: { url: 'http://127.0.0.1:3100/x', fetch: impl },

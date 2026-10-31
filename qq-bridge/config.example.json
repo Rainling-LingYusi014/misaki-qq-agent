@@ -48,7 +48,9 @@
     "restartGraceSec": 60,
     "recoverWaitMs": 150000,
     "autoHeal": null,
-    "_note": "NapCat 会话守护：定期用 get_rkey 探活（该接口每次都真的请求 QQ 服务器，且对别人不可见），连续 failThreshold 次失败就判定「会话假死」并重启容器自愈。autoHeal=null（默认）表示「容器配了免扫码回退登录（NAPCAT_QUICK_PASSWORD_MD5）才自动重启」；没配就只记录告警不出手，避免把机器人推到必须扫码的状态。管理端「NapCat」卡里可以开关、手动自愈、看二维码。"
+    "_note": "NapCat 会话守护：定期用 get_rkey 探活（该接口每次都真的请求 QQ 服务器，且对别人不可见），连续 failThreshold 次失败就判定「会话假死」并重启容器自愈。autoHeal=null（默认）表示「容器配了免扫码回退登录（NAPCAT_QUICK_PASSWORD_MD5）才自动重启」；没配就只记录告警不出手，避免把机器人推到必须扫码的状态。管理端「NapCat」卡里可以开关、手动自愈、看二维码。",
+    "winLauncherPath": "D:\\NapCat\\Shell\\launcher-bot.bat",
+    "_note_winLauncherPath": "Windows 本地栈自动重启用的拉起脚本（launcher-bot.bat）；服务器 linux 忽略此键"
   },
   "sessionCwd": "",
   "agentPreset": "qq-chat",
@@ -168,6 +170,8 @@
   },
   "social": {
     "enabled": true,
+    "_note_dndWindows": "免打扰时段（北京时间），字符串形态 \"HH:MM-HH:MM\" 逗号分隔多段，数组形态 [{start,end}]；键缺省=内置默认 23:00-08:00，空串=关闭。结束时刻需早于早安窗口2 起点（08:00），否则窗口1 的问候会被静默跳过",
+    "dndWindows": "23:00-07:00",
     "autoReplyCheckMs": 30000,
     "agentPreset": "qq-chat",
     "provideRecommendations": true,
@@ -305,10 +309,15 @@
     },
     "sticker": {
       "enabled": true,
+      "_note_send": "表情机会线（send-dice.js）：每轮唤醒都给机会（[Meme] available），限频靠两个硬闸——sendMinIntervalMs 两张最短间隔（默认 30s）、sendMaxPerWindow/sendMaxWindowMs 滑动窗口限额（默认 5 张/5 分钟）。库存是前提：meme 包目录为空且收藏表情少时，模型会以「库里没有对得上的」跳过——想多发先补包库",
+      "sendMinIntervalMs": 30000,
+      "sendMaxPerWindow": 5,
+      "sendMaxWindowMs": 300000,
       "syncTtlMs": 60000,
       "maxListCount": 100,
       "includeInPrompt": true,
-      "promptMaxStickers": 8,
+      "_note_promptMax": "promptMaxStickers = 注入提示词的表情清单上限（钳 1~30，默认 8）。收藏少时建议拉满让全部备注可见",
+      "promptMaxStickers": 30,
       "collect": {
         "enabled": true,
         "maxPerMinute": 2,
@@ -336,7 +345,8 @@
       "dailyMinWindowStart": "19:00",
       "dailyMinWindowEnd": "22:30",
       "_proactiveNote20261027": "freshContextOnly=true 时只有冷场窗口里有「新话题」才主动冒泡（实测私有默认 false）；privateDailyMax 是私聊主动冒泡的每日硬上限（与 budget 分开数，0=不限）。",
-      "_dailyMinNote": "2026-10-28 主人定规：常规模式私聊每天至少一次主动关心（陪伴模式有自己的参数档）。privateDailyMin=每天保底主动次数（0=关闭）；dailyMinWindowStart/End=保底窗口（北京时间，默认 19:00–22:30）。到期条件：今天没主动过 + 在窗口内 + 对方今天没说过话；到期时放宽 freshContextOnly，唤醒正文带 [Guide]。idleThresholdMs（冷场阈值）2026-10-28 起为 30 分钟。"
+      "_dailyMinNote": "2026-10-28 主人定规：常规模式私聊每天至少一次主动关心（陪伴模式有自己的参数档）。privateDailyMin=每天保底主动次数（0=关闭）；dailyMinWindowStart/End=保底窗口（北京时间，默认 19:00–22:30）。到期条件：今天没主动过 + 在窗口内 + 对方今天没说过话；到期时放宽 freshContextOnly，唤醒正文带 [Guide]。idleThresholdMs（冷场阈值）2026-10-28 起为 30 分钟。",
+      "_regularPrivateNote": "2026-10-30 主人定规：常规模式私聊每天唯一的主动 = 早安问候（morningGreet），本段的主动机会链对非陪伴私聊已停用（排程端/回调端双守卫）；陪伴模式 companionCare 不受影响。下列私聊参数对常规私聊已不生效，仅陪伴/群聊路径仍在用。"
     },
     "poke": {
       "_note": "拍一拍的开口策略（2026-10-28 主人定规）：单拍不追问；doubleTapMs 内第二下算『一连两下』，或 windowMs 内累计 count 下 → 问一次；问过之后 cooldownMs 内不再问。QQ 拍一拍本身有 ≥10 秒冷却，doubleTapMs 必须明显大于 10 秒（现在 15 秒）。计数按会话+发送者分开。",
@@ -462,7 +472,7 @@
       ]
     },
     "morningGreet": {
-      "_note": "早安问候（2026-10-29 主人定规）：白名单私聊每天必问一次，骰子只决定落在哪个窗口（p1=窗口1概率，窗口2=1-p1），分钟在窗内随机。不占主动配额；「对方今天已先开口/今天已问过/陪伴静默时段/免打扰」则当天跳过，不补发。privateExcludeUids（proactive 的不粘人名单）对它同样生效。enabled=false 整体关掉。",
+      "_note": "早安问候（2026-10-29 主人定规）：白名单私聊每天必问一次，骰子只决定落在哪个窗口（p1=窗口1概率，窗口2=1-p1），分钟在窗内随机。不占主动配额；「对方今天已先道过早安（2026-10-30 改口：说了别的话不算）/今天已问过/陪伴静默时段/免打扰」则当天跳过，不补发。「今天」按问候日计，凌晨 4 点为界。privateExcludeUids（proactive 的不粘人名单）对它同样生效。enabled=false 整体关掉。",
       "enabled": true,
       "p1": 0.33,
       "window1": [
@@ -504,5 +514,31 @@
         "pool": []
       }
     }
+  },
+  "telegram": {
+    "enabled": false,
+    "whitelist": [
+      "@YuanShen"
+    ],
+    "sidecarPort": 8765,
+    "proxyPort": 7892,
+    "limits": {
+      "maxFileBytes": 2147483648,
+      "dailyLimit": 0
+    },
+    "retentionDays": 3,
+    "_note": "TG 资源域：whitelist=可搜可下的频道（@名或 t.me 链接）；需先完成 MTProto 登录生成 state/tg-session.session（见设计文档 §8）；proxyPort 指向 mihomo 的 TG 专线监听口；limits.maxFileBytes 上限 2GB（免费账号硬顶）。不启用保持 enabled=false，桥侧零动作、工具面不注册。",
+    "_note_limits": "dailyLimit=0 表示不限次数（2026-10-30 主人拍板对所有人开放、不设限额）；>0 则为每人每日下载次数上限。maxFileBytes 为单文件硬上限（TG 免费账号 2GB）。"
+  },
+  "materials": {
+    "_note": "素材库（2026-10-30）：美咲发空间/动态用的素材仓库，主人经 LAN 上传页（手机/PC 浏览器）投图。categories=大类目录（可增删，inbox 恒在）；lanPort/bindHost=上传页监听（局域网直绑，token=consoleToken）；图片落 state/materials/，账本 index.db，sha256 去重。enabled=false 整体关。",
+    "enabled": true,
+    "lanPort": 3210,
+    "bindHost": "0.0.0.0",
+    "categories": [
+      "misaki",
+      "daily",
+      "scenery"
+    ]
   }
 }

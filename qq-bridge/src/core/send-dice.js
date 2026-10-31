@@ -34,46 +34,59 @@ export function dice(kind, key, probability, cooldownMs) {
   return { p, cooling, hit: !cooling && p > 0 && Math.random() < p };
 }
 
-// ── 表情包（内置表情库 qq_send_meme + QQ 收藏表情 qq_send_sticker 共用一条概率）──────
-// 配置沿用既有的 social.sticker.sendProbability（管理端「表情包」卡里那个"发表情概率"），
-// 新增 sendCooldownMs 管同一会话的连发。
-export const MEME_DEFAULT_PROBABILITY = 0.3;
-export const MEME_DEFAULT_COOLDOWN_MS = 3 * 60 * 1000;
+// ── 表情包（内置表情库 qq_send_meme + QQ 收藏表情 qq_send_sticker 共用一条机会线）──────
+// 2026-10-30 主人定调：**概率退役**——每一轮唤醒都给表情机会，发不发由「库里有没有贴语境的」
+// 这一条模型判断把守；限频全靠两个硬闸：sendMinIntervalMs（两张最短间隔）+
+// sendMaxPerWindow / sendMaxWindowMs（滑动窗口限额）。历史背景：2026-09-19 曾把 HIT 从
+// "许可"改成"指令"（当时实际发生率 ≈ 概率 × 模型配合率，1966 次工具调用只发过 5 张）；
+// 概率门删除后指令语义保留，闸门变成确定性的。
+export const MEME_DEFAULT_MIN_INTERVAL_MS = 30 * 1000;
+export const MEME_DEFAULT_MAX_PER_WINDOW = 5;
+export const MEME_DEFAULT_MAX_WINDOW_MS = 5 * 60 * 1000;
+
+/** `meme:${key}` -> 最近发送时间戳数组（滑窗限额；进程内，重启清空不影响正确性） */
+const sentTimes = new Map();
 
 function memeCfg() {
   const s = cfgRef?.social?.sticker ?? {};
-  const prob = Number(s.sendProbability);
-  const cd = Number(s.sendCooldownMs);
+  const num = (v, d) => { const n = Number(v); return Number.isFinite(n) && n >= 0 ? n : d; };
   return {
     enabled: cfgRef?.social?.sticker?.enabled !== false,
-    probability: Number.isFinite(prob) && prob >= 0 ? prob : MEME_DEFAULT_PROBABILITY,
-    cooldownMs: Number.isFinite(cd) && cd >= 0 ? cd : MEME_DEFAULT_COOLDOWN_MS
+    minIntervalMs: num(s.sendMinIntervalMs, num(s.sendCooldownMs, MEME_DEFAULT_MIN_INTERVAL_MS)),
+    maxPerWindow: Math.max(1, num(s.sendMaxPerWindow, MEME_DEFAULT_MAX_PER_WINDOW)),
+    maxWindowMs: num(s.sendMaxWindowMs, MEME_DEFAULT_MAX_WINDOW_MS)
   };
 }
 
 /** 表情包发出去之后登记一次（内置表情库与收藏表情两条路都调） */
 export function noteMemeSent(key) {
   noteSent('meme', key);
+  const k = String(key ?? '').trim();
+  if (!k) return;
+  const arr = sentTimes.get(`meme:${k}`) ?? [];
+  arr.push(Date.now());
+  sentTimes.set(`meme:${k}`, arr.slice(-20));
 }
 
 /**
- * 唤醒提示词里的表情包抽签行（英文，与 preset 的英文指令框架一致）
- * 表情包总开关关掉、或概率为 0 时给出明确说明；不注入空行以外的东西。
- *
- * 2026-09-19：把 HIT 从"许可"改成"指令"。原文写的是 `you MAY send ONE sticker/meme`，
- * 结果实际发生率 ≈ 配置概率 × 模型配合率 —— 抽中了也常常不发（实测 1966 次工具调用里
- * qq_send_sticker 只有 5 次）。用户配概率是希望它真的发，所以改成祈使句：
- * 抽中就发一张，只有"库里没有对得上语境的"这一个理由可以跳过。preset 里的对应段落同步改了。
+ * 唤醒提示词里的表情机会行（英文，与 preset 的英文指令框架一致）。
+ * 三种形态：available（本轮有机会）/ cooldown（30s 间隔内）/ quota used（窗口满额）。
  */
 export function memeTurnHint(key) {
   const c = memeCfg();
   if (!c.enabled) return '';
-  const { p, cooling, hit } = dice('meme', key, c.probability, c.cooldownMs);
-  if (hit) {
-    return `[Meme] dice HIT (p=${p}): SEND ONE sticker or meme this turn (qq_send_sticker for QQ favorites; qq_meme_search + qq_send_meme for the meme packs, which already include the owner's own packs and the pack bound to the current character). At most one, never as a substitute for answering, and skip it only if nothing in the library fits what you are saying.\n`;
+  const k = String(key ?? '').trim();
+  const now = Date.now();
+  const last = sentAt.get(`meme:${k}`) ?? 0;
+  if (last > 0 && now - last < c.minIntervalMs) {
+    return `[Meme] cooldown (${Math.ceil((c.minIntervalMs - (now - last)) / 1000)}s since last sticker): no stickers this turn unless someone explicitly asks for one.\n`;
   }
-  const why = cooling ? 'cooldown' : 'dice MISS';
-  return `[Meme] ${why} (p=${p})${p <= 0 ? ' stickers off' : ''}: no stickers this turn unless someone explicitly asks for one.\n`;
+  const times = (sentTimes.get(`meme:${k}`) ?? []).filter((t) => now - t < c.maxWindowMs);
+  sentTimes.set(`meme:${k}`, times);
+  if (times.length >= c.maxPerWindow) {
+    return `[Meme] sticker quota used (${times.length}/${c.maxPerWindow} in last ${Math.round(c.maxWindowMs / 60000)}min): no stickers this turn unless someone explicitly asks for one.\n`;
+  }
+  return `[Meme] sticker available (quota ${times.length}/${c.maxPerWindow} in ${Math.round(c.maxWindowMs / 60000)}min): SEND ONE sticker or meme this turn if one in the library fits what you are saying (qq_send_sticker for QQ favorites; qq_meme_search + qq_send_meme for the meme packs, which already include the owner's own packs and the pack bound to the current character). At most one, never the same one twice in a row, never as a substitute for answering. A text placeholder like "[表情包:...]" is NOT sending one - if you cannot send a real image, send none.\n`;
 }
 
 /** 供诊断/日志：当前生效的表情包参数 */
@@ -85,5 +98,6 @@ export function memeDiceInfo() {
 /** 清空登记（测试与排障用） */
 export function resetSendDice() {
   sentAt.clear();
+  sentTimes.clear();
   log('[send-dice] 抽签登记已清空');
 }

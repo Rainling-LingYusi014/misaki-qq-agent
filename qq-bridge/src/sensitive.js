@@ -19,14 +19,19 @@ const PATH_RE = /(?<![A-Za-z0-9])[A-Za-z]:[\\/](?!\s)[^\s"'<>|，。；、]{2,}|
 const SECRET_PATH_RE = /(?:\/|\\|^)(?:\.ssh\/|\.aws\/|\.gnupg\/|id_rsa|id_dsa|id_ecdsa|id_ed25519|[\w.-]+\.pem|credentials|\.netrc)(?=[/\\\s"'<>|，。；、]|$)/i;
 const CRED_RE = /(?:token|密码|密钥|口令|password|passwd|secret|api[_-]?key|access[_-]?key|authorization|bearer|credential|私钥)(?:\s*)(?:[:=：])(?:\s*)[A-Za-z0-9_\-./+@]{6,}/i;
 
-export const SENSITIVE_RE = new RegExp(`${PATH_RE.source}|${SECRET_PATH_RE.source}|${CRED_RE.source}`, 'i');
+// B站凭据形态（2026-10-27，审查 P3-4）：SESSDATA / bili_jct 等 cookie 值本身没有 "token=" 前缀，
+// 直接贴出来时 CRED_RE 抓不到。只认「键名 + 赋值符 + 足够长的值」，不裸配 32 位十六进制——
+// 我们日常在对话里贴 md5 摘要，裸匹配会大面积误伤。
+const BILI_CRED_RE = /(?:SESSDATA|bili_jct|DedeUserID__ckMd5)\s*[=:：]\s*[A-Za-z0-9%*_\-.~]{20,}/i;
+
+export const SENSITIVE_RE = new RegExp(`${PATH_RE.source}|${SECRET_PATH_RE.source}|${CRED_RE.source}|${BILI_CRED_RE.source}`, 'i');
 
 // 判断命中类别，便于日志定位真伪。返回 null | 'path' | 'secret-path' | 'credential'
 export function sensitiveHitKind(text) {
   const s = String(text ?? '');
   if (PATH_RE.test(s)) return 'path';
   if (SECRET_PATH_RE.test(s)) return 'secret-path';
-  if (CRED_RE.test(s)) return 'credential';
+  if (CRED_RE.test(s) || BILI_CRED_RE.test(s)) return 'credential';
   return null;
 }
 

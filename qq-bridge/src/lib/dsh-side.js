@@ -59,11 +59,19 @@ export function resolveDshTarget(opts = {}) {
   const profile = opts.profile || process.env.QQB_DSH_PROFILE || 'web';
   const env = process.env.QQB_DSH_HOME;
   const projRuntime = defaultIsolatedDshHome();
+  /* 2026-10-30：restart.bat → start.bat 这条重启链**不注入 QQB_DSH_HOME**（只有 start-qq-stack.ps1 注入），
+   * 于是预设被刷新到 manager 记录的旧目录（D:\Downloads\Kizuna-main\...），而真正在跑的
+   * 项目根 dsh-home 永远拿不到新 preset——「改了提示词重启桥却不生效」的根因。
+   * 探测顺序补上「项目根 dsh-home」（已初始化才算），排在 manager 兜底之前。 */
+  const projDshHome = path.resolve(REPO_ROOT, '..', 'dsh-home');
   const managerHome = readManagerIsolatedHome();
   const isBooted = (h) => h && fs.existsSync(h) && fs.existsSync(path.join(h, 'profiles', profile));
-  // 探测顺序：env（显式）→ 项目 .runtime（若已启动过）→ manager 持久化隔离 home → 项目 .runtime（尚未初始化，仅提示用）
-  let home = env || (isBooted(projRuntime) ? projRuntime : (isBooted(managerHome) ? managerHome : projRuntime));
-  const source = env ? 'env' : home === managerHome && isBooted(managerHome) ? 'manager' : 'isolated';
+  // 探测顺序：env（显式）→ 项目 .runtime（若已启动过）→ 项目根 dsh-home（若已启动过）→ manager 持久化隔离 home → 项目 .runtime（尚未初始化，仅提示用）
+  let home = env || (isBooted(projRuntime) ? projRuntime : (isBooted(projDshHome) ? projDshHome : (isBooted(managerHome) ? managerHome : projRuntime)));
+  const source = env ? 'env'
+    : (home === projDshHome && isBooted(projDshHome)) ? 'project-dsh-home'
+      : (home === managerHome && isBooted(managerHome)) ? 'manager'
+        : 'isolated';
   if (isDesktopDshHome(home) && !opts.allowDesktopHome) {
     return { home, profile, source, exists: false, booted: false, refusedDesktop: true, error: `目标 DSH home 是桌面端（${home}），默认不写入；请用 QQB_DSH_HOME 指向隔离目录或显式授权` };
   }

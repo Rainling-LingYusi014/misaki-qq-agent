@@ -1,7 +1,7 @@
 // 回归测试：括号反馈（2026-10-29 主人定规，陪伴模式专属「高级反馈总开关」）
 //
 // 规则原话要点：
-//   · 括号统一英文半角 ()（中文全角太宽），代码层归一；
+//   · 括号统一中文全角 （）（2026-10-30 主人改口），代码层归一；输入全半角都认；
 //   · 普通反馈：回合命中率 10+x%（x=0~30 随机数，每个气泡发出之前产生一次）；
 //   · 实时反馈：由「用户的动作性」触发（摸摸头/抱一下…），每一句都加，100%；
 //   · 一个气泡最多两段，双段概率 10%；心理类不降档。
@@ -48,7 +48,7 @@ check('③ 实时档：每句都保留（100%），确定性可复现', () => {
   for (let i = 0; i < 50; i++) {
     const r = lib.shapeBrackets('过来（抱）一下就好', { scene: 'realtime', seed: `k#${i}` });
     assert.equal(r.keptSegments, 1);
-    assert.ok(r.text.includes('('), '实时档必须保留括号段');
+    assert.ok(r.text.includes('（'), '实时档必须保留括号段（现在是全角）');
   }
   const a = lib.shapeBrackets('（低头）嗯', { scene: 'realtime', seed: 'same' });
   const b = lib.shapeBrackets('（低头）嗯', { scene: 'realtime', seed: 'same' });
@@ -67,7 +67,7 @@ check('④ 普通档：命中率落在 (10+x)% 区间内，且每个气泡独立
   assert.ok(ratio > 0.10 && ratio < 0.50, `普通档命中率应在 10%~40% 附近，实际 ${(ratio * 100).toFixed(1)}%`);
 });
 
-check('⑤ 双段概率 10%：大量样本下双段占比贴 0.10', () => {
+check('⑤ 双段概率 18%：大量样本下双段占比贴 0.18（2026-10-30 由 10% 上调）', () => {
   let two = 0;
   const N = 600;
   for (let i = 0; i < N; i++) {
@@ -75,21 +75,21 @@ check('⑤ 双段概率 10%：大量样本下双段占比贴 0.10', () => {
     if (r.keptSegments === 2) two++;
   }
   const ratio = two / N;
-  assert.ok(ratio > 0.04 && ratio < 0.18, `双段占比应贴 10%，实际 ${(ratio * 100).toFixed(1)}%`);
+  assert.ok(ratio > 0.10 && ratio < 0.27, `双段占比应贴 18%，实际 ${(ratio * 100).toFixed(1)}%`);
 });
 
-check('⑥ 全角归一 + 提到句首：无论写在哪，保留的段都移到最前并变半角 ()', () => {
+check('⑥ 全角归一 + 提到句首：无论写在哪，保留的段都移到最前并变全角 （）', () => {
   const r = lib.shapeBrackets('（揉揉头发）别怕', { scene: 'realtime', seed: 'norm' });
-  assert.ok(!r.text.includes('（'), `不应再有全角括号：${r.text}`);
-  assert.ok(r.text.startsWith('(揉揉头发)'));
+  assert.ok(!r.text.includes('('), `不应再有半角括号：${r.text}`);
+  assert.ok(r.text.startsWith('（揉揉头发）'));
   // 2026-10-29 主人定规：写在句尾也要提到最前
   const tail = lib.shapeBrackets('别怕，我在呢（揉揉头发）', { scene: 'realtime', seed: 'norm2' });
-  assert.ok(tail.text.startsWith('(揉揉头发)'), `句尾的段必须提到最前：${tail.text}`);
+  assert.ok(tail.text.startsWith('（揉揉头发）'), `句尾的段必须提到最前：${tail.text}`);
   assert.ok(tail.text.includes('别怕'), '正文不能丢');
   // 两段：保持原顺序、都在最前
   const two = lib.shapeBrackets('嗯（低头）（笑）', { scene: 'realtime', seed: 'norm3' });
-  if (two.keptSegments === 2) assert.match(two.text, /^\(低头\) \(笑\) /, `两段应前置：${two.text}`);
-  else assert.match(two.text, /^\(低头\) /, `单段也应前置：${two.text}`);
+  if (two.keptSegments === 2) assert.match(two.text, /^（低头） （笑） /, `两段应前置：${two.text}`);
+  else assert.match(two.text, /^（低头） /, `单段也应前置：${two.text}`);
 });
 
 check('⑦ 非反馈形状的括号永不剥：日期/英文/超长段都保留', () => {
@@ -135,7 +135,7 @@ check('⑩ 段分型：动作 / 表情神态 / 心理活动 三分，未知归�
 
 check('⑪ 动作类 6 泡内完全相同 → 砍掉；超出窗口 → 允许', () => {
   const cfg = { actionRepeatBubbles: 6 };
-  const hist = [{ seg: '(小声)', seq: 10 }];
+  const hist = [{ seg: '（小声）', seq: 10 }];
   // 第 13 泡：距 10 只有 3 泡 → 砍
   const near = lib.shapeBrackets('（小声）我其实有点怕', { scene: 'realtime', seed: 'r1', cfg, recentActions: hist, bubbleSeq: 13 });
   assert.equal(near.keptSegments, 0, '窗口内必须砍掉');
@@ -144,12 +144,12 @@ check('⑪ 动作类 6 泡内完全相同 → 砍掉；超出窗口 → 允许',
   // 第 17 泡：距 10 是 7 泡 → 允许
   const far = lib.shapeBrackets('（小声）我其实有点怕', { scene: 'realtime', seed: 'r2', cfg, recentActions: hist, bubbleSeq: 17 });
   assert.equal(far.keptSegments, 1, '超出 6 泡就该允许');
-  assert.ok(far.text.startsWith('(小声)'));
+  assert.ok(far.text.startsWith('（小声）'));
 });
 
 check('⑫ 表情/神态/心理 不受窗口限制（同一句连续重复照样保留）', () => {
   const cfg = { actionRepeatBubbles: 6 };
-  const hist = [{ seg: '(笑)', seq: 10 }, { seg: '(担忧)', seq: 10 }, { seg: '(叹气)', seq: 10 }];
+  const hist = [{ seg: '（笑）', seq: 10 }, { seg: '（担忧）', seq: 10 }, { seg: '（叹气）', seq: 10 }];
   for (const seg of ['笑', '担忧', '叹气']) {
     const r = lib.shapeBrackets(`（${seg}）嗯`, { scene: 'realtime', seed: `x${seg}`, cfg, recentActions: hist, bubbleSeq: 11 });
     assert.equal(r.keptSegments, 1, `${seg} 属于表情/心理，不该被窗口拦`);
@@ -158,7 +158,7 @@ check('⑫ 表情/神态/心理 不受窗口限制（同一句连续重复照样
 
 check('⑬ 窗口边界精确：距离正好 6 泡算在内、7 泡放行', () => {
   const cfg = { actionRepeatBubbles: 6 };
-  const hist = [{ seg: '(点头)', seq: 10 }];
+  const hist = [{ seg: '（点头）', seq: 10 }];
   const at6 = lib.shapeBrackets('（点头）好', { scene: 'realtime', seed: 'b6', cfg, recentActions: hist, bubbleSeq: 16 });
   assert.equal(at6.keptSegments, 0, 'seq 16 - 6 = 10 → 边界应算在内（砍）');
   const at7 = lib.shapeBrackets('（点头）好', { scene: 'realtime', seed: 'b7', cfg, recentActions: hist, bubbleSeq: 17 });
@@ -167,7 +167,7 @@ check('⑬ 窗口边界精确：距离正好 6 泡算在内、7 泡放行', () =
 
 check('⑭ 只认「完全相同」：不同动作/近似写法都不受影响', () => {
   const cfg = { actionRepeatBubbles: 6 };
-  const hist = [{ seg: '(小声)', seq: 10 }];
+  const hist = [{ seg: '（小声）', seq: 10 }];
   const other = lib.shapeBrackets('（压低了声音）我有点怕', { scene: 'realtime', seed: 'o1', cfg, recentActions: hist, bubbleSeq: 12 });
   assert.equal(other.keptSegments, 1, '换个动作照常保留');
   assert.equal(lib.shapeBrackets('（小小声）我有点怕', { scene: 'realtime', seed: 'o2', cfg, recentActions: hist, bubbleSeq: 12 }).keptSegments, 1,
@@ -176,10 +176,10 @@ check('⑭ 只认「完全相同」：不同动作/近似写法都不受影响',
 
 check('⑮ keptSegs 只回报真正发出去的段（供调用方记账）', () => {
   const cfg = { actionRepeatBubbles: 6 };
-  const r = lib.shapeBrackets('（小声）嗯', { scene: 'realtime', seed: 'k1', cfg, recentActions: [{ seg: '(小声)', seq: 9 }], bubbleSeq: 10 });
+  const r = lib.shapeBrackets('（小声）嗯', { scene: 'realtime', seed: 'k1', cfg, recentActions: [{ seg: '（小声）', seq: 9 }], bubbleSeq: 10 });
   assert.deepEqual(r.keptSegs, [], '被砍的段不能进账本');
   const r2 = lib.shapeBrackets('（点头）嗯', { scene: 'realtime', seed: 'k2', cfg, bubbleSeq: 10 });
-  assert.deepEqual(r2.keptSegs, ['(点头)'], '真正发出去的段要回报');
+  assert.deepEqual(r2.keptSegs, ['（点头）'], '真正发出去的段要回报');
 });
 
 // ── 2026-10-29 动作链 / 单个纯动作反馈（主人定规）──
@@ -195,20 +195,20 @@ function findSeed(pred, prefix = 'x') {
 }
 const requireRoll = (key) => stableRoll(key);
 
-check('⑯ 骰子分布：动作链 8%、链内 2 条 67%、单个纯动作 8%', () => {
+check('⑯ 骰子分布：动作链 18%、链内 2 条 67%、单个纯动作 18%（2026-10-30 由 8% 上调）', () => {
   let chain = 0, two = 0, chainN = 0, single = 0;
   const N = 4000;
   for (let i = 0; i < N; i++) {
     const s = `d${i}`;
-    if (requireRoll(`bf-chain:${s}`) * 100 < 8) {
+    if (requireRoll(`bf-chain:${s}`) * 100 < 18) {
       chain++;
       chainN++;
       if (requireRoll(`bf-chain-n:${s}`) * 100 < 67) two++;
-    } else if (requireRoll(`bf-single:${s}`) * 100 < 8) single++;
+    } else if (requireRoll(`bf-single:${s}`) * 100 < 18) single++;
   }
-  assert.ok(chain / N > 0.05 && chain / N < 0.12, `动作链应贴 8%，实际 ${(chain / N * 100).toFixed(1)}%`);
+  assert.ok(chain / N > 0.14 && chain / N < 0.23, `动作链应贴 18%，实际 ${(chain / N * 100).toFixed(1)}%`);
   assert.ok(two / chainN > 0.6 && two / chainN < 0.74, `链内 2 条应贴 67%，实际 ${(two / chainN * 100).toFixed(1)}%`);
-  assert.ok(single / N > 0.05 && single / N < 0.12, `纯动作应贴 8%，实际 ${(single / N * 100).toFixed(1)}%`);
+  assert.ok(single / N > 0.14 && single / N < 0.23, `纯动作应贴 18%，实际 ${(single / N * 100).toFixed(1)}%`);
 });
 
 check('⑰ 普通档永不触发动作链/纯动作（两个骰子都不掷）', () => {
@@ -223,9 +223,9 @@ check('⑱ 动作链 3 条：段一条一段，文字垫最后一条（主人原
   assert.equal(plan.mode, 'chain');
   assert.equal(plan.chainSize, 3);
   assert.equal(plan.bubbles.length, 3);
-  assert.equal(plan.bubbles[0].text, '(害羞)');
-  assert.equal(plan.bubbles[1].text, '(躲闪)');
-  assert.equal(plan.bubbles[2].text, '(看起来有点不满) 头发都给你弄乱了');
+  assert.equal(plan.bubbles[0].text, '（害羞）');
+  assert.equal(plan.bubbles[1].text, '（躲闪）');
+  assert.equal(plan.bubbles[2].text, '（看起来有点不满） 头发都给你弄乱了');
 });
 
 check('⑲ 动作链 2 条：材料合并成「段 + 段/文字」', () => {
@@ -234,15 +234,15 @@ check('⑲ 动作链 2 条：材料合并成「段 + 段/文字」', () => {
   assert.equal(plan.mode, 'chain');
   assert.equal(plan.chainSize, 2);
   assert.equal(plan.bubbles.length, 2);
-  assert.equal(plan.bubbles[0].text, '(害羞)');
-  assert.equal(plan.bubbles[1].text, '(躲闪) 头发都给你弄乱了');
+  assert.equal(plan.bubbles[0].text, '（害羞）');
+  assert.equal(plan.bubbles[1].text, '（躲闪） 头发都给你弄乱了');
 });
 
 check('⑳ 纯动作链（没有文字）：段均分，末条也是一段', () => {
   const s = findSeed((x) => requireRoll(`bf-chain:${x}`) * 100 < 8 && requireRoll(`bf-chain-n:${x}`) * 100 >= 67, 'cp');
   const plan = lib.planRealtimeReply(['（抱）（贴紧）（嫌弃）'], { scene: 'realtime', seed: s });
   assert.equal(plan.mode, 'chain');
-  assert.deepEqual(plan.bubbles.map((b) => b.text), ['(抱)', '(贴紧)', '(嫌弃)']);
+  assert.deepEqual(plan.bubbles.map((b) => b.text), ['（抱）', '（贴紧）', '（嫌弃）']);
 });
 
 check('㉑ 材料不够 N 条 → 链降级，不硬凑', () => {
@@ -255,7 +255,7 @@ check('㉒ 单个纯动作反馈：只发一个段、文字省略；原话过长
   const s = findSeed((x) => requireRoll(`bf-chain:${x}`) * 100 >= 8 && requireRoll(`bf-single:${x}`) * 100 < 8, 's1');
   const ok = lib.planRealtimeReply(['（小声）我有点怕'], { scene: 'realtime', seed: s });
   assert.equal(ok.mode, 'single');
-  assert.deepEqual(ok.bubbles.map((b) => b.text), ['(小声)'], '纯动作只发那一个段');
+  assert.deepEqual(ok.bubbles.map((b) => b.text), ['（小声）'], '纯动作只发那一个段');
 
   const s2 = findSeed((x) => requireRoll(`bf-chain:${x}`) * 100 >= 8 && requireRoll(`bf-single:${x}`) * 100 < 8, 's2');
   const longText = '（小声）' + '这是一句很长很长的回答，长度明显超过了二十个字，不该被动作吃掉';
@@ -267,11 +267,11 @@ check('㉓ 动作链里的段同样受 6 气泡窗口约束（重复的跳过）
   const s = findSeed((x) => requireRoll(`bf-chain:${x}`) * 100 < 8 && requireRoll(`bf-chain-n:${x}`) * 100 >= 67, 'cr');
   const plan = lib.planRealtimeReply(['（害羞）（躲闪）头发都给你弄乱了'], {
     scene: 'realtime', seed: s, currentSeq: 10, bubbleSeq: 10,
-    recentActions: [{ seg: '(害羞)', seq: 8 }],
+    recentActions: [{ seg: '（害羞）', seq: 8 }],
   });
-  // (害羞) 在窗口内 → 跳过，链改用 (躲闪) 起头；凑不够 3 条则降级
+  // （害羞） 在窗口内 → 跳过，链改用 （躲闪） 起头；凑不够 3 条则降级
   if (plan.mode === 'chain') {
-    assert.ok(!plan.bubbles.some((b) => b.text === '(害羞)'), `窗口内的重复动作不能出现：${JSON.stringify(plan.bubbles)}`);
+    assert.ok(!plan.bubbles.some((b) => b.text === '（害羞）'), `窗口内的重复动作不能出现：${JSON.stringify(plan.bubbles)}`);
   } else {
     assert.equal(plan.mode, 'normal');
   }

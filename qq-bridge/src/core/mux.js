@@ -5,6 +5,8 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { Readable, Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 import { NodeApiClient, unwrap, createTurnCollector } from '../dsh-client.js';
@@ -84,7 +86,7 @@ import {
 } from './sticker.js';
 import { resolveNameToUid, forgetPersonCognition } from './memory.js';
 import { markMessagesRead } from './memory.js';
-// misaki@reset 的聊天存档清除（该会话全部消息 + FTS 重建）
+// msk@reset 的聊天存档清除（该会话全部消息 + FTS 重建）
 import { clearChatHistory, rebuildChatFts } from './chat-db.js';
 /* 2026-09-21 需求：/token 自动发出今日 token 总量与花费（口径与管理端实测区一致）。 */
 import { buildTokenReportText } from './token-report.js';
@@ -192,12 +194,12 @@ import {
   clearSocialTimers, clearAllSocialTimers, resetConversationKeepingLedger,
   applyMisakiCommand, setStopNote, setResetExecutor, armPendingReset, cancelPendingReset,
   conversationMode,
-  // 2026-10-29 misaki@reaction：括号反馈总开关（按会话，按钮式翻转）
+  // 2026-10-29 msk@reaction：括号反馈总开关（按会话，按钮式翻转）
   bracketReactionOf, toggleBracketReaction,
 } from './social-state.js';
-// misaki@ 指令解析（纯函数，见 companion-mode.js）
+// msk@ 指令解析（纯函数，见 companion-mode.js）
 import { parseMisakiCommand, STOP_ACK_TEXT, NOTHING_TO_STOP_TEXT, RESET_DONE_TEXT, fmtWanTokens, helpText } from './companion-mode.js';
-// misaki@credits 额度查询：与限额闸同一函数/同一口径（token-meter.js）
+// msk@credits 额度查询：与限额闸同一函数/同一口径（token-meter.js）
 import { checkTokenBudget, todayBillingUsage } from './token-meter.js';
 import {
   loadScheduledTasks, parseScheduledAt, createScheduledTask, cancelScheduledTask, setScheduledRecorder,
@@ -272,7 +274,7 @@ import { clearInboxMarks } from './inbox-marks.js';
 let cfgRef = null;
 export function initMuxCore(cfg) {
   cfgRef = cfg;
-  // misaki@reset 锁定期到点执行器（social-state 的定时器回调；boot 恢复在 loadSocialState 末尾 rearm）
+  // msk@reset 锁定期到点执行器（social-state 的定时器回调；boot 恢复在 loadSocialState 末尾 rearm）
   setResetExecutor(executeMisakiResetNow);
 }
 let apiRef = null;
@@ -311,9 +313,9 @@ function isDuplicateInbound(key, messageId) {
   return false;
 }
 
-  // ── misaki@stop / misaki@reset（2026-10-26）：一次性动作指令，桥层硬拦截、零 token。──
-  // 会话级全套卸载：提取自原 /reset 内联块，owner 的 /reset 与 misaki@reset 共用这一份实现。
-  // 返回 true = 存在 DSH 会话映射并已卸载；false = 本来就没有会话（misaki@reset 仍会做认知清除）。
+  // ── msk@stop / msk@reset（2026-10-26）：一次性动作指令，桥层硬拦截、零 token。──
+  // 会话级全套卸载：提取自原 /reset 内联块，owner 的 /reset 与 msk@reset 共用这一份实现。
+  // 返回 true = 存在 DSH 会话映射并已卸载；false = 本来就没有会话（msk@reset 仍会做认知清除）。
   async function hardResetConversation(key) {
     const old = state.sessions[key];
     if (!old) return false;
@@ -363,12 +365,12 @@ function isDuplicateInbound(key, messageId) {
     return true;
   }
 
-  // misaki@stop：硬停当前会话正在跑的任务。不隔离会话、不丢上下文、不撤回已发出的消息。
+  // msk@stop：硬停当前会话正在跑的任务。不隔离会话、不丢上下文、不撤回已发出的消息。
   // 2026-10-26 实测修复：「有没有活在跑」不能只看主会话回合标记——看门狗隔离只归档不 cancel，
   // 被隔离会话（及其 subagent）在 DSH 服务端照样跑完并交付；主会话回合结束的瞬间标记也会清空。
   // 追杀面 = 主会话 + 本会话名下近期见过的 sid（keyRecentSids，隔离不清除）+ 未完结 subagent 登记
   // （keyPendingSubagents，按 key 存，隔离不清除）——任何一个活着就硬停，逐个 session/cancel。
-  // 注意：stop 只停任务回合，绝不触碰 misaki@reset 的锁定期（pendingReset）——主人定规，不可否决。
+  // 注意：stop 只停任务回合，绝不触碰 msk@reset 的锁定期（pendingReset）——主人定规，不可否决。
   async function handleMisakiStop(key) {
     const now = Date.now();
     const main = state.sessions[key] || null;
@@ -416,19 +418,19 @@ function isDuplicateInbound(key, messageId) {
     pendingWakeKeys.delete(key);
     cancelKeyedSends(key); // 已排队未发出的气泡一并取消（已发出的不撤回）
     setStopNote(key);       // 挂起"另行说明已经被停止"：下一轮唤醒注入 [Stopped] 行
-    appendActivity(`${key} 任务被 misaki@stop 终止（cancel ${cancelled}/${targets.size} 个会话）`);
+    appendActivity(`${key} 任务被 msk@stop 终止（cancel ${cancelled}/${targets.size} 个会话）`);
     try { await sendToQQ(key, STOP_ACK_TEXT); } catch (e) { log(`[misaki-cmd] 回执失败 ${key}: ${e?.message ?? e}`); }
     try { recordSentMessages(key, [{ text: STOP_ACK_TEXT }]); } catch {}
   }
 
-  // misaki@reset：进入 1 小时锁定期。期间对方任何一条普通回话立即取消；一条都没有，到点自动执行。
-  // 锁定期不能被 misaki@stop 否决（它不是任务回合，handleMisakiStop 不触碰 pendingReset）。
+  // msk@reset：进入 1 小时锁定期。期间对方任何一条普通回话立即取消；一条都没有，到点自动执行。
+  // 锁定期不能被 msk@stop 否决（它不是任务回合，handleMisakiStop 不触碰 pendingReset）。
   // 指令必须独占一个气泡（解析层已强制），引用/附带其他文字不会触发；2026-10-27 起 token 就是 reset（无 -1）。
   const RESET_HOLD_MS = 60 * 60 * 1000;
   async function handleMisakiReset(key) {
     const executeAt = armPendingReset(key, RESET_HOLD_MS);
-    appendActivity(`${key} misaki@reset 进入锁定期，执行时刻 ${Math.floor(executeAt / 1000)}`);
-    const text = `好。已进入清空锁定期：北京时间 ${fmtBeijing(executeAt)}（时间戳 ${Math.floor(executeAt / 1000)}）我会清空关于你的全部记忆——对话、记住的事、档案，全部还原到刚认识的样子，模式也回到常规。此操作无法被 misaki@stop 取消；这期间你发来的任何一条普通消息都会立即取消清空，一条都没有，到点自动执行。`;
+    appendActivity(`${key} msk@reset 进入锁定期，执行时刻 ${Math.floor(executeAt / 1000)}`);
+    const text = `好。已进入清空锁定期：北京时间 ${fmtBeijing(executeAt)}（时间戳 ${Math.floor(executeAt / 1000)}）我会清空关于你的全部记忆——对话、记住的事、档案，全部还原到刚认识的样子，模式也回到常规。此操作无法被 msk@stop 取消；这期间你发来的任何一条普通消息都会立即取消清空，一条都没有，到点自动执行。`;
     try { await sendToQQ(key, text, { single: true }); } catch (e) { log(`[misaki-cmd] 回执失败 ${key}: ${e?.message ?? e}`); }
     try { recordSentMessages(key, [{ text }]); } catch {}
   }
@@ -457,13 +459,13 @@ function isDuplicateInbound(key, messageId) {
         else wiped += `${wiped ? '、' : ''}长期记忆清除失败（${mem?.error ?? '?'}）`;
       } catch (error) { log(`[misaki-cmd] ${key} 长期记忆清除失败: ${error?.message ?? error}`); }
     }
-    log(`[misaki-cmd] ${key} 认知已清空（misaki@reset，不可逆）：${wiped || '无存量'}`);
-    appendActivity(`${key} 认知已清空（misaki@reset）：${wiped || '无存量'}`);
+    log(`[misaki-cmd] ${key} 认知已清空（msk@reset，不可逆）：${wiped || '无存量'}`);
+    appendActivity(`${key} 认知已清空（msk@reset）：${wiped || '无存量'}`);
     try { await sendToQQ(key, RESET_DONE_TEXT, { single: true }); } catch (e) { log(`[misaki-cmd] 回执失败 ${key}: ${e?.message ?? e}`); }
     try { recordSentMessages(key, [{ text: RESET_DONE_TEXT }]); } catch {}
   }
 
-  // misaki@credits（2026-10-27，取代 consumption×3）：任意模式可查，固定语句、零 token，tokens 与生图一并显示。
+  // msk@credits（2026-10-27，取代 consumption×3）：任意模式可查，固定语句、零 token，tokens 与生图一并显示。
   // 口径与限额闸一致：token 用 checkTokenBudget（额度日=北京自然日 00:00 换日——config dayOffsetMinutes=0，
   // 2026-10-27 主人定规与生图重置统一；owner 豁免→显示"不限"，附全局实际用量）；
   // 生图读 mcp-napcat-safe 同一份配额文件 state/gen-image-quota.json（北京自然日 00:00 换日，owner 豁免）。
@@ -522,7 +524,7 @@ function isDuplicateInbound(key, messageId) {
   const resolveReply = (messageId) => resolveReplyInfo(kind, id, messageId, event.self_id);
   // textContent 带引用对象信息，供 DSH 判断“这句话在对谁说”；
   // plainContent 只保留当前消息自己的文字，用于命令/指向性判断，避免被引用原文干扰。
-  const textContent = await segmentsToText(event.message ?? [], { resolveAtName, resolveReply });
+  let textContent = await segmentsToText(event.message ?? [], { resolveAtName, resolveReply });
   const plainContent = await segmentsToText(event.message ?? [], { resolveAtName, includeReply: false });
   // 自动好友守卫：私聊里非管理员/非受信任者发来违法/诈骗营销内容时，自动删除好友并拉黑
   if (kind === 'private' && cfgRef.social?.autoFriendGuard !== false) {
@@ -591,6 +593,70 @@ function isDuplicateInbound(key, messageId) {
     return;
   }
 
+  /* 2026-10-31 P0：入站视频此前只渲染成 [视频]，文件本体被丢弃——主人转发视频来问内容时她无从看起。
+   * 现在把视频取到工作区（state/agents/video-inbox，video_look 白名单内），路径写进消息文本。
+   * 2026-10-31 审查复核（P0-1/P1-3）挪位 + 加固：整块从消息解析口移到去重与静默判定【之后】——
+   * 重投消息不再先下载一遍才被丢弃、静默群不再白拉；下载改流式落盘 + 200MB 上限 + 2 分钟超时 +
+   * SSRF 闸，大文件/慢源/内网地址都不能再把整桥拖住；目录带保留清理（3 天，有新视频才顺手扫）。
+   * 失败只记日志，绝不拦截消息本身。 */
+  for (const vm of mediaList.filter((m) => m.kind === 'video')) {
+    try {
+      const MAX_VIDEO_BYTES = 200 * 1024 * 1024;
+      if ((Number(vm.fileSize) || 0) > MAX_VIDEO_BYTES) {
+        textContent += `\n[视频过大（${Math.round(vm.fileSize / 1048576)}MB），未拉取；想知道内容可以让 TA 压小一点或分段发]`;
+        log(`[video-in] ${key} 视频超限未拉取（${Math.round(vm.fileSize / 1048576)}MB）`);
+        continue;
+      }
+      let got = null;
+      try { got = await botRef.raw('get_video', { file_id: vm.file }); } catch { /* 旧形参再试一次 */ }
+      if (!got?.file && vm.file) { try { got = await botRef.raw('get_video', { file: vm.file }); } catch { /* 都不行就算了 */ } }
+      const src = String(got?.file ?? vm.url ?? '');
+      if (!src) { log(`[video-in] ${key} 视频拿不到文件（file_id=${String(vm.file).slice(0, 24)}）`); continue; }
+      const inbox = path.join(STATE_DIR, 'agents', 'video-inbox');
+      fs.mkdirSync(inbox, { recursive: true });
+      // 保留清理（P1-3）：视频本身低频，只在有新视频进来时顺手扫一次，过期按 mtime 删
+      try {
+        const inboxCutoff = Date.now() - 3 * 86400e3;
+        for (const f of fs.readdirSync(inbox)) {
+          const p = path.join(inbox, f);
+          try { if (fs.statSync(p).mtimeMs < inboxCutoff) fs.unlinkSync(p); } catch { /* 占用中跳过 */ }
+        }
+      } catch { /* 清不掉不影响主流程 */ }
+      const safeName = String(vm.fileName || `video-${Date.now()}.mp4`).replace(/[\\/:*?"<>|]/g, '_').slice(-80);
+      const dest = path.join(inbox, `${Date.now()}-${safeName}`);
+      if (/^https?:\/\//.test(src)) {
+        await validateFetchUrl(src); // SSRF 闸：QQ 服务器给的 URL 也过一遍（禁内网/环回/DNS rebinding）
+        const res = await fetch(src, { signal: AbortSignal.timeout(120_000) });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const declared = Number(res.headers.get('content-length')) || 0;
+        if (declared > MAX_VIDEO_BYTES) throw new Error(`视频过大（${Math.round(declared / 1048576)}MB），未拉取`);
+        let seen = 0;
+        const capGuard = new Transform({
+          transform(chunk, _enc, cb) {
+            seen += chunk.length;
+            if (seen > MAX_VIDEO_BYTES) { cb(new Error(`视频超过 ${Math.round(MAX_VIDEO_BYTES / 1048576)}MB 上限，已中止落盘`)); return; }
+            cb(null, chunk);
+          },
+        });
+        try {
+          await pipeline(Readable.fromWeb(res.body), capGuard, fs.createWriteStream(dest));
+        } catch (e) {
+          try { fs.unlinkSync(dest); } catch { /* 半截文件清掉 */ }
+          throw e;
+        }
+      } else {
+        const st0 = fs.statSync(src);
+        if (st0.size > MAX_VIDEO_BYTES) throw new Error(`视频过大（${Math.round(st0.size / 1048576)}MB），未拉取`);
+        await fs.promises.copyFile(src, dest); // 异步复制：大文件落盘不再阻塞事件循环
+      }
+      vm.videoFile = dest;
+      textContent += `\n[视频文件已收到：${dest}；想知道画面内容可用 video_look 看]`;
+      log(`[video-in] ${key} 视频已落工作区：${dest}（${Math.round((vm.fileSize || fs.statSync(dest).size) / 1048576)}MB）`);
+    } catch (e) {
+      log(`[video-in] ${key} 视频落盘失败：${e?.message ?? e}`);
+    }
+  }
+
   // 控制类话语：仅管理员（ownerQQ）可下达；群友触发直接拦截
   if (!isOwner && /进入角色扮演|退出角色扮演|切换角色|设置角色|改角色|换角色|关闭角色扮演|开启角色扮演/.test(plainContent)) {
     await sendToQQ(key, '角色切换仅管理员可在管理端操作，群内不支持。');
@@ -622,19 +688,19 @@ function isDuplicateInbound(key, messageId) {
     log('画像学习指令处理出错:', error?.message ?? error);
   }
 
-  // misaki@ 指令通道（2026-10-26）：统一前缀 `misaki@` 的桥层硬拦截——不进模型、零 token、不受模型发挥影响。
-  // 仅私聊；句中提及不触发（解析只认 misaki@ 开头）；misaki@白名单后缀（如部署者自己的域名邮箱，见 social.misakiCommands.passthroughSuffixes）原样放行；
-  // 未知串回固定提醒（回显打错的串并指向 misaki@help，2026-10-27 主人定版，不再罗列全表）；
-  // 模式切换为三指令直切（misaki@standard/companion/interactive），目标=当前模式时回「当前已处于X模式。」（零 token）。
+  // msk@ 指令通道（2026-10-26）：统一前缀 `msk@` 的桥层硬拦截——不进模型、零 token、不受模型发挥影响。
+  // 仅私聊；句中提及不触发（解析只认 msk@ 开头）；msk@白名单后缀（如部署者自己的域名邮箱，见 social.misakiCommands.passthroughSuffixes）原样放行；
+  // 未知串回固定提醒（回显打错的串并指向 msk@help，2026-10-27 主人定版，不再罗列全表）；
+  // 模式切换为三指令直切（msk@standard/companion/interactive），目标=当前模式时回「当前已处于X模式。」（零 token）。
   if (kind === 'private') {
     const mcmd = parseMisakiCommand(plainContent, cfgRef);
-    // misaki@reset 锁定期：**指令本身也算消息**（主人定规）——锁定期内收到任何东西都取消挂起的清空，
+    // msk@reset 锁定期：**指令本身也算消息**（主人定规）——锁定期内收到任何东西都取消挂起的清空，
     // 唯一例外是 reset 自身（取消后由 handleMisakiReset 重新进入/顺延锁定期，不重复回"已取消"）。
     // 取消回执先发，消息/指令随后照常处理。
     if (cancelPendingReset(key)) {
       const isResetSelf = mcmd && mcmd.kind === 'action-reset';
       if (!isResetSelf) {
-        appendActivity(`${key} 锁定期内收到消息，misaki@reset 已取消`);
+        appendActivity(`${key} 锁定期内收到消息，msk@reset 已取消`);
         try { await sendToQQ(key, '锁定期已解除：这次清空已取消。', { single: true }); } catch (e) { log(`[misaki-cmd] 回执失败 ${key}: ${e?.message ?? e}`); }
         try { recordSentMessages(key, [{ text: '锁定期已解除：这次清空已取消。' }]); } catch {}
       }
@@ -663,7 +729,7 @@ function isDuplicateInbound(key, messageId) {
             : '陪伴模式反馈总开关：已关闭（陪伴模式下不再加括号动作）。';
         } catch (e) {
           log(`[misaki-cmd] 反馈开关翻转失败 ${key}: ${e?.message ?? e}`);
-          text = '开关没翻过来（状态没存上），请再发一次 misaki@reaction 试试。';
+          text = '开关没翻过来（状态没存上），请再发一次 msk@reaction 试试。';
         }
         try { await sendToQQ(key, text, { single: true }); } catch (e) { log(`[misaki-cmd] 开关回执失败 ${key}: ${e?.message ?? e}`); }
         try { recordSentMessages(key, [{ text }]); } catch { /* 回执入库失败不影响主流程 */ }
@@ -676,7 +742,7 @@ function isDuplicateInbound(key, messageId) {
       }
       if (mcmd.kind === 'action-voice-consent') {
         /* 2026-10-28（审查 P1-3 修复）：声音复刻的用户侧授权闸——必须用户本人在 QQ 里
-         * 发「misaki@confirm」才算数（模型传的 consent=true 只是转述，硬闸在 tts-delivery）。
+         * 发「msk@confirm」才算数（模型传的 consent=true 只是转述，硬闸在 tts-delivery）。
          * 记账落 state/voice-consent.json；桥直接回执，不进模型、零 token。 */
         const uid = String(key).split(':')[1] ?? '';
         let text;
@@ -686,14 +752,14 @@ function isDuplicateInbound(key, messageId) {
           text = '声音复刻授权已开通：以后可以让美咲用你的声音读东西了，建音色时不会再重复询问。';
         } catch (e) {
           log(`[misaki-cmd] 声音授权记账失败 ${key}: ${e?.message ?? e}`);
-          text = '开通好像没成功（授权没记上），请再发一次 misaki@confirm 试试。';
+          text = '开通好像没成功（授权没记上），请再发一次 msk@confirm 试试。';
         }
         try { await sendToQQ(key, text, { single: true }); } catch (e) { log(`[misaki-cmd] 授权回执失败 ${key}: ${e?.message ?? e}`); }
         try { recordSentMessages(key, [{ text }]); } catch { /* 回执入库失败不影响主流程 */ }
         return;
       }
       if (mcmd.kind === 'action-voice-revoke') {
-        /* 2026-10-28 主人拍板 #9：misaki@unconfirm 撤销声音复刻授权——同样必须本人发，
+        /* 2026-10-28 主人拍板 #9：msk@unconfirm 撤销声音复刻授权——同样必须本人发，
          * 桥直接回执零 token。撤的是以后建新音色的资格；已建音色不连带删（删音色走 tts 工具）。 */
         const uid = String(key).split(':')[1] ?? '';
         let text;
@@ -701,11 +767,11 @@ function isDuplicateInbound(key, messageId) {
           const { revokeVoiceConsent } = await import('./tts-delivery.js');
           const removed = revokeVoiceConsent(uid);
           text = removed
-            ? '声音复刻授权已撤销：以后再想建音色，需要重新发 misaki@confirm 开通。已建成的音色不受影响。'
+            ? '声音复刻授权已撤销：以后再想建音色，需要重新发 msk@confirm 开通。已建成的音色不受影响。'
             : '你本来就没有开通声音复刻授权，不用撤销。';
         } catch (e) {
           log(`[misaki-cmd] 声音授权撤销失败 ${key}: ${e?.message ?? e}`);
-          text = '撤销好像没成功（记账没删掉），请再发一次 misaki@unconfirm 试试。';
+          text = '撤销好像没成功（记账没删掉），请再发一次 msk@unconfirm 试试。';
         }
         try { await sendToQQ(key, text, { single: true }); } catch (e) { log(`[misaki-cmd] 撤销回执失败 ${key}: ${e?.message ?? e}`); }
         try { recordSentMessages(key, [{ text }]); } catch { /* 回执入库失败不影响主流程 */ }
@@ -747,7 +813,7 @@ function isDuplicateInbound(key, messageId) {
     // 2026-09-13 需求：删掉 /help（原来是发《小鲸鱼能力概览》docx）：
     // 该指令不再拦截，会按"其它 /xxx"的通用规则交给模型，由它正常回应。
     if (plainContent === '/reset' || plainContent === '/new') {
-      // 2026-10-26：卸载逻辑提取为 hardResetConversation（misaki@reset 共用这一份，见其定义处）
+      // 2026-10-26：卸载逻辑提取为 hardResetConversation（msk@reset 共用这一份，见其定义处）
       const had = await hardResetConversation(key);
       if (had) await sendToQQ(key, '已重置会话，下次消息将开新上下文');
       return;
@@ -1025,7 +1091,8 @@ function isDuplicateInbound(key, messageId) {
     // 转发（合并聊天记录）自动展开：把收到的 forward 段内容就地展开成可读文本，
     // 让 AI 无需额外调用 qq_get_forward_msg 就能看到“对方转发里到底说了什么”，
     // 避免消息里只有 [转发消息 id=…] 占位符时 AI 因为读不到内容而整条忽略。
-    const storeText = await expandIncomingForwardPreview(key, event.message ?? [], textContent);
+    const storeText = (await expandIncomingForwardPreview(key, event.message ?? [], textContent))
+      .replace(/\n?\[视频文件已收到：[^\]]*\]/g, ''); // 审查 P2-9：盘符路径只进唤醒投递，不入库/记忆/语料
     appendSocialMessage(key, sender, storeText, plainContent, quoteTargetIsSelf, isOwner, event.message_id ?? event.msg_id ?? null, mediaList, event.user_id ?? null, extractForwardIds(event.message ?? []), Array.isArray(event?.message) && event.message.some((seg) => seg?.type === 'at' && String(seg.data?.qq) === String(event?.self_id ?? '')), fileList, Array.isArray(event.message) ? (event.message.find((seg) => seg?.type === 'reply' && seg.data?.id != null)?.data?.id ?? null) : null);
     // default同样收集群聊黑话学习素材（AI 自主提交之外，桥接仍自动提取高频陌生词）
     if (kind === 'group') {
@@ -1061,11 +1128,11 @@ function isDuplicateInbound(key, messageId) {
   // 一代（reserved 观望状态机）代码不可达，已删除（2026-09-06 单模式化）。
 }
 
-// ── misaki@stop 追杀面（2026-10-26 实测修复）──────────────────────────────────
+// ── msk@stop 追杀面（2026-10-26 实测修复）──────────────────────────────────
 // 桥侧回合标记只反映「桥认领的会话」：看门狗隔离（quarantineSession）会清掉该 sid 的全部痕迹，
 // 但被隔离会话与其 subagent 在 DSH 服务端可能仍在跑，跑完还能通过工具端口把消息发出来——
-// 实测事故：18:30 隔离后子代理 18:35 照样交付 PPT，期间 misaki@stop 误报「现在没有在跑的活」。
-// 下面两张表按会话 key 记录，隔离路径不清除，专门给 misaki@stop 提供追杀线索。
+// 实测事故：18:30 隔离后子代理 18:35 照样交付 PPT，期间 msk@stop 误报「现在没有在跑的活」。
+// 下面两张表按会话 key 记录，隔离路径不清除，专门给 msk@stop 提供追杀线索。
 const keyRecentSids = new Map();       // key -> Map<sid, lastEventAt>：本会话名下见过的所有 DSH 会话
 const keyPendingSubagents = new Map(); // key -> [{sid, callId, at}]：未完结的 subagent 工具调用
 function noteKeySidActivity(key, sid) {
@@ -1152,7 +1219,7 @@ export async function pumpMux() {
             const args = sanitizeToolArgs(rawArgs);
             appendToolLog({ type: 'call', time: new Date().toISOString(), key, sessionId: frame.sessionId, tool: toolName, args, target: extractToolTargetKey(rawArgs) || undefined });
             // 2026-10-26 stop 追杀面：subagent 派遣按 key 登记（quarantineSession 会清 sid 级痕迹，
-            // 但子代理可能在母会话隔离后仍在服务端跑完并交付——misaki@stop 必须还能追到它）。
+            // 但子代理可能在母会话隔离后仍在服务端跑完并交付——msk@stop 必须还能追到它）。
             if (toolName === 'subagent' && callId != null) {
               let pendArr = keyPendingSubagents.get(key);
               if (!pendArr) keyPendingSubagents.set(key, (pendArr = []));

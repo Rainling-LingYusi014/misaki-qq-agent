@@ -238,7 +238,7 @@ export function getProfile(uid) {
   }
 }
 
-/** misaki@reset（清空认知，2026-10-26）：把一个人在记忆库里的痕迹全部删除，还原到"没认识过"。
+/** msk@reset（清空认知，2026-10-26）：把一个人在记忆库里的痕迹全部删除，还原到"没认识过"。
  * 范围：profiles 该 uid 一行 + memory_entries 里按 uid / conv_key 命中的全部条目（各层级含 permanent）。
  * 不可逆；只影响传入的这个人/这个会话，不动其他会话与全局资源。
  * FTS 由删除触发器自动同步（见 ensureMemoryIndex 的 mem_fts 触发器），无需手工重建。 */

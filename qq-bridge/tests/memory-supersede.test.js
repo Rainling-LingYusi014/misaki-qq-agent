@@ -32,7 +32,7 @@ const check = (n, f) => { try { f(); console.log('PASS  ' + n); } catch (e) { fa
 const mem = await import(pathToFileURL(path.join(sandbox, 'src', 'core', 'memory.js')).href);
 const db = mem.initMemoryDb();
 const OWNER = '123456789';
-const FRIEND = '1000000003';
+const FRIEND = '1265046372';
 
 // ── 基础覆盖 ──────────────────────────────────────────────────────────────
 const oldFact = mem.rememberEntry({ uid: FRIEND, category: 'fact', content: '这个人有对象' });

@@ -98,6 +98,8 @@ import {
 import { postRandomQzone, initQzoneCore, startQzoneAutoLike, startQzoneWeeklyScheduler } from './core/qzone.js';
 import { initBiliNurtureCore, startBiliNurture } from './core/bili-nurture.js';
 import { initBiliDynamicCore, startBiliDynamicScheduler } from './core/bili-dynamic.js';
+import { initTgResource } from './core/tg-resource.js';
+import { initMaterials } from './core/materials.js';
 import { auditSandboxPatch } from './core/sandbox-audit.js';
 import {
   cancelPendingEntry, handlePendingAnswer, handlePokeNotice, handleInputStatusNotice,
@@ -325,6 +327,8 @@ async function main() {
   initStickerCore(cfg);
   initDocxCore(cfg);
   initQqSendCore(cfg);
+  initTgResource(cfg); // 2026-10-30 TG 资源域：telegram.enabled 时自启 Python 侧车并托管（否则零动作）
+  try { initMaterials(cfg); } catch (e) { log(`[materials] 素材库初始化失败（不影响其他功能）: ${e?.message ?? e}`); }
   setTunableCfg(cfg);
   // 2026-10-25（工具型裁剪）：QZone 全家（说说/点赞/cookie）默认下线——工具型不碰 QQ 空间，
   // 顺带消灭审计 P1 第 8 条（GET /api/qzone-cookie）的实际暴露面；要重开置 social.qzoneEnabled=true
@@ -500,7 +504,10 @@ async function main() {
   // （重复计 token、重放"无正文收尾"误标新未读、旧回复被写回 pendingUndeliveredText 触发重复回复、
   // 重放帧重新武装看门狗造成重启后 180s 批量误杀会话）。
   const api = new NodeApiClient(cfg.dsh.baseUrl, undefined, {
-    dshLogFile: process.env.DSH_ISOLATED_LOG_FILE || '',
+    dshLogFile: process.env.DSH_ISOLATED_LOG_FILE
+      // 2026-10-30：restart.bat/start.bat 直拉链不注入该 env，cookie 换不到 → remote.mux 被
+      // 401 拒（事件流 3s 一报错，QQ 线瘫）。常规落点兜底；文件不存在时 readLatestToken 返 null，行为同旧版免鉴权。
+      || path.join(STATE_DIR, '..', '..', '本地栈', 'dsh-web.log'),
     seqFile: path.join(STATE_DIR, 'dsh-seq.json'),
   });
   setTurnGuardApi(api);

@@ -208,6 +208,11 @@ const MEDIA_PLACEHOLDER_HINT = '—— 这张图没能投递给你，看不到�
 export async function resolveOneMedia(media, opts = {}) {
   const raw = opts.raw === true;
   if (!media || typeof media !== 'object') return { ok: false, fallbackText: '' };
+  /* 审查 P1-2：video 不是图片——诚实占位，不按图片额度去真拉一遍字节再谎报
+   * 「加载失败」。想看画面请走 video_look（工具描述与 mux 入库提示同口径）。 */
+  if (media.kind === 'video') {
+    return { ok: false, fallbackText: '[视频：本工具不读取；想知道画面内容用 video_look 看]' };
+  }
   if (media.kind === 'face') {
     const face = await fetchFaceMedia(media, opts);
     if (face.buffer) {

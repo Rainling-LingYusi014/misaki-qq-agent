@@ -1253,7 +1253,7 @@ export function currentDayOffsetMin() {
 }
 
 /** 今日（计费日，由 config dayOffsetMinutes 定换日时刻；本部署=北京自然日 00:00）全局用量与换日键：
- * misaki@credits 显示用，与 checkTokenBudget 的全局分支同口径（加权计费：cacheRead×cacheHitWeight）。 */
+ * msk@credits 显示用，与 checkTokenBudget 的全局分支同口径（加权计费：cacheRead×cacheHitWeight）。 */
 export function todayBillingUsage() {
   ensureInit();
   const key = billingKey(Date.now());

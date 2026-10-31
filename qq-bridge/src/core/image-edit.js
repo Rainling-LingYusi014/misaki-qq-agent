@@ -509,6 +509,62 @@ export async function editImage({ cfg, name, buf, watermarkBuf, watermarkName, u
   }
 }
 
+const PILLOW_SLICE_SCRIPT = String.raw`
+import sys, json, os
+from PIL import Image
+src, out_dir, raw = sys.argv[1], sys.argv[2], sys.argv[3]
+o = json.loads(raw)
+rows = max(1, min(6, int(o['rows'])))
+cols = max(1, min(6, int(o['cols'])))
+inset = max(0.0, min(0.15, float(o.get('inset') or 0)))
+im = Image.open(src)
+im.load()
+W, H = im.size
+cw, ch = W / cols, H / rows
+frames = []
+for r in range(rows):
+    for c in range(cols):
+        box = (int(c * cw + cw * inset), int(r * ch + ch * inset),
+               int((c + 1) * cw - cw * inset), int((r + 1) * ch - ch * inset))
+        tile = im.crop(box)
+        name = 'tile-%d-%d.png' % (r, c)
+        tile.save(os.path.join(out_dir, name))
+        frames.append(name)
+print(json.dumps({'frames': len(frames), 'rows': rows, 'cols': cols, 'tileW': int(cw), 'tileH': int(ch), 'files': frames}))
+`;
+
+/**
+ * 故事板切格（2026-10-30，为「同角色多帧」补的能力）：把一张 N×M 网格图按行列等分切成帧。
+ * 为什么需要它：文生图每次调用都是新角色，逐帧一致做不到；而**一次生成一张多格故事板**天然同角色
+ * 同画风，切格后按顺序合成 GIF 就能得到连贯动作。切格本身不占额度（额度在随后的 makeGif 里算一次）。
+ */
+export function sliceStoryboard({ buf, rows = 2, cols = 2, inset = 0 } = {}) {
+  const t = probeTools();
+  if (!t.pillow) throw new Error('故事板切格需要 Python Pillow');
+  if (!Buffer.isBuffer(buf) || !buf.length) throw new Error('故事板图片为空');
+  const r = Math.max(1, Math.min(6, Number(rows) || 2));
+  const c = Math.max(1, Math.min(6, Number(cols) || 2));
+  if (r * c < 2) throw new Error('至少要有 2 格（rows×cols ≥ 2）');
+  const jobId = `sheet-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+  const tmp = ensureDir(path.join(TMP_DIR, jobId));
+  try {
+    const srcPath = path.join(tmp, 'sheet.png');
+    fs.writeFileSync(srcPath, buf);
+    const outDir = ensureDir(path.join(tmp, 'tiles'));
+    const res = spawnSync(t.pyCmd, ['-c', PILLOW_SLICE_SCRIPT, srcPath, outDir, JSON.stringify({ rows: r, cols: c, inset })], {
+      encoding: 'utf8', timeout: 120000, maxBuffer: 8 * 1024 * 1024,
+    });
+    if (res.status !== 0) throw new Error(`切格失败：${(res.stderr || res.stdout || '').trim().slice(0, 300)}`);
+    const info = JSON.parse(String(res.stdout || '{}').trim().split(/\r?\n/).pop() || '{}');
+    const frames = (info.files || []).map((name) => ({ name, buf: fs.readFileSync(path.join(outDir, name)) }));
+    if (frames.length < 2) throw new Error('切格后帧数不足 2');
+    log(`[image-edit] 故事板切格 ${r}x${c} → ${frames.length} 帧 ${info.tileW}x${info.tileH}`);
+    return { frames, rows: r, cols: c, tileW: info.tileW, tileH: info.tileH };
+  } finally {
+    try { fs.rmSync(tmp, { recursive: true, force: true }); } catch { /* ignore */ }
+  }
+}
+
 /** 多图合成 GIF（2~60 帧）。额度与单图编辑共用，一次合成算一次。 */
 export async function makeGif({ cfg, images, uid, isOwner, options } = {}) {
   const t = probeTools();

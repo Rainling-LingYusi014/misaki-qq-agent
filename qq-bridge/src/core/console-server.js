@@ -91,6 +91,8 @@ import {
   uploadFileToQQ, sendDocx, initDocxCore,
 } from './docx.js';
 import { makePptxBuffer, makeXlsxBuffer, writeOfficeToMount } from './office-gen.js';
+import { tgSearch, tgDownload, tgJob, tgEnabled } from './tg-resource.js';
+
 import {
   stickerEnabled, saveStickerStoreSafe, syncStickerLibrary, listStickersFor,
   getStickerImageData, sendSticker2, sendQqFace2,
@@ -191,13 +193,19 @@ import {
   scheduleReplyCheck, buildWakeReminderPrompt,
   clearSocialTimers, clearAllSocialTimers, resetConversationKeepingLedger,
   companionToolBlock, companionToolBlockByToken,
+  // 2026-10-30 TG 资源域开放全员：key 由桥从 token 反解，不接受调用方自报
+  keyByAgentToken,
   bubbleStyleOf,
-  // 2026-10-29 misaki@reaction：括号反馈总开关（按会话）
+  // 2026-10-29 msk@reaction：括号反馈总开关（按会话）
   bracketReactionOf,
+  // 2026-10-31 早安资料卡点赞：早安派发钩子（bot 调用在本文件落地，见 botRef 旁）
+  setMorningLikeHook,
 } from './social-state.js';
 import { companionCfg } from './companion-mode.js';
 import { shapeBubbles, joinBubbles } from '../lib/bubble-split.js';
 import { shapeBrackets, bracketScene, bracketFeedbackCfg, classifySegment, planRealtimeReply } from '../lib/bracket-feedback.js';
+// 视频字幕直读（2026-10-31 主人拍板 P1）：B站/YouTube 字幕轨 → 文本，模型读了讲大意
+import { fetchVideoSubtitles, lookVideoFile } from '../lib/video-subs.js';
 // 作息仪式（2026-10-13）：晚安熄灯计时 / 早安触发（触发方是 sleep-switch.sh 的 cron）
 import { initRitual, startGoodnight, clearGoodnight } from './ritual.js';
 // 出站回复幂等账本（2026-09-16 修「reset 之后同一条回复发了两遍」，事故经过见模块顶部注释）
@@ -234,6 +242,15 @@ import { handleIncoming, pumpMux, initMuxCore, setMuxApi, setMuxBot } from './mu
 let cfgRef = null;
 let apiRef = null;
 let botRef = null;
+/* 2026-10-31 早安资料卡点赞：social-state 的早安派发钩子在这里落成 NapCat 调用。
+ * morningLikeTimes=0 关闭；非会员每人每天 10 赞封顶；失败只记日志不打扰问候。 */
+setMorningLikeHook((uid) => {
+  const times = Math.min(10, Math.max(0, Number(cfgRef?.social?.proactive?.morningLikeTimes ?? 10)));
+  if (!times || !botRef) return;
+  botRef.raw('send_like', { user_id: Number(uid), times })
+    .then(() => log(`[morningLike] ${uid} x${times}`))
+    .catch((e) => log(`[morningLike] 点赞失败(${uid}): ${e?.message ?? e}`));
+});
 let sendRich = null;
 let musicSearch = null;
 let buildMusicCard = null;   // media 域提供：音乐卡片字段由桥解析拼好（含封面归一化 + 降级梯子）
@@ -1827,10 +1844,23 @@ export function startConsoleServer() {
         sendWakePrompt(ownerKeyRitual, 'morning').catch((e) => log(`[ritual] 早安唤醒失败: ${e?.message ?? e}`));
         // 2026-10-17 早安朋友名单：对名单里的私聊也各发一次 morning 唤醒（不计配额——配额只统计 proactiveCheck）
         const morningUids = Array.isArray(cfgRef?.social?.proactive?.morningFriendUids) ? cfgRef.social.proactive.morningFriendUids : [];
+        // 2026-10-31 主人加的小功能：早安附近顺手给好友资料卡点赞（NapCat send_like，非会员每人每天 10 赞封顶）。
+        //   跟着槽位走；失败只记日志，不打扰问候。morningLikeTimes=0 关闭。
+        const likeTimes = Math.min(10, Math.max(0, Number(cfgRef?.social?.proactive?.morningLikeTimes ?? 10)));
+        const todayKeyManual = beijingDateKey(); // 审查 P2-7：与排程线同一记账字段，两条线互认
         for (const mUid of morningUids) {
           const mKey = `private:${mUid}`;
           if (mKey === ownerKeyRitual) continue;
+          const stM = getSocialState(mKey);
+          if (stM.morningGreetDay === todayKeyManual) { log(`[ritual] ${mKey} 今天已问候过（手动/排程撞车），跳过`); continue; }
+          stM.morningGreetDay = todayKeyManual; // 派发即记账：排程线当天不再对同一人双发早安+点赞
+          saveSocialState();
           sendWakePrompt(mKey, 'morning').catch((e) => log(`[ritual] 早安唤醒失败(${mKey}): ${e?.message ?? e}`));
+          if (likeTimes > 0 && botRef) {
+            botRef.raw('send_like', { user_id: Number(mUid), times: likeTimes })
+              .then(() => log(`[morningLike] ${mUid} x${likeTimes}`))
+              .catch((e) => log(`[morningLike] 点赞失败(${mUid}): ${e?.message ?? e}`));
+          }
         }
         sendJson({ ok: true, woken: ownerKeyRitual });
         return;
@@ -2058,7 +2088,7 @@ export function startConsoleServer() {
             enabled: cfgRef.social?.sticker?.enabled !== false,
             total: stickerEntries.length,
             context: cfgRef.social?.sticker?.includeInPrompt !== false ? buildStickerContext(stickerEntries, cfgRef.social?.sticker?.promptMaxStickers ?? 8) : '',
-            strategy: cfgRef.social?.sticker?.includeInPrompt !== false ? buildStickerStrategyHint(cfgRef.social?.sticker?.sendProbability) : ''
+            strategy: cfgRef.social?.sticker?.includeInPrompt !== false ? buildStickerStrategyHint() : ''
           }
         });
         return;
@@ -2657,13 +2687,15 @@ export function startConsoleServer() {
             const stBf = getSocialState(key);
             if (bfCfg.enabled && stBf?.agentMode === 'companion' && bracketReactionOf(key)) {
               const scene = bracketScene(stBf);
-              /* 2026-10-29 防重放（幂等）：模型 90 秒内重发同一批文本时，直接复现上次的成形结果。
-               * 否则动作去重会读到刚才自己写入的历史，输出少一段、文本变了，反而绕过防重闸导致双发。 */
+              /* 2026-10-29 防重放（幂等）：模型 180 秒内重发同一批文本时，直接复现上次的成形结果。
+               * 否则动作去重会读到刚才自己写入的历史，输出少一段、文本变了，反而绕过防重闸导致双发。
+               * 审查 P2-6：窗口与幂等账本 REPLAY_WINDOW_MS(180s) 对齐——90s 时，90~180s 之间的
+               * 部分失败重发会因 bubbleSeq 已推进而生成变体，绕过 filterAlreadySentBubbles 双发。 */
               const bfInput = JSON.stringify(messages);
               const lastBf = stBf._bfLast && typeof stBf._bfLast === 'object' ? stBf._bfLast : null;
-              if (lastBf && lastBf.input === bfInput && Date.now() - Number(lastBf.at || 0) < 90000) {
+              if (lastBf && lastBf.input === bfInput && Date.now() - Number(lastBf.at || 0) < 180000) {
                 bubbleTexts = Array.isArray(lastBf.out) ? lastBf.out.slice() : bubbleTexts;
-                log(`[BF] ${key} 同一批文本 90s 内重发 → 复现上次成形结果（不重新过动作去重）`);
+                log(`[BF] ${key} 同一批文本 180s 内重发 → 复现上次成形结果（不重新过动作去重）`);
               } else {
                 let kept = 0;
                 const baseSeq = Number(stBf.bubbleSeq) || 0;
@@ -2689,6 +2721,7 @@ export function startConsoleServer() {
                   saveSocialState();
                   log(`[BF] ${key} 实时档 → ${plan.mode === 'chain' ? `动作链 ${plan.chainSize} 条` : '单个纯动作反馈'}（文字${plan.mode === 'single' ? '已省略' : '保留在末条'}）`);
                 } else {
+                  const rolls = [];
                   bubbleTexts = bubbleTexts.map((t, i) => {
                     const seq = baseSeq + i + 1;
                     const r = shapeBrackets(t, {
@@ -2700,6 +2733,7 @@ export function startConsoleServer() {
                       bubbleSeq: seq,
                     });
                     kept += r.keptSegments;
+                    rolls.push(String(r.rolled || ''));
                     for (const seg of (r.keptSegs || [])) {
                       // 只记动作类；表情/神态/心理不进窗口（主人：这两类暂不限制）
                       if (classifySegment(String(seg).replace(/^\(|\)$/g, '')) === 'action') hist.push({ seg, seq });
@@ -2707,18 +2741,40 @@ export function startConsoleServer() {
                     return r.text;
                   });
                   const dropped = bubbleTexts.filter((t, i) => t !== messages[i]).length;
+                  const stripN = rolls.filter((x) => x === 'strip').length;
                   // 记账：序号推进 + 动作历史截断（上限 60）
                   stBf.bubbleSeq = baseSeq + bubbleTexts.length;
                   stBf.bracketActions = hist.slice(-60);
                   stBf._bfLast = { input: bfInput, out: bubbleTexts.slice(), at: Date.now() };
                   saveSocialState();
-                  log(`[BF] ${key} 括号反馈 scene=${scene} → 保留 ${kept} 段 / ${bubbleTexts.length} 气泡${dropped ? `（${dropped} 条因动作重复被砍）` : ''}`);
+                  /* 2026-11-01 修正日志（曾把骰子剥掉误标成「动作重复被砍」，误导了一整轮排查）：
+                   * rolled='strip' 是普通档骰子未中（整泡剥光），其余变化才是去重/移位类改写。 */
+                  log(`[BF] ${key} 括号反馈 scene=${scene} → 保留 ${kept} 段 / ${bubbleTexts.length} 气泡（骰子剥 ${stripN} ／ 其他改动 ${dropped - stripN}）`);
                 }
               }
             }
           } catch (eBf) {
             log(`[BF] ${key} 括号成形异常，按原文发：${eBf?.message ?? eBf}`);
           }
+        }
+        /* 2026-10-30 亲密语域硬闸（主人定：先只记日志跑三天，确认不误伤再改写）。
+         * 依据：人类在亲密语境的指令词占比 0%，而 10-30 下午那段她占到 38%
+         * （别说话了 / 别得寸进尺 / 滚去上课）——这正是「陪着」滑成「管着」的地方。 */
+        try {
+          const gateCfg = cfgRef?.social?.associative?.intimateGate;
+          const stG = getSocialState(key);
+          const lastIn = [...(Array.isArray(stG?.unread) ? stG.unread : [])].reverse().find((m) => m && !m.isSelf);
+          const inText = String(lastIn?.plain ?? lastIn?.text ?? '');
+          const intimate = /抱|亲|贴贴|想你|喜欢你|睡|乖|揉|撒娇|mua/i.test(inText) || bracketScene(stG) === 'realtime';
+          if (gateCfg?.enabled !== false && intimate && stG?.agentMode === 'companion') {
+            const IMP = /(别|先|快去|快点|滚|记得|该去|起来吧|睡吧|闭眼)/;
+            const hits = bubbleTexts.filter((t) => IMP.test(String(t)));
+            if (hits.length) {
+              log(`[Gate] ${key} 亲密语域检出指令句 ${hits.length}/${bubbleTexts.length}（mode=${gateCfg?.mode || 'log'}，未改写）：${String(hits[0]).slice(0, 28)}`);
+            }
+          }
+        } catch (eGate) {
+          log('[Gate] 亲密语域检查异常：' + (eGate?.message ?? eGate));
         }
         /* 2026-10-28 主人：「正常人聊天打字不会额外打句号」——现场「收下啦。」。
          * 只兜住最明显的一类：单行、≤20 字、结尾句号；长段落和多句陈述的句号保留。
@@ -4425,6 +4481,130 @@ export function startConsoleServer() {
           log(`[send-file] 工具发送文件失败 ${key}: ${error?.message ?? error}`);
           sendJson({ ok: false, error: `发送文件失败：${error?.message ?? error}` }, 500);
         }
+        return;
+      }
+      // ── TG 资源域（2026-10-30，M2）：主人专用的 Telegram 搜索/下载/任务查询。
+      // 身份闸（2026-10-30 主人拍板：对所有人开放，不设人数白名单、不设限额）。
+      // token 即身份：key 由桥从 token 反解，不接受调用方自报（防伪造他人会话/偷投递到别人私聊）。
+      // 仅私聊可用；下载与文件投递都落调用方自己的私聊。开关未开时直接拒绝（纵深防御，工具面也不注册）。
+      const tgAccessGuard = (token) => {
+        if (!tgEnabled()) return { error: 'TG 资源域未启用（telegram.enabled）' };
+        const resolved = keyByAgentToken(String(token ?? '').trim());
+        if (!resolved) return { error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim' };
+        if (!resolved.startsWith('private:')) return { error: 'TG 资源仅在私聊可用' };
+        return { key: resolved };
+      };
+      if (req.method === 'POST' && url.pathname === '/api/tg/search') {
+        const body = await readBody();
+        const guard = tgAccessGuard(req.headers['x-agent-token']);
+        if (guard.error) { sendJson({ ok: false, error: guard.error }, 403); return; }
+        try {
+          const out = await tgSearch(String(body.query ?? '').slice(0, 120), body.channel,
+            Math.max(1, Math.min(Number(body.n) || 5, 8)), body.since, body.until);
+          sendJson({ ok: true, ...out });
+        } catch (e) { sendJson({ ok: false, error: `TG 搜索失败：${e?.message ?? e}` }, 502); }
+        return;
+      }
+      /* ── 视频字幕直读（2026-10-31 主人拍板 P1）：B站/YouTube 字幕轨 → 文本 ──
+       * 模型在「找/推视频交付前」与「用户甩链接来问」时调用；kind='none' 必须如实说没有对白可总结。
+       * 身份闸与 TG 同款（token 即身份、仅私聊），但不挂 TG 开关——字幕线独立于 TG 资源域。 */
+      if (req.method === 'POST' && url.pathname === '/api/video/subtitles') {
+        const body = await readBody();
+        const resolved = keyByAgentToken(String(req.headers['x-agent-token'] ?? '').trim());
+        if (!resolved) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim' }, 403); return; }
+        if (!resolved.startsWith('private:')) { sendJson({ ok: false, error: '视频字幕仅在私聊可用' }, 403); return; }
+        const url = String(body.url ?? '').trim();
+        if (!/^https?:\/\//.test(url)) { sendJson({ ok: false, error: '需要 http(s) 视频链接' }, 400); return; }
+        try {
+          const yt = cfgRef?.ytdl ?? {};
+          const out = await fetchVideoSubtitles(url, {
+            ytBin: String(yt.bin || ''),
+            proxyUrl: String(yt.proxyUrl || 'http://127.0.0.1:7890'),
+            workDir: path.join(String(yt.dir || path.join(STATE_DIR, 'agents')), 'subs-tmp'),
+          });
+          sendJson({ ok: true, url, ...out });
+        } catch (e) { sendJson({ ok: false, error: `字幕拉取失败：${e?.message ?? e}` }); } /* 审查 P2-11：与 look 统一 200+ok:false（业务失败非 5xx），工具层认 ok 字段 */
+        return;
+      }
+      /* ── 视频看画面（2026-10-31 主人拍板 P3，视觉=GLM-5.3-Flash）─────────────
+       * 无对白内容（过场动画/PV）唯一的内容层入口。纪律：只描述看得见的，不推剧情。 */
+      if (req.method === 'POST' && url.pathname === '/api/video/look') {
+        const body = await readBody();
+        const resolved = keyByAgentToken(String(req.headers['x-agent-token'] ?? '').trim());
+        if (!resolved) { sendJson({ ok: false, error: 'Invalid agent token - use the [Token] value at the top of the latest wake prompt, copied verbatim' }, 403); return; }
+        if (!resolved.startsWith('private:')) { sendJson({ ok: false, error: '视频看画面仅在私聊可用' }, 403); return; }
+        const filePath = String(body.path ?? '').trim();
+        if (!filePath) { sendJson({ ok: false, error: 'path 不能为空（工作区内的视频文件）' }, 400); return; }
+        const workspaceRoot = String(cfgRef.dsh?.workspaceRoot ?? '').trim();
+        const legacyAgentsRoot = path.resolve(STATE_DIR, 'agents');
+        const allowedRoots = [...new Set([workspaceRoot ? path.resolve(workspaceRoot) : null, legacyAgentsRoot].filter(Boolean))];
+        let absPath = '';
+        let matchedRoot = '';
+        for (const r of allowedRoots) {
+          const cand = path.isAbsolute(filePath) ? path.resolve(filePath) : path.resolve(r, filePath);
+          if (cand === r || cand.startsWith(r + path.sep)) { matchedRoot = r; absPath = cand; break; }
+        }
+        if (!absPath || !fs.existsSync(absPath)) { sendJson({ ok: false, error: `文件不存在或不在工作区白名单内：${filePath}` }, 404); return; }
+        /* 审查 P1-1：与 send-file 同一防线——realpath 双校验（软链出白名单即拒）+ 普通文件闸。
+         * fs.existsSync 跟随软链，前缀检查拦不住「白名单内建链指向白名单外」的逃逸。 */
+        try {
+          const realRoot = fs.realpathSync(matchedRoot);
+          const realFile = fs.realpathSync(absPath); // 符号链接在此现形：link 出白名单即拒
+          if (realFile !== realRoot && !realFile.startsWith(realRoot + path.sep)) {
+            sendJson({ ok: false, error: '路径越界（符号链接）：只允许白名单目录内的真实文件' }, 403); return;
+          }
+          absPath = realFile;
+          const vstat = fs.statSync(absPath);
+          if (!vstat.isFile()) { sendJson({ ok: false, error: '目标不是普通文件（目录或设备）' }, 400); return; }
+          if (vstat.size <= 0) { sendJson({ ok: false, error: '文件为空' }, 400); return; }
+          if (vstat.size > 2 * 1024 * 1024 * 1024) { sendJson({ ok: false, error: '文件过大（>2GB）：video_look 只对 ≤2GB 的视频开放' }, 413); return; }
+        } catch (error) {
+          if (error && typeof error === 'object' && error.code === 'ENOENT') { sendJson({ ok: false, error: `文件不存在：${filePath}` }, 404); return; }
+          sendJson({ ok: false, error: `路径校验失败：${error?.message ?? error}` }, 400); return;
+        }
+        const vv = cfgRef.videoVision ?? {};
+        const ffmpegBin = String(cfgRef.ffmpegBin || path.join(ROOT, 'bin', 'ffmpeg-9.0.2-essentials_build', 'bin', 'ffmpeg.exe'));
+        const ffprobeBin = String(cfgRef.ffprobeBin || path.join(ROOT, 'bin', 'ffmpeg-9.0.2-essentials_build', 'bin', 'ffprobe.exe'));
+        try {
+          const out = await lookVideoFile({
+            file: absPath,
+            ffmpegBin,
+            ffprobeBin,
+            tmpDir: path.join(String(cfgRef.ytdl?.dir || path.join(STATE_DIR, 'agents')), 'look-tmp'),
+            vision: {
+              baseUrl: String(vv.baseUrl || 'https://open.bigmodel.cn/api/paas/v4'),
+              apiKey: String(vv.apiKey || cfgRef.zhipu?.apiKey || ''),
+              model: String(vv.model || 'glm-5.3-flash'),
+            },
+          });
+          sendJson({ ok: !!out.ok, ...out });
+        } catch (e) { sendJson({ ok: false, error: `视频看画面失败：${e?.message ?? e}` }, 502); }
+        return;
+      }
+      if (req.method === 'POST' && url.pathname === '/api/tg/download') {
+        const body = await readBody();
+        const guard = tgAccessGuard(req.headers['x-agent-token']);
+        if (guard.error) { sendJson({ ok: false, error: guard.error }, 403); return; }
+        const msgId = Number(body.msgId);
+        if (!Number.isFinite(msgId) || msgId <= 0) { sendJson({ ok: false, error: 'msgId 必须是正整数（来自 tg_search 结果）' }, 400); return; }
+        try {
+          const out = await tgDownload(guard.key, body.channel, msgId);
+          sendJson({ ok: true, ...out });
+        } catch (e) { sendJson({ ok: false, error: `TG 下载未受理：${e?.message ?? e}` }, 502); }
+        return;
+      }
+      if (req.method === 'POST' && url.pathname === '/api/tg/job') {
+        const body = await readBody();
+        /* 审查 P2-8：与 tg_search/download 同一道闸（agent token 即身份），并校验 job 归属——
+         * 全局 console 闸本来就拦外部进程，这里补的是「拿到 console token 的组件也不能
+         * 查别人的 job」。工具侧 tg_job 已同步改为携带 [Token]。 */
+        const guard = tgAccessGuard(req.headers['x-agent-token']);
+        if (guard.error) { sendJson({ ok: false, error: guard.error }, 403); return; }
+        const jobId = String(body.jobId ?? '').trim();
+        if (!/^[0-9a-f]{8,}$/.test(jobId)) { sendJson({ ok: false, error: 'jobId 格式不对（tg_download 返回的十六进制 id）' }, 400); return; }
+        const jobOut = await tgJob(jobId);
+        if (jobOut.known && jobOut.key && jobOut.key !== guard.key) { sendJson({ ok: false, error: '这个下载任务不是你发起的（归属校验失败）' }, 403); return; }
+        sendJson({ ok: true, ...jobOut });
         return;
       }
       // 生成并发送 PPTX / XLSX（办公 office，2026-10-26）：MCP qq_send_pptx / qq_send_xlsx。
@@ -7033,6 +7213,16 @@ export function startConsoleServer() {
                 cfg: cfgRef, images: frames, uid, isOwner,
                 options: { width: ibody.width, delay: ibody.delay, fps: ibody.fps, loop: ibody.loop },
               });
+            } else if (actionLc === 'gif-storyboard' && imgIds.length > 0) {
+              /* 故事板切格 → 合成 GIF（2026-10-30）：一张 N×M 网格图切帧后拼动图。
+               * 解决「同一角色逐帧一致」——一次生成的多格图天然同角色，比多张独立生成可靠。 */
+              const f = await imgMod.fetchImageForEdit({ cfg: cfgRef, messageId: imgIds[0] });
+              const sliced = imgMod.sliceStoryboard({ buf: f.buf, rows: ibody.rows, cols: ibody.cols, inset: ibody.inset });
+              r = await imgMod.makeGif({
+                cfg: cfgRef, images: sliced.frames, uid, isOwner,
+                options: { width: ibody.width, delay: ibody.delay, fps: ibody.fps, loop: ibody.loop },
+              });
+              r = { ...r, storyboard: { rows: sliced.rows, cols: sliced.cols, tileW: sliced.tileW, tileH: sliced.tileH } };
             } else if (imgIds.length > 1 && actionLc) {
               /* 批量处理（工作站第三批）：同一组参数逐张跑，打包 ZIP 发回。 */
               const frames = [];

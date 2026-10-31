@@ -123,8 +123,10 @@ function extractText(body) {
  *   失败不抛：调用方按"退回附件"处理（识图是增强，不该成为丢图的理由）。
  */
 export async function describeImageWithVisionModel(buffer, mimeType, opts = {}) {
-  const ep = visionEndpoint();
-  if (!ep) return { ok: false, error: '未配置独立识图模型' };
+  const ep = opts.baseUrl
+    ? { url: chatCompletionsUrl(opts.baseUrl), model: String(opts.model ?? '').trim(), key: String(opts.apiKey ?? '').trim() }
+    : visionEndpoint();
+  if (!ep || !ep.model) return { ok: false, error: '未配置独立识图模型' };
   const started = Date.now();
   const dataUrl = `data:${mimeType || 'image/jpeg'};base64,${Buffer.from(buffer).toString('base64')}`;
   const body = {
@@ -152,6 +154,47 @@ export async function describeImageWithVisionModel(buffer, mimeType, opts = {}) 
     const text = extractText(parsed);
     if (!text) return { ok: false, error: '响应里没有可用的文字描述' };
     return { ok: true, text, model: ep.model, ms: Date.now() - started };
+  } catch (error) {
+    return { ok: false, error: String(error?.message ?? error) };
+  }
+}
+
+/**
+ * 多帧画面描述（2026-10-31 主人拍板 P3，视频看画面用）：把一段视频抽出的 N 帧
+ * 按时间顺序一次交给视觉模型，产出「画面里有什么」的描述。
+ * 只描述看得见的（场景/人物/动作/文字/风格）——**不推测剧情、不猜对话**，
+ * 防编造纪律写在调用方（video_look 工具描述）与 persona。
+ * opts.baseUrl/apiKey/model 可覆盖 dsh.vision*（P3 用 GLM-5.3-Flash 时从这里指）。
+ * @returns {Promise<{ok:true, text:string, model:string, ms:number, frames:number}|{ok:false, error:string}>}
+ */
+export async function describeVideoFrames(frames, opts = {}) {
+  if (!Array.isArray(frames) || !frames.length) return { ok: false, error: '没有可描述的帧' };
+  const ep = opts.baseUrl
+    ? { url: chatCompletionsUrl(opts.baseUrl), model: String(opts.model ?? '').trim(), key: String(opts.apiKey ?? '').trim() }
+    : visionEndpoint();
+  if (!ep || !ep.model) return { ok: false, error: '未配置视觉模型' };
+  const started = Date.now();
+  const n = frames.length;
+  const prompt = opts.prompt
+    || `这是一段视频按时间顺序抽取的 ${n} 帧画面。请描述这段视频的视觉内容：场景、出现的角色与他们的动作、画面文字、整体氛围与风格。纪律：只描述画面里看得见的东西，不要推测剧情走向，不要编造对话或声音。直接输出描述本身。`;
+  const content = [{ type: 'text', text: prompt }];
+  for (const f of frames) {
+    content.push({ type: 'text', text: `[第 ${f.index} 帧，位于视频 ${Math.round(f.t)} 秒处]` });
+    content.push({ type: 'image_url', image_url: { url: `data:image/jpeg;base64,${Buffer.from(f.buf).toString('base64')}` } });
+  }
+  const body = { model: ep.model, max_tokens: Number(opts.maxTokens) > 0 ? Number(opts.maxTokens) : 900, messages: [{ role: 'user', content }] };
+  const headers = { accept: 'application/json' };
+  if (ep.key) headers.authorization = `Bearer ${ep.key}`;
+  try {
+    const res = await requestJsonPost(ep.url, body, headers);
+    if (res.statusCode < 200 || res.statusCode >= 300) {
+      return { ok: false, error: `HTTP ${res.statusCode}：${res.text.slice(0, 200)}` };
+    }
+    let parsed;
+    try { parsed = JSON.parse(res.text); } catch { return { ok: false, error: '响应不是合法 JSON' }; }
+    const text = extractText(parsed);
+    if (!text) return { ok: false, error: '响应里没有可用的文字描述' };
+    return { ok: true, text, model: ep.model, ms: Date.now() - started, frames: n };
   } catch (error) {
     return { ok: false, error: String(error?.message ?? error) };
   }

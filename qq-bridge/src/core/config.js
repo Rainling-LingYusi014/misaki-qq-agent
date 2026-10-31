@@ -252,10 +252,11 @@ export function loadConfig() {
         maxListCount: 100,         // qq_list_stickers 单次最大返回数
         includeInPrompt: true,     // 是否在 qq_get_prompt / 唤醒提示里附带表情摘要与策略
         promptMaxStickers: 8,      // 提示里最多列出的常用表情数
-        // 2026-09-15：发表情概率从"提示词软引导"改成桥侧掷骰（与语音同一套机制，见 core/send-dice.js）：
-        // 每次唤醒桥掷一次，把 [Meme] dice HIT/MISS 写进唤醒正文；sendCooldownMs 管同一会话的连发。
-        sendProbability: 0.3,      // 0~1；0 = 不主动发表情（只有被明确要求才发）
-        sendCooldownMs: 180000,    // 刚发过表情包后这段时间内不再抽中（默认 3 分钟）
+        // 2026-10-30 主人定调：概率退役——每轮唤醒都给表情机会（[Meme] available），
+        // 限频全靠两个硬闸（见 core/send-dice.js）；发不发由模型按语境判断。
+        sendMinIntervalMs: 30000,  // 两张表情的最短间隔（毫秒）
+        sendMaxPerWindow: 5,       // 滑动窗口内最多张数
+        sendMaxWindowMs: 300000,   // 滑动窗口时长（毫秒，默认 5 分钟）
         collect: {
           enabled: true,           // AI 收藏他人表情总开关
           maxPerMinute: 2,         // 每分钟最多收藏次数
@@ -352,10 +353,22 @@ export function loadConfig() {
      * core/napcat-guard.js 的 guardCfg() 读的就是 cfgRef?.guard，于是改 guard.* 完全无效、守护照旧按默认值跑，
      * napcat-guard.js 里 verdict='disabled' 那条分支也不可达。这里把 guard 段透传进来（出厂默认见 config.example.json）。 */
     guard: { ...(file.guard ?? {}) },
+    /* 2026-10-30：TG 资源域（core/tg-resource.js）。与 guard 同型的 BL2 坑——loadConfig 是显式键字面量，
+     * 不在这里透传的话 config.json 里的 telegram 段会被整段丢掉，initTgResource 永远按未启用跑。 */
+    telegram: { ...(file.telegram ?? {}) },
     /* 2026-10-27：TTS 交付链路（千问复刻）的配置。loadConfig 返回的是显式键字面量，
      * 不在这里透传的话 config.json 里的 voice 段会被整段丢掉（与上面 guard 的 BL2 坑同型）。
      * 注意它和 state/voice-config.json 的 MiMo 聊天语音是两套东西，互不影响。 */
     voice: { ...(file.voice ?? {}) },
+    /* 2026-10-30：素材库（core/materials.js + materials-server.js）。BL2 坑同型——不透传整段丢弃。
+     * LAN 上传页（手机/PC 浏览器直投）+ 美咲检索工具共用的库定义都在这一段。 */
+    materials: {
+      enabled: true,
+      lanPort: 3210,
+      bindHost: '0.0.0.0',
+      categories: ['misaki', 'daily', 'scenery'],
+      ...(file.materials ?? {}),
+    },
     /* 2026-10-27：通用文件格式转换（同样必须显式透传，否则 config.json 里的 convert 段会被丢掉）。 */
     convert: { ...(file.convert ?? {}) },
     /* 2026-10-27 晚：文本/JSON 工具的小额度（JSON 格式化、文本处理；与上面同型，不透传会整段丢）。 */

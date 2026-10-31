@@ -58,7 +58,7 @@ ok(isBlacklisted({ privates: ['333'] }, '333'), 'isBlacklisted: 旧键名 deny.p
 ok(!isBlacklisted({ private: ['111'] }, '999') && !isBlacklisted({}, '') && !isBlacklisted(null, '1'), 'isBlacklisted: 不中/空 uid/无 deny → false');
 
 // 白名单（owner + allow）
-ok(isWhitelisted({ ownerQQ: 1000000002 }, '1000000002'), 'isWhitelisted: ownerQQ 命中（数字配置 vs 字符串 uid）');
+ok(isWhitelisted({ ownerQQ: 1736784911 }, '1736784911'), 'isWhitelisted: ownerQQ 命中（数字配置 vs 字符串 uid）');
 ok(isWhitelisted({ allow: { private: ['123'] } }, '123') && isWhitelisted({ allow: { privates: ['456'] } }, '456'), 'isWhitelisted: allow.private / privates 兼容');
 ok(!isWhitelisted({ ownerQQ: 1 }, '') && !isWhitelisted({}, '1'), 'isWhitelisted: 空 uid / 无配置 → false');
 
@@ -84,7 +84,7 @@ const mockBot = {
 };
 setFriendApprovalBot(mockBot);
 initFriendApprovalCore({
-  ownerQQ: 1000000002,
+  ownerQQ: 1736784911,
   social: { friendApproval: { enabled: true, minDelayMs: 200, maxDelayMs: 400, notifyOwner: false } },
   deny: { private: ['111111111'] },
   allow: { private: ['222222222'] },
@@ -105,7 +105,7 @@ try {
   ok(readPending().length === 0, '端到端①: 黑名单不进待审批队列');
 
   // ② owner 秒过
-  await handleFriendRequest({ flag: 'F-owner', user_id: '1000000002', comment: '' });
+  await handleFriendRequest({ flag: 'F-owner', user_id: '1736784911', comment: '' });
   await waitCalls(2);
   ok(calls[1]?.flag === 'F-owner' && calls[1]?.approve === true, '端到端②: owner 秒过（approve=true）', JSON.stringify(calls[1]));
 
@@ -139,7 +139,7 @@ try {
 // 注意：pendingRequests 是模块 import 时刻载入内存的快照，事后写文件再调同一实例看不到 ——
 // 所以先用 query 打散缓存拿一个全新实例（import 前把过期条目写进文件）。
 const testCfg = {
-  ownerQQ: 1000000002,
+  ownerQQ: 1736784911,
   social: { friendApproval: { enabled: true, minDelayMs: 200, maxDelayMs: 400, notifyOwner: false } },
   deny: { private: ['111111111'] },
   allow: { private: ['222222222'] },

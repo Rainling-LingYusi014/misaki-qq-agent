@@ -4,7 +4,7 @@
 // 时刻必须可重现：按（会话+日期）做文本指纹（stableRoll，与气泡骰子同源），桥重启后重算
 // 同一天得到同一时刻 → 定时器无需落盘，天然「不重发、不漏账」。
 import { stableRoll } from './dice.js';
-import { parseClockMin } from './time.js';
+import { beijingDateKey, parseClockMin } from './time.js';
 
 export const MORNING_GREET_DEFAULTS = Object.freeze({
   p1: 0.33,
@@ -42,11 +42,34 @@ export function morningGreetPlan({ key, dateKey, p1, window1, window2 }) {
   return { atMs: dayStartMs + sMin * 60000 + offsetSec * 1000, windowIndex: idx };
 }
 
-/** 到点判定（纯函数）。「对方今天已经先开口（比如他先问了早安）→ 再补发一条愣的会很奇怪」
- *  是主人点名的场景：lastIncomingAt 兜住他今天说过的任何话，都算「今天已经搭上话」。 */
-export function morningGreetDecision({ dateKey, greetedDay = '', lastIncomingAt = 0, dayStartMs = 0, busy = false }) {
+/** 到点判定（纯函数）。2026-10-30 主人改口：「对方已先开口」只指**主动道过早安**——
+ *  今天说过别的话不算（熬到凌晨道晚安、早上起床，早安照发不误）。
+ *  peerGreetedDay 由入站钩子按问候日记账（见 isPeerMorningGreeting / greetDayKey）。 */
+export function morningGreetDecision({ dateKey, greetedDay = '', peerGreetedDay = '', busy = false }) {
   if (greetedDay === dateKey) return { fire: false, why: '今天已问过' };
-  if (Number(lastIncomingAt) >= dayStartMs) return { fire: false, why: '对方今天已先开口' };
+  if (peerGreetedDay === dateKey) return { fire: false, why: '对方今天已先道过早安' };
   if (busy) return { fire: false, why: '对话进行中' };
   return { fire: true, why: '' };
+}
+
+// ── 问候日界与对方问候识别（2026-10-30 主人定规）────────────────────────────
+// 新的一天从凌晨 4 点起算：0~4 点算前一夜，熬夜到凌晨的对话不拦当天早安。
+
+export const GREET_DAY_BOUNDARY_HOURS = 4;
+
+/** 早安域的「今天是哪天」：北京时间日期键前移 4 小时再取。 */
+export function greetDayKey(ms = Date.now()) {
+  return beijingDateKey(ms - GREET_DAY_BOUNDARY_HOURS * 3600 * 1000);
+}
+
+// 只认纯问候形态（可带标点/表情标记/一句后续）。前缀匹配：「早安，昨晚…」算道过早安；
+// 「早点睡」「早上再说」「早自习」这类不算。
+const PEER_GREET_RE = /^(?:早[安呀啊哦哈哟]?|早上好|早上呀|早哦|good\s*morning|morning|ohayo|おはよう)(?:[！!。．,，~～\s…]|$)/;
+
+export function isPeerMorningGreeting(text) {
+  let t = String(text ?? '').trim().toLowerCase();
+  if (!t) return false;
+  t = t.replace(/\[[^\]]{1,16}\]/g, ' ').trim(); // [表情:xx] 等 QQ 标记不算内容
+  if (!t || t.length > 24) return false;
+  return PEER_GREET_RE.test(t);
 }

@@ -30,7 +30,7 @@ const check = (n, f) => { try { f(); console.log('PASS  ' + n); } catch (e) { fa
 
 const mem = await import(pathToFileURL(path.join(sandbox, 'src', 'core', 'memory.js')).href);
 const db = mem.initMemoryDb();
-const FRIEND = '1000000003';
+const FRIEND = '1265046372';
 const nameOf = (uid) => db.prepare('SELECT name FROM profiles WHERE uid = ?').get(uid)?.name ?? '';
 
 // ── ① 占位标签一律拒收 ───────────────────────────────────────────────────
@@ -58,12 +58,12 @@ check('先写名字再收到占位标签 → 名字不受影响', () => {
 
 // ── ③ 原有的两道过滤不退化 ───────────────────────────────────────────────
 check('名字是纯号码 → 拒收', () => {
-  assert.equal(mem.rememberContactName('1000000002', '1000000002'), false);
-  assert.equal(nameOf('1000000002'), '');
+  assert.equal(mem.rememberContactName('1832746340', '1832746340'), false);
+  assert.equal(nameOf('1832746340'), '');
 });
 check('超长串（疑似误传正文）→ 拒收', () => {
-  assert.equal(mem.rememberContactName('1000000002', '啊'.repeat(80)), false);
-  assert.equal(nameOf('1000000002'), '');
+  assert.equal(mem.rememberContactName('1832746340', '啊'.repeat(80)), false);
+  assert.equal(nameOf('1832746340'), '');
 });
 check('uid 不是 QQ 号 → 拒收', () => {
   assert.equal(mem.rememberContactName('group:990002', '某人'), false);

@@ -112,6 +112,9 @@ export function saveStickerStoreSafe() {
   try { saveStickerStore(STICKER_FILE, stickerEntries); } catch (error) { log('保存表情库失败:', error?.message ?? error); }
 }
 
+// 上轮同步缺席的 qq 来源 id（部分列表防误杀的去抖状态，见 syncStickerLibrary 内注释）
+let lastMissingStickerIds = null;
+
 // 从 NapCat OneBot 拉取 QQ 账号收藏表情（fetch_custom_face_detail），并合并进本地库。
 // force=true 时忽略 TTL 强制刷新；失败时返回 null（调用方决定是否使用缓存）。
 export async function syncStickerLibrary(force = false) {
@@ -184,7 +187,22 @@ export async function syncStickerLibrary(force = false) {
       log(`[sticker] NapCat 本次返回 0 个收藏表情（多为 QQ 刚重启、缓存未就绪）—— 保留本地 ${stickerEntries.length} 条，不覆盖`);
       return { entries: stickerEntries, syncedAt: stickerSyncedAt, fromCache: false };
     }
-    stickerEntries = mergeStickerLibrary(stickerEntries, fetched);
+    // 部分列表防误杀：连续两轮缺席集合完全一致才放行「QQ 端已删除」清理。
+    // NapCat 缓存热身会返回半截列表（非空但缺大半），单轮清理会把整库推平（2026-10-30 事故）。
+    let allowPrune = true;
+    try {
+      const fetchedIds = new Set(fetched.map((f) => String(f?.emoji_id || f?.resId || f?.id || '').trim()).filter(Boolean));
+      const missing = stickerEntries.filter((e) => e.source === 'qq' && !fetchedIds.has(e.id)).map((e) => e.id);
+      const sameAsLast = Array.isArray(lastMissingStickerIds)
+        && missing.length === lastMissingStickerIds.length
+        && missing.every((id) => lastMissingStickerIds.includes(id));
+      allowPrune = missing.length === 0 || (sameAsLast && missing.length > 0);
+      if (!allowPrune && missing.length > 0) {
+        log(`[sticker] 缺席 ${missing.length} 条与上轮不一致（疑似缓存热身的部分列表）—— 本轮跳过清理，只合并`);
+      }
+      lastMissingStickerIds = missing;
+    } catch { allowPrune = true; }
+    stickerEntries = mergeStickerLibrary(stickerEntries, fetched, { allowPrune });
     stickerSyncedAt = Date.now();
     saveStickerStoreSafe();
     log(`[sticker] 已同步 QQ 收藏表情 ${fetched.length} 个（本地库 ${stickerEntries.length} 条）`);

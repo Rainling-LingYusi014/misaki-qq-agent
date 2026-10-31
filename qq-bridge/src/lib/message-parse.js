@@ -380,6 +380,16 @@ export function extractMediaFromSegments(segments) {
         kind: 'face',
         faceId: String(d.id ?? '')
       });
+    } else if (seg.type === 'video') {
+      /* 2026-10-31 P0：入站视频此前被整个丢弃——主人转发视频来问内容时她无从看起。
+       * 现在带出 file_id/url，mux 侧取文件落工作区后模型可用 video_look 看画面。 */
+      media.push({
+        kind: 'video',
+        file: String(d.file ?? d.file_id ?? ''),
+        url: String(d.url ?? ''),
+        fileName: String(d.name ?? d.file_name ?? ''),
+        fileSize: Number(d.file_size ?? d.size) || 0,
+      });
     }
   }
   return media;

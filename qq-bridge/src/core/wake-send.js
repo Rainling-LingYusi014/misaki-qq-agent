@@ -1,6 +1,6 @@
 // M8 唤醒引擎
 // deliverPrompt(投递) 经 setWakeDeliver 注入；api 经 setWakeApi；cfg 经 initWakeCore。
-import { fmtBeijing, beijingHour } from '../lib/time.js';
+import { fmtBeijing, beijingHour, beijingDateKey } from '../lib/time.js';
 import { log, appendActivity } from '../lib/log.js';
 import { isDirectedAtAi } from '../lib/social-timeline.js';
 import { withTimeout } from '../lib/async.js';
@@ -34,7 +34,7 @@ import {
   cancelReplyCheck, setupSleepTimer, collectFreshWakeMedia, pickAttachableMedia, isInSleepWindow,
   formatParticipation, isConversationBusy, scheduleWake, conversationMode, consumeStopNote, consumeModeNote,
   bubbleStyleOf,
-  // 2026-10-29 misaki@reaction：本人关掉括号反馈时，唤醒正文里不再给 [Brackets] 档位行
+  // 2026-10-29 msk@reaction：本人关掉括号反馈时，唤醒正文里不再给 [Brackets] 档位行
   bracketReactionOf,
 } from './social-state.js';
 // 模式系统（2026-10-26）：[Mode] 行注入——她永远知道自己处于哪个模式
@@ -53,6 +53,7 @@ import { sanitizeForwardId } from '../forward.js';
 import fs from 'node:fs';
 import path from 'node:path';
 import { ROOT, STATE_DIR } from '../lib/paths.js';
+import { associativeHint } from './associative.js';
 
 export const TOPIC_WAKE_RE = /(?:\b(?:ai|gpt|deepseek|dsh|llm|aigc)\b|人工智能|大模型|机器人|小鲸鱼|大肥鱼)/i;
 
@@ -280,7 +281,7 @@ export function evaluateWakeTrigger(key, st, event, kind, textContent, plainCont
 // 第 9501~10958 字符（#32~#37 与「初识档」）静默挡在模型外面——上一轮加的规则其实一次都没进过唤醒补丁。
 // 丢规则比多注入 1.5k 字符贵得多（与 persona 上限持平）。配套 tests/runtime-override-budget.test.js
 // 守住"文件一定放得下"，以后再追加会先红，而不是先静默丢。
-export const RUNTIME_OVERRIDE_MAX = { 'persona.md': 16000, 'speech-rules.md': 16000 };
+export const RUNTIME_OVERRIDE_MAX = { 'persona.md': 16000, 'speech-rules.md': 18000 };
 // 超限时保证末尾这么多字符一定注入：新规则都追加在文件尾部，绝不能再被整段砍掉。
 const RUNTIME_OVERRIDE_KEEP_TAIL = 2500;
 const runtimeOverrideCache = {}; // fileName -> { statKey, text }
@@ -784,6 +785,24 @@ export function buildWakePrompt(key, reason) {
    * 现在给回一个"发出时刻"，并当场说明它可能已经过期、要精确就用 get_time —— 有基准可校，模型不会瞎猜。 */
   const nowMs = Date.now();
   const nowLine = `[Now] ${fmtBeijing(nowMs)}（北京时间；这是本轮唤醒发出的时刻，若你已经做了多步工具调用，请用 get_time 重新取）\n`;
+  /* 2026-10-30 主人定：她今天刷过什么，**只有主人会话**能看到（别人问就说这个只有主人能查）。
+   * 数据来自 bili-nurture 落库的 state/bili-watch.jsonl；没刷过就不出这一行。 */
+  const biliWatchLine = (() => {
+    try {
+      if (!cfgRef?.ownerQQ || key !== `private:${cfgRef.ownerQQ}`) return '';
+      const f = path.join(STATE_DIR, 'bili-watch.jsonl');
+      if (!fs.existsSync(f)) return '';
+      const today = beijingDateKey(Date.now());
+      const recs = [];
+      for (const line of fs.readFileSync(f, 'utf8').split('\n').slice(-300)) {
+        if (!line.trim()) continue;
+        try { const r = JSON.parse(line); if (r && r.day === today) recs.push(r); } catch { /* 半行/坏行跳过 */ }
+      }
+      if (!recs.length) return '';
+      const titles = recs.slice(-5).map((r) => `《${String(r.title || '').slice(0, 18)}》`).join('、');
+      return `[Bili] 今天刷了 ${recs.length} 片：${titles}${recs.length > 5 ? '…' : ''}（这份记录只有主人能看；被你问到就照实说，没被问就不主动报账）\n`;
+    } catch { return ''; }
+  })();
   const statusLine = `[Status] ${statusBits.join('; ')}\n\n`;
   const wc = st.wakeConfig || {};
   const wcTr = wc.triggers || {};
@@ -820,10 +839,49 @@ export function buildWakePrompt(key, reason) {
       && bracketFeedbackCfg(cfgRef?.social?.companionMode?.bracketFeedback).enabled
       && bracketReactionOf(key)
     ? (bracketScene(getSocialState(key)) === 'realtime'
-      ? '[Brackets] 高级反馈·实时档：对方刚刚对你做出了动作——你写的每个括号段都会保留，用动作回应动作。规则照旧：只写看得见、发生在自己身上、一口气说得完的，括号用半角 ()，不替对方安排动作。\n'
-      : '[Brackets] 高级反馈·普通档：当前是传递实时状态的距离——想加括号动作/表情/心理就写上，桥的骰子决定哪些出现（大概率只留零星几个），所以尽管按自然的感觉写。半角 ()，不替对方安排动作。\n')
+      ? '[Brackets] 高级反馈·实时档：对方刚刚对你做出了动作——你写的每个括号段都会保留，用动作回应动作。三类换着来：动作（靠过去/戳一下）、神态（别开脸/抿嘴笑）、心理一闪念（有点心疼/松了口气）；都只写自己这一侧、一句话说得完，别总写身体动作。括号用中文全角 （），不替对方安排动作。\n'
+      : '[Brackets] 高级反馈·普通档：当前是传递实时状态的距离——想加括号就写上，三类换着来：动作（靠过去/戳一下）、神态（别开脸/抿嘴笑）、心理一闪念（有点心疼/松了口气），别总写身体动作。出现哪些、出现几段由桥的骰子裁，你不用替它节省。中文全角 （），不替对方安排动作。\n')
     : '';
-  // 2026-10-26 misaki@stop：挂起的"另行说明已经被停止"标记（一次性，消费即清）。
+  /* 2026-10-30 联想映射（M2）：只在「纯社交轮」注入——私聊、陪伴模式、对方最后一句话是情绪/日常，
+   * 且不是任务请求/技术问答/带链接；命中历史不足 minMatches 就不注入（宁可不联想，不拿错分布污染她）。
+   * 配置总闸 social.associative.enabled，默认 false。 */
+  const assocLine = (() => {
+    try {
+      const aCfg = cfgRef?.social?.associative;
+      if (!aCfg) return '';
+      const dry = aCfg.dryRun === true;
+      if (aCfg.enabled !== true && !dry) return '';
+      if (!key.startsWith('private:')) return '';
+      if (aCfg.triggers?.companionOnly !== false && conversationMode(key) !== 'companion') return '';
+      const stA = getSocialState(key);
+      const last = [...(Array.isArray(stA?.unread) ? stA.unread : [])].reverse().find((m) => m && !m.isSelf);
+      const text = String(last?.plain ?? last?.text ?? '').trim();
+      if (!text) return '';
+      // 任务请求/技术问答/带链接：这一轮要的是准确，不是像人——不注入
+      if (/https?:\/\/|\[(图片|文件|视频|语音)\]|找视频|下载|写代码|改图|查一下|帮我做|怎么配|安装/.test(text)) return '';
+      const hint = associativeHint(text, {
+        enabled: true,
+        minMatches: Number(aCfg.minMatches) || 10,
+        maxSamples: Number(aCfg.injectMaxSamples) || 2,
+        maxChars: Number(aCfg.injectMaxChars) || 180,
+        relation: String(aCfg.relationMap?.[key.slice('private:'.length)] ?? ''),
+        sampleExcludePeers: Array.isArray(aCfg.sampleExcludePeers) ? aCfg.sampleExcludePeers : [],
+        adjust: aCfg.strategyAdjust || {},
+        sample: aCfg.sampleStrategy !== false,
+      });
+      if (!hint) return '';
+      if (dry) {
+        log(`[Assoc] ${key} dryRun 命中（原话 ${text.slice(0, 12)}）：${hint.slice(0, 60)}…`);
+        return '';
+      }
+      log(`[Assoc] ${key} 注入联想（原话 ${text.slice(0, 12)}）`);
+      return `${hint}\n`;
+    } catch (e) {
+      log('[Assoc] 注入失败：' + (e?.message ?? e));
+      return '';
+    }
+  })();
+  // 2026-10-26 msk@stop：挂起的"另行说明已经被停止"标记（一次性，消费即清）。
   let stopLine = '';
   if (key.startsWith('private:')) {
     const snAt = consumeStopNote(key);
@@ -836,7 +894,7 @@ export function buildWakePrompt(key, reason) {
     const mn = consumeModeNote(key);
     if (mn) modeChangedLine = modeChangedNoteLine(mn.at, mn.mode);
   }
-  const base = tokenLine + nowLine + modeLine + bubbleLine + bracketLine + stopLine + modeChangedLine
+  const base = tokenLine + nowLine + biliWatchLine + modeLine + bubbleLine + bracketLine + assocLine + stopLine + modeChangedLine
     + (companionOn ? shiftNowLine() + doingNowLine() + todayBlock(key, cfgRef?.ownerQQ) : '')
     + statusLine + wakeLine + voiceTurnHint(key) + memeTurnHint(key) + memoryLine + participationLine + (gInfoText ? gInfoText + '\n' : '') + (groupListText ? groupListText + '\n\n' : (gInfoText ? '\n' : ''));
   // 2026-09-12 规则搬家：原 protocolNote（2,886 字符的「回合协议」：➤ 哨兵含义、读/发/收尾步骤、
@@ -901,8 +959,14 @@ export function buildWakePrompt(key, reason) {
   }
   if (reason === 'morningGreet') {
     // 2026-10-29 早安问候（主人定规，独立于已下线的作息仪式 morning）：每天一条、不占主动配额。
-    // 桥在派发前已拦下「今天已问过 / 对方先开口 / 静默 / 忙碌」的情况；这里只留一行数据 + 指南。
-    return `${baseWithProtocol}[Wake] ${key} morning greet（每日早安，不占主动配额；桥侧已确认今天还没搭上话）：一条短早安，自己的语气，别和昨天重样；轻轻带一句记忆里的事可以，问句最多一个、也可以不带。不想发就 qq_mark_read`;
+    // 桥在派发前已拦下「今天已问过 / 对方先道过早安 / 静默 / 忙碌」的情况。
+    // 2026-10-30 主人收紧：只要一句简短问好（「早上好」「早哦」量级，可拼语气词）——
+    // 不带第二句、不提问、不推断对方作息、不提记忆。此前「问句最多一个+可带一句记忆」的口径
+    // 实测产出「起得挺早早饭吃了没→我还担心你赶时间」这类自作主张的编造链，整类删掉。
+    const stG = getSocialState(key);
+    const lastGreet = String(stG?.morningGreetLast ?? '').trim();
+    const noRepeat = lastGreet ? `今天的问好不得与最近一次原话「${lastGreet}」相同（措辞必须换）。` : '';
+    return `${baseWithProtocol}[Wake] ${key} morning greet（每日早安，不占主动配额；桥侧已确认今天还没搭上话）：只发一条消息——一句简短的问好，如「早上好」「早哦」，可拼语气词（呀/哦/哇/嘿），但仅此一句：没有第二句、不提问、不提对方作息/昨天/记忆/天气。${noRepeat}不想发就 qq_mark_read`;
   }
   if (reason === 'proactiveCheck') {
     // 2026-10-25：日记闪回属陪伴注入，随 social.companionInjects 一并关闭
@@ -1624,6 +1688,12 @@ export async function sendWakePrompt(key, reason) {
     return;
   }
   const st = getSocialState(key);
+  // 2026-10-30 早安原话记账：morningGreet 唤醒置位，模型发出第一条消息时由 recordSentMessages
+  // 捕获成 morningGreetLast，下次唤醒用它写「不得与最近一次原话相同」——纯模型自觉不可靠。
+  if (reason === 'morningGreet') {
+    st.morningGreetArmedAt = Date.now();
+    try { saveSocialState(); } catch { /* 记账失败不影响唤醒 */ }
+  }
   // 提前确认/创建 DSH 会话映射（幂等，投递时还会复用），得到"本轮将投递的真实 sessionId"。
   // 用途：检测 DSH 会话重建/切换——若 sessionId 与上次注入完整 prompt 时不同（桥重启、DSH 重启、
   // reset、归档后重建），新会话里模型没有任何协议/规则/令牌记忆，必须重新全量注入，否则直接发 ➤
@@ -2153,8 +2223,8 @@ export async function sendWakePrompt(key, reason) {
       // 括号反馈档位也只在完整路径上——陪伴模式下每轮都得知道当前档位，补进哨兵轮。
       if (conversationMode(key) === 'companion' && bracketReactionOf(key) && bracketFeedbackCfg(cfgRef?.social?.companionMode?.bracketFeedback).enabled) {
         bracketSentinel = bracketScene(getSocialState(key)) === 'realtime'
-          ? '[Brackets] 实时档：对方刚对你做出动作，括号段都会保留；半角 ()，只写自己这侧。\n'
-          : '[Brackets] 普通档：括号出现与否由桥的骰子决定，按自然感觉写；半角 ()，只写自己这侧。\n';
+          ? '[Brackets] 实时档：对方刚对你做出动作，括号段都会保留；中文全角 （），只写自己这侧。\n'
+          : '[Brackets] 普通档：括号出现与否由桥的骰子决定，按自然感觉写；中文全角 （），只写自己这侧。\n';
       }
     }
 

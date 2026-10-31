@@ -1,7 +1,7 @@
 // 回归测试：模式切换对「极简哨兵轮」可见（2026-10-29 真机事故）
 //
 // 现场（主人小号泠岚 14:22–14:23）：
-//   14:22:22 对方发 misaki@companion → 桥切换成功并替她回执「好呀。那从现在起…」
+//   14:22:22 对方发 msk@companion → 桥切换成功并替她回执「好呀。那从现在起…」
 //   14:23:07 她答「还没切呢，现在是常规模式」
 //   14:23:39 又说「我这边还是常规模式，切成功的话桥会直接回你一句」
 // 根因：`[Mode]` 行与 `[ModeChanged]` 一次性说明只拼在 buildWakePrompt（首轮/轮换后首轮）里；
@@ -48,8 +48,8 @@ check('③ 切模式后一次性说明点名新模式，消费一次即清空', 
   fs.cpSync(path.join(repo, 'src'), path.join(sandbox, 'src'), { recursive: true });
   fs.writeFileSync(path.join(sandbox, 'package.json'), JSON.stringify({ name: 'qb-modeline', private: true, type: 'module' }));
   fs.mkdirSync(path.join(sandbox, 'state'), { recursive: true });
-  fs.writeFileSync(path.join(sandbox, 'config.json'), JSON.stringify({ ownerQQ: '1000000001', allowAllWhenEmpty: true }));
-  const cfg = { ownerQQ: '1000000001', allowAllWhenEmpty: true, allow: {}, deny: {}, social: {} };
+  fs.writeFileSync(path.join(sandbox, 'config.json'), JSON.stringify({ ownerQQ: '1736784911', allowAllWhenEmpty: true }));
+  const cfg = { ownerQQ: '1736784911', allowAllWhenEmpty: true, allow: {}, deny: {}, social: {} };
   const modUrl = (p) => pathToFileURL(path.join(sandbox, 'src', p)).href;
   for (const p of ['core/mode.js', 'core/qq-send.js', 'core/social-flow.js']) {
     try { const m = await import(modUrl(p)); (m.initModeCore || m.initQqSendCore || m.initSocialFlowCore)?.(cfg); } catch { /* 可选 */ }
@@ -57,7 +57,7 @@ check('③ 切模式后一次性说明点名新模式，消费一次即清空', 
   const social = await import(modUrl('core/social-state.js'));
   const companion = await import(modUrl('core/companion-mode.js'));
   social.initSocialCore(cfg);
-  const KEY = 'private:1000000002';
+  const KEY = 'private:1832746340';
   social.getSocialState(KEY);
 
   assert.equal(social.conversationMode(KEY), 'regular', '默认是常规模式');
@@ -74,7 +74,7 @@ check('③ 切模式后一次性说明点名新模式，消费一次即清空', 
   // 当前模式行：陪伴态必须自己说清是陪伴，并给得出退出指令
   const modeLineC = companion.modeLineForWake(social.conversationMode(KEY));
   assert.match(modeLineC, /\[Mode\] 陪伴模式/);
-  assert.match(modeLineC, /misaki@standard/, '必须给得出切回常规的指令原文');
+  assert.match(modeLineC, /msk@standard/, '必须给得出切回常规的指令原文');
 
   social.setConversationMode(KEY, 'regular');
   const modeLineR = companion.modeLineForWake(social.conversationMode(KEY));

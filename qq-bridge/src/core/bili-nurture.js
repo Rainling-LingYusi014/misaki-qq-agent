@@ -421,6 +421,18 @@ async function watchOne(s) {
   const label = cand.source === 'owner' ? '主人片' : `兴趣片[${cand.kw ?? ''}]`;
   const extra = notes.length ? `｜${notes.join('｜')}` : '';
   log(`[bili-nurture] ${label}《${cand.title}》${w.played}/${w.dur}s（完播 ${pct}%）｜${likeNote}${extra}｜今日 ${s.plan.count}/${s.plan.quota} 片 · ${Math.round(s.plan.watchSec / 60)}min`);
+  /* 2026-10-30 主人定：观看历史落库，**仅主人可查阅**（[Bili] 行只注入主人会话）。
+   * 目的：她以后能如实回答「今天刷了什么」而不是现编，也留一份可核对的行为记录。 */
+  try {
+    const rec = {
+      ts: Date.now(), day: todayKey(), bvid: w.bvid, aid: String(w.aid ?? ''), title: String(w.title || cand.title || ''),
+      up: String(w.upName ?? ''), dur: Number(w.dur) || 0, played: Number(w.played) || 0,
+      completion: Math.round(completion * 100) / 100, liked: likedFresh ? 1 : 0, source: cand.source || '',
+    };
+    fs.appendFileSync(path.join(STATE_DIR, 'bili-watch.jsonl'), JSON.stringify(rec) + '\n');
+  } catch (e) {
+    log('[bili-nurture] 观看记录写入失败：' + (e?.message ?? e));
+  }
 }
 
 /* ── 调度 ── */
