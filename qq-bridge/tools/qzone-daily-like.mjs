@@ -1,6 +1,6 @@
-// 每日空间自动点赞（2026-10-07 主人要求："让泠娜给她的列表好友的空间自动点赞"）
+// 每日空间自动点赞（2026-10-07 主人要求："让她给她的列表好友的空间自动点赞"）
 //
-// 复用泠娜自己的 QZone 登录态（NapCat get_cookies 中转，与 mcp-napcat-safe.js 的
+// 复用她自己的 QZone 登录态（NapCat get_cookies 中转，与 mcp-napcat-safe.js 的
 // qq_qzone_view / qq_qzone_like 同一套接口），不需要 qzone-liker 的扫码登录。
 //
 // 行为（保守风控口径）：
