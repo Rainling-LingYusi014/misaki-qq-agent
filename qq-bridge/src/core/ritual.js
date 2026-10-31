@@ -1,6 +1,6 @@
 // 作息仪式（2026-10-13）：晚安 / 早安流程的计时侧。
 // 需求：sleep-switch.sh 的「睡」不再瞬间熄灯，改为 POST /api/social/goodnight/start ——
-// 泠娜先跟主人道晚安，然后 5+x 分钟（x∈[5,15]，即 10~20min）后自动 paused。
+// 她先跟主人道晚安，然后 5+x 分钟（x∈[5,15]，即 10~20min）后自动 paused。
 // 「醒」侧由脚本先 POST activity{paused:false}（老行为不变）再 POST /api/social/morning/start
 // 触发早安唤醒（道早安 + 补回睡觉期间的未读）。
 // 本模块只管：熄灯时刻的持久化 + 计时 + 桥重启后的恢复 + 到点熄灯（复用 /api/social/activity

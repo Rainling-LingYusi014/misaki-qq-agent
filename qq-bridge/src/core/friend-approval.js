@@ -1,7 +1,7 @@
 // 好友申请拟人化延迟审批（2026-10-07）
 // 需求：别人加好友不要秒通过——黑名单秒拒、owner/白名单秒过，其余随机晾一段时间（默认
 // 10 分钟 ~ 6 小时）再自动同意；申请信息以伪消息注入 owner 私聊会话（appendSocialNotice），
-// 泠娜"知情不决策"。队列持久化到 state/friend-requests.json，桥重启后到点补审。
+// 她"知情不决策"。队列持久化到 state/friend-requests.json，桥重启后到点补审。
 //
 // 为什么不复用 core/scheduler.js：① 它的 fire 动作写死为"发消息到 targetKey"，而这里是
 // "set_friend_add_request + 注入伪消息"；② loadScheduledTasks 对已过期一次性任务是**丢弃**

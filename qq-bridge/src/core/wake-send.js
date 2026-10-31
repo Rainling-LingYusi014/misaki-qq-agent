@@ -930,14 +930,14 @@ export function buildWakePrompt(key, reason) {
    * 这两种是"每天固定一次的仪式"，行为必须确定，所以指南直接写在唤醒正文里（不能只靠
    * 系统提示词 [WAKE TYPES] 的通用规则）。 */
   if (reason === 'goodnight') {
-    return `${baseWithProtocol}[Wake] ${key} goodnight\n[Guide] 现在是泠娜睡觉的时间，熄灯流程已经启动，过十几分钟她就会去睡。这回合只做一件事：跟哥哥道晚安——必须发，简短自然、像平时随口说的那样，不要弄得隆重；可以顺带一句今晚的小事，但不要再起新话题、不要发问。发完这回合就算道过别了，之后不久就去睡。`;
+    return `${baseWithProtocol}[Wake] ${key} goodnight\n[Guide] 现在是她睡觉的时间，熄灯流程已经启动，过十几分钟她就会去睡。这回合只做一件事：跟哥哥道晚安——必须发，简短自然、像平时随口说的那样，不要弄得隆重；可以顺带一句今晚的小事，但不要再起新话题、不要发问。发完这回合就算道过别了，之后不久就去睡。`;
   }
   if (reason === 'morning') {
     const isOwnerMorning = !!cfgRef?.ownerQQ && key === `private:${cfgRef.ownerQQ}`;
     if (isOwnerMorning) {
-      return `${baseWithProtocol}[Wake] ${key} morning\n[Guide] 泠娜刚睡醒（早安流程）。第一步：跟哥哥道个早安——必须发，简短随口就好，真人道早安不是什么隆重的事，一两句就行。第二步：把 [Unread] 里哥哥在她睡觉期间发的消息看完并逐条回复，一条都不许装没看见；都回完再该干嘛干嘛。`;
+      return `${baseWithProtocol}[Wake] ${key} morning\n[Guide] 她刚睡醒（早安流程）。第一步：跟哥哥道个早安——必须发，简短随口就好，真人道早安不是什么隆重的事，一两句就行。第二步：把 [Unread] 里哥哥在她睡觉期间发的消息看完并逐条回复，一条都不许装没看见；都回完再该干嘛干嘛。`;
     }
-    return `${baseWithProtocol}[Wake] ${key} morning\n[Guide] 泠娜刚睡醒（早安流程）。第一步：给这位朋友发个早安——必须发，简短自然就好，像朋友顺手打了个招呼，一两句，别隆重。第二步：如果 [Unread] 里有对方之前发的消息，先逐条回复再道早安；没有就直接发早安。`;
+    return `${baseWithProtocol}[Wake] ${key} morning\n[Guide] 她刚睡醒（早安流程）。第一步：给这位朋友发个早安——必须发，简短自然就好，像朋友顺手打了个招呼，一两句，别隆重。第二步：如果 [Unread] 里有对方之前发的消息，先逐条回复再道早安；没有就直接发早安。`;
   }
   if (reason === 'bootstrap') {
     return `${baseWithProtocol}[Guide] ${key} first connect`;
@@ -1890,8 +1890,8 @@ export async function sendWakePrompt(key, reason) {
   const maxPerHour = Number(isPrivateKey ? (cfgRef.social?.wake?.maxWakePerHourPrivate ?? 0) : (cfgRef.social?.wake?.maxWakePerHour ?? 0));
   const recentMinute = (st.wakeTimes || []).filter((t) => now - t < 60000).length;
   const recentHour = (st.wakeTimes || []).filter((t) => now - t < 3600000).length;
-  // 2026-10-07 需求：owner @ 泠娜不受唤醒限频（其他群友仍受限）。
-  // 判据：未读批次里存在 owner 发出且 @ 了泠娜的消息（appendSocialMessage 已打 isOwner/atSelf 标）。
+  // 2026-10-07 需求：owner @ 她不受唤醒限频（其他群友仍受限）。
+  // 判据：未读批次里存在 owner 发出且 @ 了她的消息（appendSocialMessage 已打 isOwner/atSelf 标）。
   // 不会造成永久豁免：回合收尾按已读水位清空 unread（mux.js 正常/无正文收尾都会推进），已处理的 owner @ 消息不再留在批次里。
   const overLimit = (maxPerMinute > 0 && recentMinute >= maxPerMinute) || (maxPerHour > 0 && recentHour >= maxPerHour);
   const ownerAtBypass = overLimit && (Array.isArray(st.unread) ? st.unread : []).some((m) => m && m.isOwner === true && m.atSelf === true);

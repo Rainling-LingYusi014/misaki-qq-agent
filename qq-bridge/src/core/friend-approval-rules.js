@@ -73,7 +73,7 @@ export function isWhitelisted(cfg, uid) {
   return list.map(String).includes(id);
 }
 
-// ── 伪消息文本模板（泠娜第一人称知情口吻；桥替她说，她不决策） ────────────────
+// ── 伪消息文本模板（她第一人称知情口吻；桥替她说，她不决策） ────────────────
 
 function nameOf(nickname, uid) {
   const n = String(nickname ?? '').trim();

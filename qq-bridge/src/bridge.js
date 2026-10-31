@@ -358,7 +358,7 @@ async function main() {
   // NapCat 鉴权令牌：写进 NapCat 自己的配置 + 重启容器（管理端「NapCat 令牌」卡走这里）
   initNapcatTokens(cfg);
   // NapCat 会话守护（2026-10-26 半版）：get_rkey 探针 + 报警（不自动重启；密码回退激活后开 autoHeal）。
-  // 为什么需要：静默死两次亲历（2026-09-16 泠娜 / 2026-10-25 本部署）——TCP 活着、isLogin 仍 true，
+  // 为什么需要：静默死两次亲历（2026-09-16 旧栈 / 2026-10-25 本部署）——TCP 活着、isLogin 仍 true，
   // 只有 get_rkey（真打腾讯服务器）能逮住。
   initNapcatGuard(cfg, {
     callAction: (action, params) => bot.raw(action, params),
@@ -669,7 +669,7 @@ async function main() {
   // autoFriendApproval === false = 最高优先级总开关：完全不碰好友申请（申请自然挂着）。
   // friendApproval.enabled === false = 回退旧「黑名单秒拒 / 其余秒过」逻辑（legacyAutoApprove）。
   // 默认（两者都开）：黑名单秒拒 + owner/allow 白名单秒过，其余随机晾 10 分钟~6 小时再自动通过，
-  // 全过程以伪消息通知 owner 会话（泠娜知情不决策）。见 core/friend-approval.js。
+  // 全过程以伪消息通知 owner 会话（她知情不决策）。见 core/friend-approval.js。
   const legacyAutoApprove = async (event) => {
     try {
       const flag = String(event.flag ?? '');

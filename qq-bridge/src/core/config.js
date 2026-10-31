@@ -238,7 +238,7 @@ export function loadConfig() {
         breakProbability: 0.15       // 每次唤醒的插话概率（0=只等他停，1=从不等待）
       },
       // 2026-10-07 好友申请拟人化延迟审批：黑名单秒拒、owner/白名单秒过，其余随机晾
-      // [minDelayMs, maxDelayMs] 再自动通过，伪消息通知 owner 会话（泠娜知情不决策）。
+      // [minDelayMs, maxDelayMs] 再自动通过，伪消息通知 owner 会话（她知情不决策）。
       // 详见 core/friend-approval.js。enabled=false = 回退旧"秒过"逻辑（见 bridge.js legacyAutoApprove）
       friendApproval: {
         enabled: true,
